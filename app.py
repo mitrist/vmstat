@@ -20,11 +20,14 @@ from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 import marathon_queries as mq
 
 DEFAULT_DB = Path(os.environ.get("MARATHON_DB", str(mq.DEFAULT_DB)))
+APP_DIR = Path(__file__).resolve().parent
+SIDEBAR_LOGO = APP_DIR / "assets" / "vologdamarafon.png"
 
 # Основные цвета сервиса
 VM_LINK = "#93BDDD"
@@ -35,6 +38,8 @@ VM_MUTED = "#767676"
 # Акценты UI (границы, графики, плашки)
 VM_ACCENT = "#93BDDD"
 VM_BLUE = "#93BDDD"
+# Подзаголовок к гистограммам на «Общая статистика» (курсив под названием)
+OBSH_BAR_TITLE_NOTE = "Линия тренда - скользящее среднее за 3 года"
 
 
 def db_path() -> Path:
@@ -468,6 +473,54 @@ def sidebar_stat_card(label: str, value: int | str) -> None:
     )
 
 
+def _layout_year_bar_with_labels_and_ma3(
+    fig: go.Figure, df: pd.DataFrame, y_column: str, chart_title: str
+) -> None:
+    """Подписи над столбцами, сглаживание — скользящее среднее за 3 года (по центру), hover только Y."""
+    if df.empty or len(df) < 1:
+        return
+    ds = df.sort_values("year").reset_index(drop=True)
+    yv = ds[y_column].astype(float)
+    ymax = float(yv.max()) if len(yv) else 0.0
+    pad = ymax * 0.2 + (4 if ymax < 30 else max(2.0, ymax * 0.06))
+
+    title_with_note = (
+        f"{chart_title}<br>"
+        f'<span style="color:{VM_MUTED}; font-size:0.78em;"><i>{OBSH_BAR_TITLE_NOTE}</i></span>'
+    )
+
+    fig.update_traces(
+        texttemplate="%{y:.0f}",
+        textposition="outside",
+        cliponaxis=False,
+        hovertemplate="%{y:.0f}<extra></extra>",
+    )
+    title_layout: dict[str, Any] = dict(
+        title=dict(
+            text=title_with_note,
+            x=0.0,
+            xanchor="left",
+        ),
+    )
+    if ymax > 0:
+        title_layout["yaxis"] = dict(range=[0, ymax + pad])
+    fig.update_layout(**title_layout)
+
+    if len(ds) >= 2:
+        ma3 = yv.rolling(window=3, center=True, min_periods=1).mean()
+        fig.add_trace(
+            go.Scatter(
+                x=ds["year"],
+                y=ma3,
+                mode="lines",
+                line=dict(color=VM_MUTED, width=2, dash="dash"),
+                name="Ср. 3 г.",
+                showlegend=False,
+                hovertemplate="%{y:.0f}<extra></extra>",
+            )
+        )
+
+
 def metric_plaque(label: str, value: int | str) -> None:
     """Карточка-метрика на светлой плашке (как фон гистограмм Plotly)."""
     lab = html.escape(label)
@@ -517,17 +570,17 @@ def page_general_statistics() -> None:
     st.caption("Пустой фильтр по году / виду / кубку означает «все значения».")
     fc1, fc2, fc3 = st.columns(3)
     with fc1:
-        sel_years = st.multiselect("Год", options=years_all, default=years_all, key="gs_years")
+        sel_years = st.multiselect("Год", options=years_all, default=[], key="obsh_f_years")
     with fc2:
-        sel_sports = st.multiselect("Вид спорта", options=sports_all, default=sports_all, key="gs_sports")
+        sel_sports = st.multiselect("Вид спорта", options=sports_all, default=[], key="obsh_f_sports")
     with fc3:
         cup_ids_opts = list(cup_labels.keys())
         sel_cup_ids = st.multiselect(
             "Кубок",
             options=cup_ids_opts,
             format_func=lambda i: cup_labels.get(int(i), str(i)),
-            default=cup_ids_opts,
-            key="gs_cups",
+            default=[],
+            key="obsh_f_cups",
         )
 
     yf = sel_years if sel_years else None
@@ -560,7 +613,6 @@ def page_general_statistics() -> None:
                 x="year",
                 y="events",
                 labels={"year": "Год", "events": "Событий"},
-                title="Количество событий по годам",
             )
             fig_e.update_traces(marker_color=VM_ACCENT)
             fig_e.update_layout(
@@ -568,6 +620,9 @@ def page_general_statistics() -> None:
                 paper_bgcolor="white",
                 font=dict(color=VM_TEXT),
                 xaxis_type="category",
+            )
+            _layout_year_bar_with_labels_and_ma3(
+                fig_e, dfe, "events", "Количество событий по годам"
             )
             st.plotly_chart(fig_e, use_container_width=True)
 
@@ -581,7 +636,6 @@ def page_general_statistics() -> None:
                 x="year",
                 y="participants",
                 labels={"year": "Год", "participants": "Уникальных участников"},
-                title="Уникальных участников по годам",
             )
             fig_p.update_traces(marker_color=VM_ACCENT)
             fig_p.update_layout(
@@ -589,6 +643,9 @@ def page_general_statistics() -> None:
                 paper_bgcolor="white",
                 font=dict(color=VM_TEXT),
                 xaxis_type="category",
+            )
+            _layout_year_bar_with_labels_and_ma3(
+                fig_p, dfp, "participants", "Уникальных участников по годам"
             )
             st.plotly_chart(fig_p, use_container_width=True)
 
@@ -1343,12 +1400,15 @@ def main() -> None:
         "Команда",
         "Кубки",
     )
+    if SIDEBAR_LOGO.is_file():
+        st.sidebar.image(str(SIDEBAR_LOGO), use_container_width=True)
     i_from_url = _sidebar_read_nav_i_from_url()
     if i_from_url is not None and 0 <= i_from_url < len(PAGES):
         st.session_state["nav_page"] = PAGES[i_from_url]
     if st.session_state.get("nav_page") not in PAGES:
         st.session_state["nav_page"] = PAGES[0]
     page: str = st.session_state["nav_page"]
+    st.sidebar.divider()
     render_sidebar_text_nav(PAGES, page)
 
     path = db_path()
