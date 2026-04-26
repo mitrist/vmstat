@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "agents": [
+    {
+      "id": "dispatcher",
+      "name": "Диспетчер",
+      "role": "Управляет выполнением пунктов плана",
+      "interface": ["getNextTask() -> str | ALL_DONE", "receiveQAVerdict(OK | FAIL) -> void"],
+      "implementation": "agents/dispatcher.py"
+    },
+    {
+      "id": "developer",
+      "name": "Разработчик",
+      "role": "Пишет код по текущему заданию от диспетчера",
+      "interface": ["develop(task: string) -> выполнение в среде Cursor"],
+      "handoff": "После работы явно: «Готово к проверке: [краткое описание]»"
+    },
+    {
+      "id": "qa",
+      "name": "QA",
+      "role": "Проверяет соответствие заданию, синтаксис, очевидные баги",
+      "interface": ["review(developerOutput) -> verdict OK|FAIL + сообщение"],
+      "on_fail": "Чёткие инструкции разработчику; вызов receiveQAVerdict(FAIL) без сдвига индекса"
+    }
+  ],
+  "skill": {
+    "id": "pipeline",
+    "invoke": "@pipeline или упоминание скилла pipeline",
+    "path": ".cursor/skills/pipeline/SKILL.md"
+  }
+}

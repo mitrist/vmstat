@@ -1,0 +1,345 @@
+"""Тесты слоя marathon_queries на временной SQLite."""
+
+from __future__ import annotations
+
+import sqlite3
+import tempfile
+from pathlib import Path
+
+import pytest
+
+import marathon_queries as mq
+
+
+@pytest.fixture
+def sample_db() -> Path:
+    fd, path = tempfile.mkstemp(suffix=".db")
+    import os
+
+    os.close(fd)
+    p = Path(path)
+    conn = sqlite3.connect(p)
+    conn.executescript(
+        """
+        CREATE TABLE competitions (
+            id INTEGER PRIMARY KEY, title TEXT, date TEXT, year INTEGER, sport TEXT
+        );
+        CREATE TABLE distances (
+            id INTEGER PRIMARY KEY, competition_id INTEGER, name TEXT, distance_km REAL,
+            is_relay INTEGER DEFAULT 0
+        );
+        CREATE TABLE results (
+            id INTEGER PRIMARY KEY, competition_id INTEGER, distance_id INTEGER,
+            profile_id INTEGER, dnf INTEGER DEFAULT 0, finish_time_sec REAL,
+            team TEXT, place_abs INTEGER, place_gender INTEGER, place_group INTEGER,
+            group_name TEXT, finish_time TEXT, raw TEXT
+        );
+        CREATE TABLE profiles (
+            id INTEGER PRIMARY KEY, first_name TEXT, last_name TEXT, second_name TEXT,
+            gender TEXT, age INTEGER, birth_year INTEGER, city TEXT, city_id INTEGER,
+            region TEXT, region_id INTEGER, country TEXT, club TEXT,
+            stat_competitions INTEGER, stat_km INTEGER, stat_marathons INTEGER,
+            stat_first INTEGER, stat_second INTEGER, stat_third INTEGER, raw TEXT
+        );
+        CREATE TABLE cups (id INTEGER PRIMARY KEY, title TEXT, year INTEGER, sport TEXT, raw TEXT);
+        CREATE TABLE cup_competitions (cup_id INTEGER, competition_id INTEGER);
+        CREATE TABLE cup_distances (
+            id INTEGER PRIMARY KEY, cup_id INTEGER, name TEXT, distance_km REAL, sport TEXT, raw TEXT
+        );
+        CREATE TABLE cup_results (
+            id INTEGER PRIMARY KEY, cup_id INTEGER, distance_id INTEGER, profile_id INTEGER,
+            place_abs INTEGER, place_gender INTEGER, place_group INTEGER,
+            group_id INTEGER, group_name TEXT, total_points REAL, competitions_count INTEGER, raw TEXT
+        );
+        CREATE TABLE profile_cup_results (
+            id INTEGER PRIMARY KEY, profile_id INTEGER, year INTEGER, cup_id INTEGER,
+            cup_title TEXT, distance_id INTEGER, distance_name TEXT,
+            place_abs INTEGER, group_name TEXT, total_points REAL, raw TEXT
+        );
+        CREATE TABLE cup_scoring_computed_finishes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rule_version TEXT NOT NULL,
+            cup_id INTEGER NOT NULL,
+            year INTEGER NOT NULL,
+            profile_id INTEGER NOT NULL,
+            result_id INTEGER NOT NULL,
+            competition_id INTEGER NOT NULL,
+            distance_id INTEGER NOT NULL,
+            stage_index INTEGER NOT NULL,
+            distance_km REAL,
+            place_for_score INTEGER,
+            points_awarded INTEGER NOT NULL,
+            rule_label TEXT,
+            computed_at TEXT,
+            UNIQUE(rule_version, cup_id, year, result_id)
+        );
+        CREATE TABLE cup_scoring_computed_totals (
+            rule_version TEXT NOT NULL,
+            cup_id INTEGER NOT NULL,
+            year INTEGER NOT NULL,
+            profile_id INTEGER NOT NULL,
+            points_best7 INTEGER NOT NULL,
+            stages_json TEXT,
+            computed_at TEXT,
+            PRIMARY KEY (rule_version, cup_id, year, profile_id)
+        );
+        CREATE TABLE competition_stats (
+            competition_id INTEGER PRIMARY KEY, total_members INTEGER,
+            male INTEGER, female INTEGER, teams INTEGER, regions INTEGER, dnf INTEGER, raw TEXT
+        );
+        CREATE TABLE competition_status (competition_id INTEGER PRIMARY KEY, status TEXT);
+
+        INSERT INTO competitions VALUES (1, 'Test Marathon', '2024-06-01', 2024, 'run');
+        INSERT INTO distances VALUES (10, 1, '42 km', 42.0, 0);
+        INSERT INTO profiles VALUES (100, 'Ivan', 'Testov', '', 'm', 30, 1994, 'Vologda',
+            NULL, 'VO', 36, 'Россия', '', 1, 42, 0, 0, 0, 0,
+            '{"active_years": [2024, 2023, 2019]}');
+        INSERT INTO profiles VALUES (101, 'Petr', 'Secondov', '', 'm', 28, 1996, 'Cherepovets',
+            NULL, 'VO', 36, 'Россия', '', 0, 0, 0, 0, 0, 0, '{}');
+        INSERT INTO competitions VALUES (2, 'Spring Half', '2023-05-01', 2023, 'run');
+        INSERT INTO distances VALUES (11, 2, '21 km', 21.0, 0);
+        INSERT INTO results VALUES (1, 1, 10, 100, 0, 3600.0, 'Team A', 1, 1, 2, 'M40', '01:00:00', '{}');
+        INSERT INTO results VALUES (2, 2, 11, 100, 0, 7200.0, 'Team A', 5, 2, 4, 'M40', '02:00:00', '{}');
+        INSERT INTO results VALUES (3, 1, 10, 101, 0, 3500.0, 'Team B', 2, 2, 1, 'M40', '00:58:00', '{}');
+        INSERT INTO cup_competitions VALUES (1, 1);
+        INSERT INTO cups VALUES (1, 'Super Cup', 2024, 'run', '{}');
+        INSERT INTO cups VALUES (2, 'Mini Cup', 2024, 'run', '{}');
+        INSERT INTO cup_distances VALUES (1, 1, '21 km', 21.0, 'run', '{}');
+        INSERT INTO cup_distances VALUES (2, 2, '10 km', 10.0, 'run', '{}');
+        INSERT INTO cup_distances VALUES (3, 1, '42 km', 42.0, 'run', '{}');
+        INSERT INTO cup_results
+          (id, cup_id, distance_id, profile_id, place_abs, place_gender, place_group,
+           group_id, group_name, total_points, competitions_count, raw)
+        VALUES (9001, 1, 3, 100, 88, 40, 3, NULL, 'M40', 99.5, 1,
+            '{"competition_points": [{"competition_id": 1, "points": 88.25}]}');
+        INSERT INTO cup_results
+          (id, cup_id, distance_id, profile_id, place_abs, place_gender, place_group,
+           group_id, group_name, total_points, competitions_count, raw)
+        VALUES (9002, 2, 2, 100, 15, 7, 2, NULL, 'M40', 10.0, 1, '{}');
+        INSERT INTO cup_results
+          (id, cup_id, distance_id, profile_id, place_abs, place_gender, place_group,
+           group_id, group_name, total_points, competitions_count, raw)
+        VALUES (9003, 1, 1, 101, 3, 2, 1, NULL, 'M40', 150.0, 1, '{}');
+        INSERT INTO profile_cup_results
+          (id, profile_id, year, cup_id, cup_title, distance_id, distance_name,
+           place_abs, group_name, total_points, raw)
+        VALUES (1, 100, 2024, 1, 'Super Cup', 3, '42 km', 2, 'M40', 99.5,
+            '{"group": {"name": "Мужчины 40-44", "age_from": 40, "age_to": 44},
+              "competition": {"id": 1}}');
+        INSERT INTO profile_cup_results
+          (id, profile_id, year, cup_id, cup_title, distance_id, distance_name,
+           place_abs, group_name, total_points, raw)
+        VALUES (2, 100, 2023, 1, 'Super Cup', 1, '21 km', 3, 'M40', 50.0, '{}');
+        INSERT INTO profile_cup_results
+          (id, profile_id, year, cup_id, cup_title, distance_id, distance_name,
+           place_abs, group_name, total_points, raw)
+        VALUES (3, 100, 2024, 2, 'Mini Cup', 2, '10 km', 1, 'M40', 10.0,
+            '{"group": {"age_from": 35, "age_to": 39}}');
+        INSERT INTO profile_cup_results
+          (id, profile_id, year, cup_id, cup_title, distance_id, distance_name,
+           place_abs, group_name, total_points, raw)
+        VALUES (4, 101, 2024, 1, 'Super Cup', 1, '21 km', 1, 'M40', 150.0,
+            '{"competition": {"id": 1, "title": "Контрольный забег (2024)"}}');
+        """
+    )
+    conn.commit()
+    conn.close()
+    yield p
+    p.unlink(missing_ok=True)
+
+
+def test_season_metrics(sample_db: Path) -> None:
+    m = mq.query_season_metrics(sample_db, 2024)
+    assert m is not None
+    assert m["events"] == 1
+    assert m["finishes"] == 2
+    assert m["unique_athletes"] == 2
+    assert m["total_km"] == 84.0
+
+
+def test_profile_row_and_history(sample_db: Path) -> None:
+    row = mq.query_profile_row(sample_db, 100)
+    assert row is not None
+    assert row["first_name"] == "Ivan"
+    hist = mq.query_profile_results_history(sample_db, 100)
+    assert len(hist) == 2
+    assert mq.parse_profile_active_years(row.get("raw")) == [2024, 2023, 2019]
+    assert mq.query_profile_participation_years(sample_db, 100) == [2024, 2023]
+    h24 = mq.query_profile_results_history_for_year(sample_db, 100, 2024)
+    assert len(h24) == 1 and h24[0]["км"] == 42.0
+    h23 = mq.query_profile_results_history_for_year(sample_db, 100, 2023)
+    assert len(h23) == 1 and h23[0]["км"] == 21.0
+    assert mq.query_profile_results_history_for_year(sample_db, 100, 2019) == []
+    c24 = mq.query_profile_cup_rows_for_year(sample_db, 100, 2024)
+    assert len(c24) == 2
+    pts = {float(r["очков"]) for r in c24}
+    assert pts == {99.5, 10.0}
+    assert all("событие" in r and "дистанция" in r for r in c24)
+    petr_c24 = mq.query_profile_cup_rows_for_year(sample_db, 101, 2024)
+    petr_row = next(x for x in petr_c24 if float(x["очков"]) == 150.0)
+    assert "Контрольный" in (petr_row.get("событие") or "")
+    c23 = mq.query_profile_cup_rows_for_year(sample_db, 100, 2023)
+    assert len(c23) == 1 and c23[0]["очков"] == 50.0
+
+
+def test_profile_search_by_id(sample_db: Path) -> None:
+    rows = mq.query_profile_search(sample_db, "100", 10)
+    assert len(rows) == 1
+    assert rows[0]["id"] == 100
+
+
+def test_teams_top(sample_db: Path) -> None:
+    rows = mq.query_teams_top(sample_db, year=2024, limit=10)
+    assert len(rows) == 2
+    names = {r["команда"] for r in rows}
+    assert names == {"Team A", "Team B"}
+
+
+def test_general_stats_cards(sample_db: Path) -> None:
+    c = mq.query_general_stats_cards(sample_db, years=[2024], sports=["run"], cup_ids=None)
+    assert c["total_events"] == 1
+    assert c["total_participants"] == 2
+    assert c["regions_distinct"] >= 1
+    assert c["teams_distinct"] == 2
+    assert c["countries_distinct"] >= 1
+
+
+def test_profile_cup_page_queries(sample_db: Path) -> None:
+    assert mq.query_profile_cup_result_years(sample_db) == [2024, 2023]
+    s24 = mq.query_profile_cup_summaries_for_year(sample_db, 2024)
+    assert len(s24) == 2
+    ids_titles = {(r["id"], r["кубок"]) for r in s24}
+    assert ids_titles == {(1, "Super Cup"), (2, "Mini Cup")}
+    d = mq.query_profile_cup_detail_for_year_cup(sample_db, 2024, 1)
+    assert len(d) == 2
+    ivan = next(r for r in d if "Testov" in (r.get("участник") or ""))
+    assert float(ivan["очков"]) == 88.25
+    assert "событие" in ivan and "дистанция" in ivan
+    assert ivan["last_name"] == "Testov"
+    assert ivan["gender"] == "m"
+    assert ivan["cup_place_abs"] == 88
+    assert ivan["cup_place_gender"] == 40
+    assert ivan["cup_place_group"] == 3
+    assert ivan["pcr_place_abs"] == 2
+    assert mq.cup_detail_resolve_display_place(ivan, "Абсолютный зачёт", "Все") == 88
+    assert mq.cup_detail_resolve_display_place(ivan, "Мужчины", "Все") == 40
+    assert mq.cup_detail_resolve_display_place(ivan, "Мужчины", "Мужчины 40-44") == 3
+    assert mq.parse_profile_cup_raw_age_group_label(ivan.get("raw")) == "Мужчины 40-44"
+    d2 = mq.query_profile_cup_detail_for_year_cup(sample_db, 2024, 2)
+    assert mq.parse_profile_cup_raw_age_group_label(d2[0].get("raw")) == "35-39"
+
+
+def test_parse_profile_cup_raw_age_group_label() -> None:
+    assert mq.parse_profile_cup_raw_age_group_label("") == ""
+    assert mq.parse_profile_cup_raw_age_group_label("not json") == ""
+    assert mq.parse_profile_cup_raw_age_group_label('{"group": {"name": "M40"}}') == "M40"
+    assert mq.parse_profile_cup_raw_age_group_label('{"group": {"age_from": 20, "age_to": 29}}') == "20-29"
+
+
+def test_profile_cup_team_member_competition_rows(sample_db: Path) -> None:
+    rows = mq.query_profile_cup_team_member_competition_rows(sample_db, 100, 1, 2024)
+    assert len(rows) == 1
+    assert rows[0]["событие"] == "Test Marathon"
+    assert rows[0]["дистанция"] == "42 km"
+    assert rows[0]["место_абс"] == 1
+    assert rows[0]["время"] == "01:00:00"
+    assert float(rows[0]["очков"]) == 99.5
+    assert rows[0]["competition_id"] == 1
+    r101 = mq.query_profile_cup_team_member_competition_rows(sample_db, 101, 1, 2024)
+    assert len(r101) == 1
+    assert r101[0]["событие"] == "Test Marathon"
+    assert float(r101[0]["очков"]) == 150.0
+
+
+def test_assign_profile_cup_points_to_result_lines(sample_db: Path) -> None:
+    lines = mq.query_profile_cup_team_member_competition_rows(sample_db, 100, 1, 2024)
+    a = mq.assign_profile_cup_points_to_result_lines(sample_db, 100, 1, 2024, lines)
+    assert a == [int(round(99.5))]
+    lines101 = mq.query_profile_cup_team_member_competition_rows(sample_db, 101, 1, 2024)
+    a101 = mq.assign_profile_cup_points_to_result_lines(sample_db, 101, 1, 2024, lines101)
+    assert a101 == [150]
+    pcr_lines = mq.query_profile_cup_results_lines_for_member(sample_db, 100, 1, 2024)
+    assert mq.assign_profile_cup_points_to_result_lines(
+        sample_db, 100, 1, 2024, pcr_lines
+    ) == [None]
+
+
+def test_profile_cup_results_lines_for_member(sample_db: Path) -> None:
+    lines = mq.query_profile_cup_results_lines_for_member(sample_db, 100, 1, 2024)
+    assert len(lines) == 1
+    assert lines[0]["дистанция"] == "42 km"
+    assert float(lines[0]["очков"]) == 99.5
+    lines_p = mq.query_profile_cup_results_lines_for_member(sample_db, 101, 1, 2024)
+    assert len(lines_p) == 1
+    assert "Контрольный" in (lines_p[0].get("событие") or "")
+
+
+def test_cup_team_score_rows_and_event_parser(sample_db: Path) -> None:
+    rows = mq.query_cup_team_score_rows(sample_db, 1, 2024)
+    assert len(rows) == 2
+    by_team: dict[str, list[dict]] = {}
+    for r in rows:
+        by_team.setdefault(r["команда"], []).append(r)
+    assert sum(float(x["очков"]) for x in by_team["Team B"]) == 150.0
+    assert sum(float(x["очков"]) for x in by_team["Team A"]) == 99.5
+    assert mq.aggregate_team_cup_points_top_five(by_team["Team A"]) == 100
+    assert mq.aggregate_team_cup_points_top_five(by_team["Team B"]) == 150
+    petr = next(r for r in rows if r["profile_id"] == 101)
+    assert "Контрольный" in (petr.get("событие") or "")
+    assert mq.parse_profile_cup_raw_event_title(petr.get("raw")) == "Контрольный забег (2024)"
+    assert mq.query_cup_team_score_rows(sample_db, 2, 2024) == []
+
+
+def test_aggregate_team_cup_points_top_five() -> None:
+    rows = [{"profile_id": i, "очков": float(i * 10)} for i in range(1, 7)]
+    assert mq.aggregate_team_cup_points_top_five(rows) == 200
+
+
+def test_parse_profile_cup_raw_competition_id() -> None:
+    assert mq.parse_profile_cup_raw_competition_id("") is None
+    assert mq.parse_profile_cup_raw_competition_id('{"competition": {"id": 42}}') == 42
+    assert mq.parse_profile_cup_raw_competition_id('{"competition_id": 7}') == 7
+
+
+def test_map_profile_cup_points_by_competition_id(sample_db: Path) -> None:
+    m = mq.map_profile_cup_points_by_competition_id(sample_db, 100, 1, 2024)
+    assert m.get(1) == 99.5
+    m2 = mq.map_profile_cup_points_by_competition_id(sample_db, 101, 1, 2024)
+    assert m2.get(1) == 150.0
+
+
+def test_norm_cup_match_title() -> None:
+    assert mq.norm_cup_match_title("Забег (2024)") == "забег"
+    assert mq.norm_cup_match_distance(" 21 km ") == "21 km"
+
+
+def test_map_profile_cup_points_by_title_distance(sample_db: Path) -> None:
+    m = mq.map_profile_cup_points_by_title_distance(sample_db, 101, 1, 2024)
+    t = mq.norm_cup_match_title("Контрольный забег (2024)")
+    d = mq.norm_cup_match_distance("21 km")
+    assert abs(m[(t, d)] - 150.0) < 1e-6
+
+
+def test_parse_profile_cup_raw_event_title() -> None:
+    assert mq.parse_profile_cup_raw_event_title("") == ""
+    j = '{"competition": {"title_short": "Забег X"}}'
+    assert mq.parse_profile_cup_raw_event_title(j) == "Забег X"
+
+
+def test_team_detail_and_cups(sample_db: Path) -> None:
+    names = mq.query_team_names_for_select(sample_db, None, 100)
+    assert "Team A" in names
+    assert mq.query_team_names_for_select(sample_db, "team a", 50) == ["Team A"]
+    st = mq.query_team_stats(sample_db, "Team A")
+    assert st is not None
+    assert st["participants"] == 1
+    assert st["finishes"] == 2
+    assert st["active_years_count"] == 2
+    assert st["active_years_list"] == [2023, 2024]
+    opts = mq.query_team_year_options_for_cups(sample_db, "Team A")
+    assert 2024 in opts
+    rows = mq.query_team_cup_points_for_year(sample_db, "Team A", 2024)
+    assert len(rows) == 2
+    cups_pts = {(r["cup"], r["points"]) for r in rows}
+    assert ("Super Cup", 99.5) in cups_pts
+    assert ("Mini Cup", 10.0) in cups_pts

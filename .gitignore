@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Tests / tooling
+.pytest_cache/
+.mypy_cache/
+
+# Локальная БД и секреты
+*.db
+*.sqlite
+*.sqlite3
+*.db-shm
+*.db-wal
+.streamlit/secrets.toml
+.env
+.env.*
+
+# Бинарники / офис / временные
+*.apk
+*.pbix
+*.xlsx
+*.docx
+~$*
+
+# Крупные локальные дампы (собираются скриптами)
+profiles.csv
+results.csv
+ref_competitions.csv
+profiles.jsonl
+discovered_refs.json
+captured_requests.json
+profile_debug.html
+marathon_db_erd.html

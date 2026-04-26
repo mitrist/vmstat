@@ -1,0 +1,10 @@
+# Тема в духе vologdamarafon.ru (акцент #ff253a, светлый контент)
+[theme]
+primaryColor = "#ff253a"
+backgroundColor = "#ececec"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#1e1e22"
+font = "sans serif"
+
+[client]
+toolbarMode = "minimal"
