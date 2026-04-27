@@ -102,6 +102,7 @@ def sample_db() -> Path:
         INSERT INTO results VALUES (2, 2, 11, 100, 0, 7200.0, 'Team A', 5, 2, 4, 'M40', '02:00:00', '{}');
         INSERT INTO results VALUES (3, 1, 10, 101, 0, 3500.0, 'Team B', 2, 2, 1, 'M40', '00:58:00', '{}');
         INSERT INTO cup_competitions VALUES (1, 1);
+        INSERT INTO cup_competitions VALUES (2, 2);
         INSERT INTO cups VALUES (1, 'Super Cup', 2024, 'run', '{}');
         INSERT INTO cups VALUES (2, 'Mini Cup', 2024, 'run', '{}');
         INSERT INTO cup_distances VALUES (1, 1, '21 km', 21.0, 'run', '{}');
@@ -140,6 +141,12 @@ def sample_db() -> Path:
            place_abs, group_name, total_points, raw)
         VALUES (4, 101, 2024, 1, 'Super Cup', 1, '21 km', 1, 'M40', 150.0,
             '{"competition": {"id": 1, "title": "Контрольный забег (2024)"}}');
+        INSERT INTO competition_stats
+          (competition_id, total_members, male, female, teams, regions, dnf, raw)
+        VALUES (1, 3, 2, 1, 2, 1, 0, NULL);
+        INSERT INTO competition_stats
+          (competition_id, total_members, male, female, teams, regions, dnf, raw)
+        VALUES (2, 1, 1, 0, 0, 0, 0, NULL);
         """
     )
     conn.commit()
@@ -343,3 +350,30 @@ def test_team_detail_and_cups(sample_db: Path) -> None:
     cups_pts = {(r["cup"], r["points"]) for r in rows}
     assert ("Super Cup", 99.5) in cups_pts
     assert ("Mini Cup", 10.0) in cups_pts
+
+
+def test_cups_for_obsh_header_filter(sample_db: Path) -> None:
+    all_c = mq.query_cups_for_obsh_header_filter(sample_db, None, None)
+    ids = {r["id"] for r in all_c}
+    assert ids == {1, 2}
+    r_2023 = mq.query_cups_for_obsh_header_filter(sample_db, [2023], None)
+    assert {r["id"] for r in r_2023} == {2}
+    r_2024 = mq.query_cups_for_obsh_header_filter(sample_db, [2024], None)
+    assert {r["id"] for r in r_2024} == {1}
+
+
+def test_general_stats_events_table(sample_db: Path) -> None:
+    rows = mq.query_general_stats_events_table(sample_db, None, None, None, bar_year=None)
+    assert len(rows) == 2
+    t2024 = next(r for r in rows if r["год"] == 2024)
+    assert "Test" in t2024["Событие"]
+    assert t2024["Количество участников"] == 3
+    rows24 = mq.query_general_stats_events_table(
+        sample_db, None, None, None, bar_year=2024
+    )
+    assert len(rows24) == 1 and rows24[0]["год"] == 2024
+    rows_f = mq.query_general_stats_events_table(
+        sample_db, [2024], ["run"], [1], bar_year=None
+    )
+    assert len(rows_f) == 1
+    assert rows_f[0]["год"] == 2024

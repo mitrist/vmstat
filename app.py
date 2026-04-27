@@ -42,6 +42,46 @@ VM_BLUE = "#93BDDD"
 OBSH_BAR_TITLE_NOTE = "Линия тренда - скользящее среднее за 3 года"
 
 
+def _st_plotly_chart_supports_on_select() -> bool:
+    import inspect
+
+    return "on_select" in inspect.signature(st.plotly_chart).parameters
+
+
+def _obsh_parse_year_from_plotly_event(event: object) -> int | None:
+    """Ось X гистограммы «по годам» — взять год из selection.points (st.plotly_chart on_select)."""
+    if event is None:
+        return None
+    sel: Any = getattr(event, "selection", None)
+    if sel is None and isinstance(event, dict):
+        sel = event.get("selection")
+    if not sel:
+        return None
+    points: Any = (
+        sel.get("points")
+        if isinstance(sel, dict)
+        else getattr(sel, "points", None)
+    )
+    if not points:
+        return None
+    p0 = points[0]
+    if isinstance(p0, dict):
+        x = p0.get("x", p0.get("label"))
+    else:
+        x = getattr(p0, "x", None)
+    if x is None:
+        return None
+    try:
+        if isinstance(x, (int, float)) and not isinstance(x, bool):
+            return int(x)
+        s = str(x).strip()
+        if s.lstrip("-").isdigit():
+            return int(s)
+        return int(float(s))
+    except (TypeError, ValueError):
+        return None
+
+
 def db_path() -> Path:
     try:
         if hasattr(st, "secrets") and st.secrets and "marathon" in st.secrets:
@@ -564,27 +604,65 @@ def page_general_statistics() -> None:
 
     years_all = mq.query_distinct_years(path)
     sports_all = mq.query_distinct_sports(path)
-    cups_rows = mq.query_cups_for_filter(path)
-    cup_labels = {int(r["id"]): f"{r.get('title', '')} ({r.get('year', '—')})" for r in cups_rows}
 
-    st.caption("Пустой фильтр по году / виду / кубку означает «все значения».")
-    fc1, fc2, fc3 = st.columns(3)
-    with fc1:
-        sel_years = st.multiselect("Год", options=years_all, default=[], key="obsh_f_years")
-    with fc2:
-        sel_sports = st.multiselect("Вид спорта", options=sports_all, default=[], key="obsh_f_sports")
-    with fc3:
-        cup_ids_opts = list(cup_labels.keys())
+    st.markdown(
+        f'<p style="color:{VM_TEXT};font-weight:600;margin:0 0 6px 0;">Год</p>'
+        f'<p style="color:{VM_MUTED};font-size:0.85rem;margin:0 0 6px 0;">'
+        f"Ничего не выбрано — учитываются все годы.</p>",
+        unsafe_allow_html=True,
+    )
+    if years_all:
+        sy = st.pills(
+            "Год",
+            options=years_all,
+            selection_mode="multi",
+            default=[],
+            key="obsh_p_y",
+            label_visibility="collapsed",
+        )
+        yf = list(sy) if sy else None
+    else:
+        yf = None
+
+    st.markdown(
+        f'<p style="color:{VM_TEXT};font-weight:600;margin:0 0 6px 0;">Вид спорта</p>'
+        f'<p style="color:{VM_MUTED};font-size:0.85rem;margin:0 0 6px 0;">'
+        f"Ничего не выбрано — все виды.</p>",
+        unsafe_allow_html=True,
+    )
+    if sports_all:
+        ss = st.pills(
+            "Вид спорта",
+            options=sports_all,
+            selection_mode="multi",
+            default=[],
+            key="obsh_p_s",
+            label_visibility="collapsed",
+        )
+        sf = list(ss) if ss else None
+    else:
+        sf = None
+
+    cups_rows = mq.query_cups_for_obsh_header_filter(path, yf, sf)
+    cup_labels = {int(r["id"]): f"{r.get('title', '')} ({r.get('year', '—')})" for r in cups_rows}
+    cup_ids_opts = list(cup_labels.keys())
+    st.markdown(
+        f'<p style="color:{VM_TEXT};font-weight:600;margin:0 0 6px 0;">Кубок</p>'
+        f'<p style="color:{VM_MUTED};font-size:0.85rem;margin:0 0 6px 0;">'
+        f"Список зависит от выбранных года и вида спорта. Пусто — все кубки.</p>",
+        unsafe_allow_html=True,
+    )
+    if cup_ids_opts:
         sel_cup_ids = st.multiselect(
             "Кубок",
             options=cup_ids_opts,
             format_func=lambda i: cup_labels.get(int(i), str(i)),
             default=[],
-            key="obsh_f_cups",
+            key="obsh_cup_ms",
         )
-
-    yf = sel_years if sel_years else None
-    sf = sel_sports if sel_sports else None
+    else:
+        st.caption("Нет кубков в БД, подходящих под выбранные год и вид спорта (если кубок привязан к соревнованиям).")
+        sel_cup_ids = []
     cf = sel_cup_ids if sel_cup_ids else None
 
     cards = mq.query_general_stats_cards(path, yf, sf, cf)
@@ -624,7 +702,15 @@ def page_general_statistics() -> None:
             _layout_year_bar_with_labels_and_ma3(
                 fig_e, dfe, "events", "Количество событий по годам"
             )
-            st.plotly_chart(fig_e, use_container_width=True)
+            plot_e_kw: dict[str, Any] = {"use_container_width": True}
+            if _st_plotly_chart_supports_on_select():
+                plot_e_kw["key"] = "obsh_e_bar"
+                plot_e_kw["on_select"] = "rerun"
+                plot_e_kw["selection_mode"] = "points"
+            event_e = st.plotly_chart(fig_e, **plot_e_kw)
+            y_from_bar = _obsh_parse_year_from_plotly_event(event_e)
+            if y_from_bar is not None:
+                st.session_state["obsh_bar_drill"] = y_from_bar
 
     with g2:
         dfp = pd.DataFrame(mq.query_chart_unique_participants_by_year(path, yf, sf, cf))
@@ -648,6 +734,30 @@ def page_general_statistics() -> None:
                 fig_p, dfp, "participants", "Уникальных участников по годам"
             )
             st.plotly_chart(fig_p, use_container_width=True)
+
+    st.subheader("События")
+    if "obsh_bar_drill" not in st.session_state:
+        st.session_state["obsh_bar_drill"] = None
+    bar_drill: int | None = st.session_state.get("obsh_bar_drill")
+    d1, d2 = st.columns([1, 4])
+    with d1:
+        if st.button("Сброс уточнения по графику", help="Снять фильтр года, заданный кликом по столбцу", key="obsh_drill_clear"):
+            st.session_state["obsh_bar_drill"] = None
+            st.rerun()
+    with d2:
+        if bar_drill is not None:
+            st.caption(f"Таблица уточнена по **{bar_drill}** г. (клик по гистограмме «событий по годам»).")
+    ev_rows = mq.query_general_stats_events_table(
+        path, yf, sf, cf, bar_year=bar_drill
+    )
+    if not ev_rows:
+        st.caption("Нет строк для выбранных фильтров.")
+    else:
+        st.dataframe(
+            pd.DataFrame(ev_rows),
+            use_container_width=True,
+            hide_index=True,
+        )
 
     p1, p2 = st.columns(2)
     with p1:

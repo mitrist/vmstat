@@ -1372,6 +1372,73 @@ def query_cups_for_filter(db_path: Path | str) -> list[dict[str, Any]]:
     )
 
 
+def query_cups_for_obsh_header_filter(
+    db_path: Path | str,
+    years: list[int] | None,
+    sports: list[str] | None,
+) -> list[dict[str, Any]]:
+    """
+    Кубки, у которых есть соревнование, удовлетворяющее отбору по году и виду спорта
+    (пусто / None = без ограничения по полю; подмножество для мультиселекта «Кубок»).
+    """
+    w_parts: list[str] = []
+    params: list[Any] = []
+    if years:
+        w_parts.append("c.year IN (" + ",".join("?" * len(years)) + ")")
+        params.extend(years)
+    if sports:
+        w_parts.append("c.sport IN (" + ",".join("?" * len(sports)) + ")")
+        params.extend(sports)
+    inner = " AND ".join(w_parts) if w_parts else "1=1"
+    return q_all(
+        db_path,
+        f"""
+        SELECT DISTINCT cu.id, cu.title, cu.year
+        FROM cups cu
+        WHERE cu.id IN (
+            SELECT cc.cup_id
+            FROM cup_competitions cc
+            JOIN competitions c ON c.id = cc.competition_id
+            WHERE {inner}
+        )
+        ORDER BY cu.year DESC, cu.title
+        """,
+        tuple(params),
+    )
+
+
+def query_general_stats_events_table(
+    db_path: Path | str,
+    years: list[int] | None,
+    sports: list[str] | None,
+    cup_ids: list[int] | None,
+    bar_year: int | None = None,
+) -> list[dict[str, Any]]:
+    """
+    События (competitions) с числом участников из competition_stats;
+    тот же фильтр, что и у «Общей статистики»; bar_year — уточнение по клику на гистограмму по годам.
+    """
+    w, plist = build_competition_filter_sql(years, sports, cup_ids)
+    params: list[Any] = list(plist)
+    if bar_year is not None:
+        w = f"({w}) AND c.year = ?"
+        params.append(bar_year)
+    return q_all(
+        db_path,
+        f"""
+        SELECT
+            c.year AS год,
+            c.title AS "Событие",
+            COALESCE(cs.total_members, 0) AS "Количество участников"
+        FROM competitions c
+        LEFT JOIN competition_stats cs ON cs.competition_id = c.id
+        WHERE {w}
+        ORDER BY c.year DESC, c.title
+        """,
+        tuple(params),
+    )
+
+
 def query_general_stats_cards(
     db_path: Path | str,
     years: list[int] | None,
