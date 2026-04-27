@@ -1,0 +1,137 @@
+{
+  "updated_at_utc": "2026-04-27T08:05:03.681817+00:00",
+  "rules": [
+    {
+      "alias": "полмарафон",
+      "canonical_key": "half_marathon",
+      "canonical_label": "Полумарафон (21.1 км)",
+      "active": true
+    },
+    {
+      "alias": "21 км",
+      "canonical_key": "half_marathon",
+      "canonical_label": "Полумарафон (21.1 км)",
+      "active": true
+    },
+    {
+      "alias": "21 км 97,5м",
+      "canonical_key": "half_marathon",
+      "canonical_label": "Полумарафон (21.1 км)",
+      "active": true
+    },
+    {
+      "alias": "21.0975 км",
+      "canonical_key": "half_marathon",
+      "canonical_label": "Полумарафон (21.1 км)",
+      "active": true
+    },
+    {
+      "alias": "марафон",
+      "canonical_key": "marathon",
+      "canonical_label": "Марафон (42.195 км)",
+      "active": true
+    },
+    {
+      "alias": "42 км",
+      "canonical_key": "marathon",
+      "canonical_label": "Марафон (42.195 км)",
+      "active": true
+    },
+    {
+      "alias": "42,195 км",
+      "canonical_key": "marathon",
+      "canonical_label": "Марафон (42.195 км)",
+      "active": true
+    },
+    {
+      "alias": "10км",
+      "canonical_key": "10k",
+      "canonical_label": "10 км",
+      "active": true
+    },
+    {
+      "alias": "5км",
+      "canonical_key": "5k",
+      "canonical_label": "5 км",
+      "active": true
+    },
+    {
+      "alias": "Полумарафон",
+      "canonical_key": "half_marathon",
+      "canonical_label": "Полумарафон (21.1 км)",
+      "active": true
+    },
+    {
+      "alias": "Полумарафон (21.1 км)",
+      "canonical_key": "half_marathon",
+      "canonical_label": "Полумарафон (21.1 км)",
+      "active": true
+    },
+    {
+      "alias": "Полумарафон 21 км 97,5 м",
+      "canonical_key": "half_marathon",
+      "canonical_label": "Полумарафон (21.1 км)",
+      "active": true
+    },
+    {
+      "alias": "Марафон 42 км 195 м",
+      "canonical_key": "marathon",
+      "canonical_label": "Марафон (42.195 км)",
+      "active": true
+    },
+    {
+      "alias": "Марафон (42.195 км)",
+      "canonical_key": "marathon",
+      "canonical_label": "Марафон (42.195 км)",
+      "active": true
+    },
+    {
+      "alias": "21 км 97,5 м",
+      "canonical_key": "half_marathon",
+      "canonical_label": "Полумарафон (21.1 км)",
+      "active": true
+    },
+    {
+      "alias": "42 км 195 м",
+      "canonical_key": "marathon",
+      "canonical_label": "Марафон (42.195 км)",
+      "active": true
+    },
+    {
+      "alias": "Полумарафон 21 км",
+      "canonical_key": "half_marathon",
+      "canonical_label": "Полумарафон (21.1 км)",
+      "active": true
+    },
+    {
+      "alias": "21км",
+      "canonical_key": "half_marathon",
+      "canonical_label": "Полумарафон (21.1 км)",
+      "active": true
+    },
+    {
+      "alias": "10 км 350 м",
+      "canonical_key": "10k",
+      "canonical_label": "10 км",
+      "active": true
+    },
+    {
+      "alias": "21,1 км",
+      "canonical_key": "half_marathon",
+      "canonical_label": "Полумарафон (21.1 км)",
+      "active": true
+    },
+    {
+      "alias": "50км",
+      "canonical_key": "50k",
+      "canonical_label": "50 км",
+      "active": true
+    },
+    {
+      "alias": "50 км",
+      "canonical_key": "50k",
+      "canonical_label": "50 км",
+      "active": false
+    }
+  ]
+}

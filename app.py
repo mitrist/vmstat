@@ -128,22 +128,22 @@ def inject_vm_styles() -> None:
             background-image: linear-gradient(90deg, {VM_ACCENT}, #b0d4ea);
         }}
         section[data-testid="stSidebar"] > div:first-child {{
-            background: {VM_PAGE_BG};
-            color: {VM_TEXT};
+            background: #e6edf7;
+            color: #1d3f72;
         }}
         section[data-testid="stSidebar"] label,
         section[data-testid="stSidebar"] span,
         section[data-testid="stSidebar"] p {{
-            color: {VM_TEXT} !important;
+            color: #1d3f72 !important;
         }}
         section[data-testid="stSidebar"] a, section[data-testid="stSidebar"] a:visited {{
-            color: {VM_LINK} !important;
+            color: #1b4f9c !important;
         }}
         section[data-testid="stSidebar"] .stMarkdown {{
-            color: {VM_MUTED} !important;
+            color: #2e5f9f !important;
         }}
         section[data-testid="stSidebar"] hr {{
-            border-color: {VM_CARD_BORDER};
+            border-color: #b8cbe2;
         }}
         /* Сайдбар: навигация — только текст, без кружков/иконок (см. .vm-sidebar-text-nav) */
         .vm-sidebar-text-nav {{
@@ -156,16 +156,16 @@ def inject_vm_styles() -> None:
         }}
         .vm-sidebar-text-nav .vm-sidebar-here {{
             font-weight: 600;
-            color: {VM_TEXT};
+            color: #143f7a;
         }}
         .vm-sidebar-text-nav a {{
-            color: {VM_TEXT};
+            color: #1b4f9c;
             text-decoration: none;
             font-weight: 400;
         }}
         .vm-sidebar-text-nav a:hover {{
             text-decoration: underline;
-            color: {VM_LINK};
+            color: #0d3a7a;
         }}
         .vm-brand-bar {{
             background: {VM_PAGE_BG};
@@ -479,10 +479,19 @@ def _sidebar_read_nav_i_from_url() -> int | None:
 
 
 def render_sidebar_text_nav(pages: tuple[str, ...], current: str) -> None:
-    """Пункты меню: обычный текст, текущий раздел — полужирно; остальные — ссылка ?i= (без иконок)."""
+    """Пункты меню: текст+иконка, текущий раздел — полужирно; остальные — ссылка ?i=."""
+    icons = {
+        "Общая статистика": "📊",
+        "Событие": "🏁",
+        "Участник": "👤",
+        "Команда": "🛡️",
+        "Кубки": "🏆",
+        "Админка": "⚙️",
+    }
     parts: list[str] = ['<div class="vm-sidebar-text-nav">']
     for j, title in enumerate(pages):
-        esc = html.escape(title)
+        icon = icons.get(title, "•")
+        esc = html.escape(f"{icon} {title}")
         if title == current:
             parts.append(f'<p class="vm-sidebar-here">{esc}</p>')
         else:
@@ -800,27 +809,131 @@ def page_event() -> None:
     path = db_path()
     if not require_db(path):
         return
-    years = mq.query_distinct_years(path)
-    if not years:
-        st.warning("Нет годов в базе.")
+    years_all = mq.query_distinct_years(path)
+    sports_all = mq.query_distinct_sports(path)
+
+    st.markdown(
+        f'<p style="color:{VM_TEXT};font-weight:600;margin:0 0 6px 0;">Год</p>'
+        f'<p style="color:{VM_MUTED};font-size:0.85rem;margin:0 0 6px 0;">'
+        f"Ничего не выбрано — учитываются все годы.</p>",
+        unsafe_allow_html=True,
+    )
+    if years_all:
+        sy = st.pills(
+            "Год",
+            options=years_all,
+            selection_mode="multi",
+            default=[],
+            key="event_pills_years",
+            label_visibility="collapsed",
+        )
+        years_filter = list(sy) if sy else None
+    else:
+        years_filter = None
+
+    st.markdown(
+        f'<p style="color:{VM_TEXT};font-weight:600;margin:0 0 6px 0;">Вид спорта</p>'
+        f'<p style="color:{VM_MUTED};font-size:0.85rem;margin:0 0 6px 0;">'
+        f"Ничего не выбрано — учитываются все виды спорта.</p>",
+        unsafe_allow_html=True,
+    )
+    if sports_all:
+        ss = st.pills(
+            "Вид спорта",
+            options=sports_all,
+            selection_mode="multi",
+            default=[],
+            key="event_pills_sports",
+            label_visibility="collapsed",
+        )
+        sports_filter = list(ss) if ss else None
+    else:
+        sports_filter = None
+
+    cards = mq.query_event_section_cards(path, years_filter, sports_filter)
+    st.markdown("##### Показатели")
+    c1, c2, c3, c4, c5 = st.columns(5, gap="small")
+    with c1:
+        metric_plaque("Всего событий", cards.get("total_events", 0))
+    with c2:
+        metric_plaque("Уникальных участников", cards.get("total_participants", 0))
+    with c3:
+        metric_plaque("Команд (уник.)", cards.get("teams_distinct", 0))
+    with c4:
+        metric_plaque("Регионов (уник.)", cards.get("regions_distinct", 0))
+    with c5:
+        metric_plaque("Стран (уник.)", cards.get("countries_distinct", 0))
+
+    st.subheader("События")
+    event_rows = mq.query_event_section_events_table(path, years_filter, sports_filter)
+    if not event_rows:
+        st.caption("Нет строк для выбранных фильтров.")
+    else:
+        st.dataframe(pd.DataFrame(event_rows), use_container_width=True, hide_index=True)
+
+    st.subheader("Рекорды события")
+    rec_rows = mq.query_event_section_records_hierarchy(
+        path, years_filter, sports_filter, top_n=5
+    )
+    if not rec_rows:
+        st.caption("Нет данных для построения рекордов по выбранным фильтрам.")
+    else:
+        st.caption("Иерархия: **событие → дистанция → топ-5 мужчин и топ-5 женщин (по всем годам)**.")
+        frag = _event_records_hierarchy_html(rec_rows)
+        if hasattr(st, "html"):
+            st.html(frag)
+        else:
+            st.markdown(frag, unsafe_allow_html=True)
+
+    st.subheader("Детали выбранного события")
+    years_for_detail = years_filter if years_filter else years_all
+    if not years_for_detail:
+        st.caption("Нет годов для детализации.")
         return
-    year = st.selectbox("Год", years, index=0, key="ev_year")
-    comps = mq.query_competitions_for_year(path, year)
+    year = st.selectbox("Год (детали)", years_for_detail, index=0, key="ev_year_detail")
+    comps = mq.query_competitions_for_year(path, int(year))
+    if sports_filter:
+        sports_set = {str(x) for x in sports_filter}
+        comps = [c for c in comps if str(c.get("вид") or "") in sports_set]
     if not comps:
-        st.info("Нет событий за выбранный год.")
+        st.info("Нет событий для выбранных фильтров.")
         return
-    labels = [f"{c.get('id')} — {c.get('событие', '')[:60]}" for c in comps]
-    idx = st.selectbox("Соревнование", range(len(labels)), format_func=lambda i: labels[i])
+    labels = [f"{c.get('id')} — {c.get('событие', '')[:70]}" for c in comps]
+    idx = st.selectbox(
+        "Соревнование (детали)",
+        range(len(labels)),
+        format_func=lambda i: labels[i],
+        key="ev_competition_detail",
+    )
     comp_id = int(comps[idx]["id"])
 
-    st.subheader("Сводка")
-    st.dataframe(pd.DataFrame(mq.query_competition_header(path, comp_id)), use_container_width=True)
-    st.subheader("Дистанции")
-    st.dataframe(pd.DataFrame(mq.query_competition_distances(path, comp_id)), use_container_width=True)
-    st.subheader("Топ-10 зачёта (фрагмент)")
-    st.dataframe(pd.DataFrame(mq.query_competition_top10(path, comp_id)), use_container_width=True)
-    st.subheader("Группы")
-    st.dataframe(pd.DataFrame(mq.query_competition_groups(path, comp_id)), use_container_width=True)
+    st.markdown("##### Сводка")
+    st.dataframe(
+        pd.DataFrame(mq.query_competition_header(path, comp_id)),
+        use_container_width=True,
+        hide_index=True,
+    )
+    d1, d2 = st.columns(2)
+    with d1:
+        st.markdown("##### Дистанции")
+        st.dataframe(
+            pd.DataFrame(mq.query_competition_distances(path, comp_id)),
+            use_container_width=True,
+            hide_index=True,
+        )
+    with d2:
+        st.markdown("##### Группы")
+        st.dataframe(
+            pd.DataFrame(mq.query_competition_groups(path, comp_id)),
+            use_container_width=True,
+            hide_index=True,
+        )
+    st.markdown("##### Топ-10 зачёта (фрагмент)")
+    st.dataframe(
+        pd.DataFrame(mq.query_competition_top10(path, comp_id)),
+        use_container_width=True,
+        hide_index=True,
+    )
 
 
 def _stat_int(val: object) -> int:
@@ -828,6 +941,21 @@ def _stat_int(val: object) -> int:
         return int(val) if val is not None else 0
     except (TypeError, ValueError):
         return 0
+
+
+def _is_admin_user() -> bool:
+    """Права администратора для скрытия чувствительных вкладок."""
+    if bool(st.session_state.get("is_admin", False)):
+        return True
+    try:
+        if hasattr(st, "secrets") and st.secrets and "admin" in st.secrets:
+            adm = st.secrets["admin"]
+            if bool(adm.get("enabled", False)):
+                # Без явной сессии не открываем admin-вкладку.
+                return bool(st.session_state.get("is_admin", False))
+    except Exception:
+        return bool(st.session_state.get("is_admin", False))
+    return False
 
 
 def _cup_detail_age_group_options(rows: list[dict]) -> list[str]:
@@ -1092,70 +1220,162 @@ def _cup_team_hierarchy_html(
     return "".join(parts)
 
 
+def _event_records_hierarchy_html(rows: list[dict[str, Any]]) -> str:
+    """Иерархия для раздела «Рекорды события»: событие -> дистанция -> топ-5 м/ж."""
+    from collections import defaultdict
+
+    by_event: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for r in rows:
+        event_name = str(r.get("Событие") or "—").strip() or "—"
+        by_event[event_name].append(r)
+
+    events_sorted = sorted(by_event.items(), key=lambda x: x[0].casefold())
+    parts: list[str] = [
+        """<div class="vm-cup-tree" role="tree">
+<div class="vm-cup-head"><span>#</span><span>Событие</span><span>Дистанций</span><span>Результатов</span></div>
+"""
+    ]
+    for event_rank, (event_name, event_rows) in enumerate(events_sorted, start=1):
+        by_dist: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for r in event_rows:
+            dist_name = str(r.get("Дистанция") or "—").strip() or "—"
+            by_dist[dist_name].append(r)
+        dist_items = sorted(by_dist.items(), key=lambda x: x[0].casefold())
+
+        parts.append(
+            f'<details class="vm-cup-team"><summary>'
+            f'<span class="vm-cup-rank-cell"><span class="vm-cup-caret-t" aria-hidden="true"></span>{_esc_html(event_rank)}</span>'
+            f"<span>{_esc_html(event_name)}</span>"
+            f'<span style="text-align:right;font-variant-numeric:tabular-nums;">{_esc_html(len(dist_items))}</span>'
+            f'<span style="text-align:right;font-variant-numeric:tabular-nums;">{_esc_html(len(event_rows))}</span>'
+            f"</summary><div class='vm-cup-team-body'>"
+        )
+        for dist_name, dist_rows in dist_items:
+            parts.append(
+                "<details class='vm-cup-member'><summary>"
+                f'<span class="vm-cup-name-cell"><span class="vm-cup-caret-m" aria-hidden="true"></span>{_esc_html(dist_name)}</span>'
+                f'<span style="text-align:right;font-variant-numeric:tabular-nums;">{_esc_html(len(dist_rows))}</span>'
+                "<span></span>"
+                '<span class="vm-cup-badge">Топ 5 M/F</span>'
+                "</summary>"
+            )
+            parts.append("<table class='vm-cup-ev'><thead><tr>")
+            for h in ("Пол", "Место", "Год", "Этап", "Участник", "Время"):
+                parts.append(f"<th>{_esc_html(h)}</th>")
+            parts.append("</tr></thead><tbody>")
+            for row in dist_rows:
+                place_raw = row.get("Место")
+                place_s = str(place_raw) if place_raw is not None else "—"
+                if place_s == "1":
+                    place_s = "👑 1"
+                parts.append(
+                    "<tr>"
+                    f"<td>{_esc_html(row.get('Пол'))}</td>"
+                    f"<td>{_esc_html(place_s)}</td>"
+                    f"<td>{_esc_html(row.get('Год'))}</td>"
+                    f"<td>{_esc_html(row.get('Этап'))}</td>"
+                    f"<td>{_esc_html(row.get('Участник'))}</td>"
+                    f"<td>{_esc_html(row.get('Время'))}</td>"
+                    "</tr>"
+                )
+            parts.append("</tbody></table></details>")
+        parts.append("</div></details>")
+    parts.append("</div>")
+    return "".join(parts)
+
+
 def page_participant() -> None:
     st.header("Участник")
     path = db_path()
     if not require_db(path):
         return
 
+    st.caption("Быстрый выбор: введите фамилию/имя или id участника.")
     needle = st.text_input(
-        "Поиск по имени, фамилии или id",
+        "ФИО или id",
         placeholder="Например: Иванов или 2139",
-        key="part_needle",
+        key="part_needle_unified",
     )
-    pid_direct = st.number_input(
-        "Или введите id участника напрямую",
-        min_value=0,
-        value=0,
-        step=1,
-        key="part_pid_direct",
-    )
-
     rows: list[dict] = []
     if needle.strip():
-        rows = mq.query_profile_search(path, needle.strip(), 50)
+        rows = mq.query_profile_search_enriched(path, needle.strip(), 80)
 
-    table_pid: int | None = None
+    picked_pid: int | None = None
     if rows:
-        st.caption("Компактный выбор: **таблица** — выделите одну строку (участника).")
-        df_pick = pd.DataFrame(
-            [
-                {
-                    "id": int(r["id"]),
-                    "Фамилия": (r.get("last_name") or "").strip(),
-                    "Имя": (r.get("first_name") or "").strip(),
-                    "Город": (r.get("city") or "").strip(),
-                }
-                for r in rows
-            ]
+        st.caption("Выберите участника из выпадающего списка.")
+        options = [int(r["id"]) for r in rows]
+        labels = {
+            int(r["id"]): (
+                f"{(r.get('last_name') or '').strip()}, "
+                f"{(r.get('first_name') or '').strip()}, "
+                f"{(r.get('city') or '').strip() or '—'}, "
+                f"id {int(r['id'])}"
+            )
+            for r in rows
+        }
+        picked_pid = st.selectbox(
+            "Варианты",
+            options=options,
+            format_func=lambda i: labels.get(int(i), f"id {int(i)}"),
+            index=None,
+            placeholder="Начните печатать и выберите участника...",
+            key="part_pick_selectbox",
         )
-        h = min(320, 72 + len(df_pick) * 36)
-        ev = st.dataframe(
-            df_pick,
-            use_container_width=True,
-            hide_index=True,
-            on_select="rerun",
-            selection_mode="single-row",
-            key="part_search_pick_df",
-            height=h,
-        )
-        if ev.selection.rows:
-            table_pid = int(df_pick.iloc[ev.selection.rows[0]]["id"])
+        if picked_pid is not None:
+            picked_pid = int(picked_pid)
 
-    active_pid: int | None = None
-    if pid_direct and pid_direct > 0:
-        active_pid = int(pid_direct)
-    elif table_pid is not None:
-        active_pid = table_pid
+    if "participant_recent_ids" not in st.session_state:
+        st.session_state["participant_recent_ids"] = []
+    recent_ids_raw = st.session_state.get("participant_recent_ids", [])
+    recent_ids = [int(x) for x in recent_ids_raw if isinstance(x, (int, float, str)) and str(x).strip().isdigit()]
+    recent_ids = list(dict.fromkeys(recent_ids))[:10]
+    recent_pick: int | None = None
+    if recent_ids:
+        with st.expander("Недавние участники", expanded=False):
+            recent_rows: list[dict] = []
+            for rid in recent_ids[:10]:
+                pr = mq.query_profile_row(path, int(rid))
+                if not pr:
+                    continue
+                fn = (pr.get("first_name") or "").strip()
+                ln = (pr.get("last_name") or "").strip()
+                recent_rows.append(
+                    {
+                        "id": int(rid),
+                        "Участник": f"{ln} {fn}".strip() or f"id {rid}",
+                        "Город": (pr.get("city") or "").strip(),
+                    }
+                )
+            if recent_rows:
+                opt_ids = [int(r["id"]) for r in recent_rows]
+                recent_pick = st.radio(
+                    "Открыть из недавних",
+                    options=opt_ids,
+                    format_func=lambda i: next(
+                        (f"{x['Участник']} · id {i}" for x in recent_rows if int(x["id"]) == int(i)),
+                        f"id {i}",
+                    ),
+                    index=0,
+                    key="participant_recent_pick",
+                )
+            else:
+                st.caption("Список недавних пока пуст.")
+
+    active_pid: int | None = picked_pid if picked_pid is not None else recent_pick
+    if active_pid is None and needle.strip().isdigit():
+        active_pid = int(needle.strip())
 
     if active_pid is None:
         if needle.strip() and not rows:
             st.warning("Ничего не найдено.")
         elif needle.strip() and rows:
-            st.caption("Выберите строку в таблице или введите **id** участника выше.")
-        elif not needle.strip() and (not pid_direct or pid_direct <= 0):
-            st.caption("Введите запрос в поиск или id участника.")
+            st.caption("Выберите участника в выпадающем списке.")
+        elif not needle.strip():
+            st.caption("Введите запрос в поиск или выберите участника из недавних.")
         return
+
+    hist = [int(active_pid)] + [int(x) for x in recent_ids if int(x) != int(active_pid)]
+    st.session_state["participant_recent_ids"] = hist[:10]
 
     show_participant_dashboard(path, active_pid)
 
@@ -1168,6 +1388,13 @@ def show_participant_dashboard(path: Path, pid: int) -> None:
 
     title = f"{(p.get('last_name') or '').strip()} {(p.get('first_name') or '').strip()}".strip() or "Участник"
     st.subheader(f"{title} · id {pid}")
+    profile_url = f"https://vologdamarafon.ru/profile/{int(pid)}/"
+    st.markdown(
+        f'<p style="margin:0 0 10px 0;">'
+        f'<a href="{html.escape(profile_url)}" target="_blank" rel="noopener">Профиль на vologdamarafon.ru</a>'
+        f"</p>",
+        unsafe_allow_html=True,
+    )
     st.markdown(
         f'<p style="color:{VM_MUTED};font-size:0.95rem;margin:0 0 12px 0;">'
         f"Пол: <b>{html.escape(str(p.get('gender') or '—'))}</b> · "
@@ -1177,25 +1404,8 @@ def show_participant_dashboard(path: Path, pid: int) -> None:
         unsafe_allow_html=True,
     )
 
-    st.markdown("##### Сводная статистика (профиль)")
-    s1, s2, s3, s4, s5, s6 = st.columns(6, gap="small")
-    with s1:
-        metric_plaque("Событий (stat_competitions)", _stat_int(p.get("stat_competitions")))
-    with s2:
-        metric_plaque("Км всего (stat_km)", _stat_int(p.get("stat_km")))
-    with s3:
-        metric_plaque("Марафонов (stat_marathons)", _stat_int(p.get("stat_marathons")))
-    with s4:
-        metric_plaque("Первых мест", _stat_int(p.get("stat_first")))
-    with s5:
-        metric_plaque("Вторых мест", _stat_int(p.get("stat_second")))
-    with s6:
-        metric_plaque("Третьих мест", _stat_int(p.get("stat_third")))
-
     raw_years = mq.parse_profile_active_years(p.get("raw"))
     ay_text = ", ".join(str(y) for y in raw_years) if raw_years else "—"
-    metric_plaque("Годы активности (raw → active_years)", ay_text)
-
     db_years = mq.query_profile_participation_years(path, pid)
     year_opts = sorted(set(db_years) | set(raw_years), reverse=True)
     cy = datetime.date.today().year
@@ -1210,7 +1420,7 @@ def show_participant_dashboard(path: Path, pid: int) -> None:
     st.markdown(
         f'<p style="color:{VM_TEXT};font-weight:600;margin:16px 0 6px 0;">Год</p>'
         f'<p style="color:{VM_MUTED};font-size:0.85rem;margin:0 0 8px 0;">'
-        f"Фильтрует таблицы вкладок «События» и «Кубки».</p>",
+        f"Фильтрует KPI и вкладки профиля участника.</p>",
         unsafe_allow_html=True,
     )
     st.pills(
@@ -1222,13 +1432,135 @@ def show_participant_dashboard(path: Path, pid: int) -> None:
     )
     y_filter = int(st.session_state[sk])
 
-    tab_ev, tab_cup = st.tabs(["События", "Кубки"])
+    kpi_all = mq.query_profile_kpi_all_time(path, pid)
+    kpi_year = mq.query_profile_kpi_year(path, pid, y_filter)
+    active_years_count = len(set(db_years) | set(raw_years))
+    stat_km_profile = _stat_int(p.get("stat_km"))
+    stat_first_profile = _stat_int(p.get("stat_first"))
+    stat_second_profile = _stat_int(p.get("stat_second"))
+    stat_third_profile = _stat_int(p.get("stat_third"))
+    st.markdown("##### KPI участника")
+    mode = st.segmented_control(
+        "Режим KPI",
+        options=["Все годы", "Год"],
+        selection_mode="single",
+        default="Все годы",
+        key=f"part_kpi_mode_{pid}",
+    )
+    kv = kpi_all if mode == "Все годы" else kpi_year
+    k1, k2, k3, k4, k5 = st.columns(5, gap="small")
+    with k1:
+        metric_plaque("Старты", _stat_int(kv.get("starts_total")))
+    with k2:
+        metric_plaque("Финиши", _stat_int(kv.get("finishes_total")))
+    with k3:
+        metric_plaque("Активных лет", active_years_count)
+    with k4:
+        metric_plaque("Км", stat_km_profile)
+    with k5:
+        metric_plaque("DNF", _stat_int(kv.get("dnf_total")))
+    k6, k7, k8, k9, k10 = st.columns(5, gap="small")
+    with k6:
+        metric_plaque("Событий", _stat_int(kv.get("events_distinct")))
+    with k7:
+        metric_plaque("Дистанций (уник.)", _stat_int(kv.get("distances_distinct")))
+    with k8:
+        metric_plaque("Первых мест", stat_first_profile)
+    with k9:
+        metric_plaque("Вторых мест", stat_second_profile)
+    with k10:
+        metric_plaque("Третьих мест", stat_third_profile)
+    st.markdown(
+        f'<p style="color:{VM_MUTED};font-size:0.85rem;margin:6px 0 10px 0;">'
+        f"Годы активности (raw): <b>{html.escape(ay_text)}</b></p>",
+        unsafe_allow_html=True,
+    )
+
+    tr = pd.DataFrame(mq.query_profile_yearly_trends(path, pid))
+    if not tr.empty:
+        g1, g2 = st.columns(2)
+        with g1:
+            f_st = px.bar(tr, x="year", y="starts", labels={"year": "Год", "starts": "Стартов"})
+            f_st.update_traces(
+                marker_color=VM_ACCENT,
+                texttemplate="%{y:.0f}",
+                textposition="outside",
+                cliponaxis=False,
+            )
+            f_st.update_layout(plot_bgcolor="white", paper_bgcolor="white", font=dict(color=VM_TEXT), xaxis_type="category")
+            st.plotly_chart(f_st, use_container_width=True)
+        with g2:
+            f_km = px.line(tr, x="year", y="km_total", markers=True, labels={"year": "Год", "km_total": "Км"})
+            f_km.update_traces(line_color=VM_ACCENT)
+            f_km.update_layout(plot_bgcolor="white", paper_bgcolor="white", font=dict(color=VM_TEXT), xaxis_type="category")
+            st.plotly_chart(f_km, use_container_width=True)
+
+    tabs = ["События", "Рекорды", "Кубки", "Команды"]
+    if _is_admin_user():
+        tabs.append("Качество данных")
+    tt = st.tabs(tabs)
+    tab_ev = tt[0]
+    tab_rec = tt[1]
+    tab_cup = tt[2]
+    tab_team = tt[3]
+    tab_quality = tt[4] if len(tt) > 4 else None
+
     with tab_ev:
-        ev_df = pd.DataFrame(mq.query_profile_results_history_for_year(path, pid, y_filter))
+        all_rows = mq.query_profile_events_table(path, pid, years=None, include_dnf=True)
+        all_df = pd.DataFrame(all_rows)
+        if all_df.empty:
+            st.caption("Нет стартов по участнику.")
+            return
+        sports_opts = sorted(
+            {
+                str(x).strip()
+                for x in all_df.get("вид", pd.Series(dtype="object")).tolist()
+                if str(x).strip()
+            }
+        )
+        dist_opts = sorted(
+            {
+                str(x).strip()
+                for x in all_df.get("дистанция", pd.Series(dtype="object")).tolist()
+                if str(x).strip()
+            }
+        )
+        f1, f2, f3 = st.columns(3)
+        with f1:
+            sp = st.multiselect("Вид спорта", options=sports_opts, default=[], key=f"part_sports_{pid}")
+        with f2:
+            dd = st.multiselect("Дистанция", options=dist_opts, default=[], key=f"part_dists_{pid}")
+        with f3:
+            include_dnf = st.checkbox("Показывать DNF", value=True, key=f"part_inc_dnf_{pid}")
+        ev_df = pd.DataFrame(
+            mq.query_profile_events_table(
+                path,
+                pid,
+                years=[y_filter],
+                sports=sp or None,
+                distance_labels=dd or None,
+                include_dnf=include_dnf,
+            )
+        )
         if ev_df.empty:
-            st.caption(f"Нет финишей в соревнованиях за **{y_filter}**.")
+            st.caption(f"Нет стартов за **{y_filter}** с выбранными фильтрами.")
         else:
             st.dataframe(ev_df, use_container_width=True, hide_index=True)
+
+    with tab_rec:
+        pb_all = pd.DataFrame(mq.query_profile_personal_bests(path, pid, year=None))
+        pb_year = pd.DataFrame(mq.query_profile_personal_bests(path, pid, year=y_filter))
+        st.markdown("##### Личные рекорды (PB, все годы)")
+        if pb_all.empty:
+            st.caption("Нет корректных финишей для расчёта PB.")
+        else:
+            st.dataframe(pb_all, use_container_width=True, hide_index=True)
+        st.markdown(f"##### Лучшие результаты за {y_filter} (SB)")
+        if pb_year.empty:
+            st.caption(f"Нет корректных финишей за {y_filter}.")
+        else:
+            st.dataframe(pb_year, use_container_width=True, hide_index=True)
+
     with tab_cup:
         cup_df = pd.DataFrame(mq.query_profile_cup_rows_for_year(path, pid, y_filter))
         if cup_df.empty:
@@ -1238,6 +1570,19 @@ def show_participant_dashboard(path: Path, pid: int) -> None:
             )
         else:
             st.dataframe(cup_df, use_container_width=True, hide_index=True)
+    with tab_team:
+        team_df = pd.DataFrame(mq.query_profile_team_summary(path, pid))
+        if team_df.empty:
+            st.caption("Нет финишей с непустой командой.")
+        else:
+            st.dataframe(team_df, use_container_width=True, hide_index=True)
+    if tab_quality is not None:
+        with tab_quality:
+            if not _is_admin_user():
+                st.warning("Недостаточно прав для просмотра диагностики качества.")
+                return
+            qdf = pd.DataFrame(mq.query_profile_data_quality(path, pid))
+            st.dataframe(qdf, use_container_width=True, hide_index=True)
 
 
 def page_team() -> None:
@@ -1495,6 +1840,56 @@ def page_cups() -> None:
                     st.markdown(frag, unsafe_allow_html=True)
 
 
+def page_admin() -> None:
+    st.header("Админка")
+    st.subheader("Справочник алиасов дистанций")
+    st.caption(
+        "Используется в разделе «Событие» для нормализации дистанций "
+        "в блоке «Рекорды события» (группировка топов по канонической дистанции)."
+    )
+    src = mq.distance_aliases_file_path()
+    st.code(str(src), language=None)
+
+    current_rows = mq.load_distance_alias_rules()
+    if not current_rows:
+        current_rows = mq.default_distance_alias_rules()
+    df = pd.DataFrame(current_rows)
+    for col in ("alias", "canonical_key", "canonical_label", "active"):
+        if col not in df.columns:
+            df[col] = "" if col != "active" else True
+    df = df[["alias", "canonical_key", "canonical_label", "active"]]
+
+    edited = st.data_editor(
+        df,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="dynamic",
+        key="admin_distance_aliases_editor",
+        column_config={
+            "alias": st.column_config.TextColumn("Alias (как в исходных данных)"),
+            "canonical_key": st.column_config.TextColumn("Канонический key"),
+            "canonical_label": st.column_config.TextColumn("Название в UI"),
+            "active": st.column_config.CheckboxColumn("Активно"),
+        },
+    )
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        save_clicked = st.button("Сохранить справочник", key="admin_save_distance_aliases")
+    with c2:
+        st.caption(
+            "Пустые строки будут отброшены. Один alias не может быть привязан к разным canonical_key."
+        )
+    if save_clicked:
+        rows = edited.to_dict(orient="records")
+        errs = mq.save_distance_alias_rules(rows)
+        if errs:
+            for e in errs:
+                st.error(e)
+        else:
+            st.success("Справочник сохранён.")
+            st.rerun()
+
+
 def main() -> None:
     st.set_page_config(
         page_title="ВологдаМарафон — аналитика",
@@ -1509,6 +1904,7 @@ def main() -> None:
         "Участник",
         "Команда",
         "Кубки",
+        "Админка",
     )
     if SIDEBAR_LOGO.is_file():
         st.sidebar.image(str(SIDEBAR_LOGO), use_container_width=True)
@@ -1521,19 +1917,6 @@ def main() -> None:
     st.sidebar.divider()
     render_sidebar_text_nav(PAGES, page)
 
-    path = db_path()
-    st.sidebar.divider()
-    st.sidebar.caption("База данных")
-    st.sidebar.code(str(path), language=None)
-    if path.is_file():
-        tot = mq.query_general_stats_cards(path, None, None, None)
-        st.sidebar.caption("Сводно по всей базе")
-        sidebar_stat_card("Общее количество событий", tot.get("total_events", 0))
-        sidebar_stat_card(
-            "Общее количество участников (уникальных по profile_id)",
-            tot.get("total_participants", 0),
-        )
-        sidebar_stat_card("Общее количество команд", tot.get("teams_distinct", 0))
     st.sidebar.divider()
     st.sidebar.markdown(
         f'<p style="font-size:11px;color:{VM_MUTED};">Официальный сайт: '
@@ -1550,6 +1933,8 @@ def main() -> None:
         page_participant()
     elif page == "Команда":
         page_team()
+    elif page == "Админка":
+        page_admin()
     else:
         page_cups()
 

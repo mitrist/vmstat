@@ -6,12 +6,17 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
 DEFAULT_DB = Path(os.environ.get("MARATHON_DB", "marathon.db"))
+DEFAULT_DISTANCE_ALIASES_FILE = (
+    Path(__file__).resolve().parent / "config" / "distance_aliases.json"
+)
 
 
 @contextmanager
@@ -38,6 +43,197 @@ def q_one(db_path: Path | str, sql: str, params: tuple[Any, ...] = ()) -> dict[s
 
 def db_exists(db_path: Path | str | None = None) -> bool:
     return Path(db_path or DEFAULT_DB).is_file()
+
+
+def _table_has_column(db_path: Path | str, table_name: str, column_name: str) -> bool:
+    """Проверка наличия колонки в таблице SQLite (для совместимости старых дампов)."""
+    with connect(db_path) as c:
+        rows = c.execute(f"PRAGMA table_info({table_name})").fetchall()
+    for r in rows:
+        if str(r["name"]) == column_name:
+            return True
+    return False
+
+
+def _norm_alias_token(value: str | None) -> str:
+    """Мягкая нормализация текстового алиаса дистанции."""
+    s = (value or "").strip().casefold().replace(",", ".")
+    s = s.replace("ё", "е")
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def distance_aliases_file_path() -> Path:
+    raw = os.environ.get("DISTANCE_ALIASES_FILE", "").strip()
+    if raw:
+        return Path(raw)
+    return DEFAULT_DISTANCE_ALIASES_FILE
+
+
+def default_distance_alias_rules() -> list[dict[str, Any]]:
+    """Базовые правила справочника дистанций."""
+    return [
+        {
+            "alias": "полмарафон",
+            "canonical_key": "half_marathon",
+            "canonical_label": "Полумарафон (21.1 км)",
+            "active": True,
+        },
+        {
+            "alias": "21 км",
+            "canonical_key": "half_marathon",
+            "canonical_label": "Полумарафон (21.1 км)",
+            "active": True,
+        },
+        {
+            "alias": "21 км 97,5м",
+            "canonical_key": "half_marathon",
+            "canonical_label": "Полумарафон (21.1 км)",
+            "active": True,
+        },
+        {
+            "alias": "21.0975 км",
+            "canonical_key": "half_marathon",
+            "canonical_label": "Полумарафон (21.1 км)",
+            "active": True,
+        },
+        {
+            "alias": "марафон",
+            "canonical_key": "marathon",
+            "canonical_label": "Марафон (42.195 км)",
+            "active": True,
+        },
+        {
+            "alias": "42 км",
+            "canonical_key": "marathon",
+            "canonical_label": "Марафон (42.195 км)",
+            "active": True,
+        },
+        {
+            "alias": "42,195 км",
+            "canonical_key": "marathon",
+            "canonical_label": "Марафон (42.195 км)",
+            "active": True,
+        },
+    ]
+
+
+def load_distance_alias_rules() -> list[dict[str, Any]]:
+    """
+    Читает справочник алиасов дистанций из JSON.
+    Если файла нет или формат некорректен — отдаёт дефолтные правила.
+    """
+    p = distance_aliases_file_path()
+    if not p.is_file():
+        return default_distance_alias_rules()
+    try:
+        payload = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return default_distance_alias_rules()
+    rows = payload.get("rules") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        return default_distance_alias_rules()
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        alias = str(r.get("alias") or "").strip()
+        canonical_key = str(r.get("canonical_key") or "").strip()
+        canonical_label = str(r.get("canonical_label") or "").strip()
+        active = bool(r.get("active", True))
+        if not alias or not canonical_key or not canonical_label:
+            continue
+        out.append(
+            {
+                "alias": alias,
+                "canonical_key": canonical_key,
+                "canonical_label": canonical_label,
+                "active": active,
+            }
+        )
+    return out if out else default_distance_alias_rules()
+
+
+def validate_distance_alias_rules(rows: list[dict[str, Any]]) -> list[str]:
+    """Валидация правил перед сохранением."""
+    errors: list[str] = []
+    seen: dict[str, tuple[str, str]] = {}
+    for i, r in enumerate(rows, start=1):
+        alias = str(r.get("alias") or "").strip()
+        ckey = str(r.get("canonical_key") or "").strip()
+        clabel = str(r.get("canonical_label") or "").strip()
+        if not alias or not ckey or not clabel:
+            errors.append(f"Строка {i}: заполните alias / canonical_key / canonical_label.")
+            continue
+        if not bool(r.get("active", True)):
+            continue
+        k = _norm_alias_token(alias)
+        val = (ckey, clabel)
+        if k in seen and seen[k] != val:
+            errors.append(
+                f"Конфликт alias '{alias}': уже связан с {seen[k][0]} / {seen[k][1]}."
+            )
+        else:
+            seen[k] = val
+    return errors
+
+
+def save_distance_alias_rules(rows: list[dict[str, Any]]) -> list[str]:
+    """Сохраняет справочник алиасов в JSON; возвращает список ошибок валидации."""
+    errs = validate_distance_alias_rules(rows)
+    if errs:
+        return errs
+    clean_rows: list[dict[str, Any]] = []
+    for r in rows:
+        alias = str(r.get("alias") or "").strip()
+        ckey = str(r.get("canonical_key") or "").strip()
+        clabel = str(r.get("canonical_label") or "").strip()
+        if not alias and not ckey and not clabel:
+            continue
+        clean_rows.append(
+            {
+                "alias": alias,
+                "canonical_key": ckey,
+                "canonical_label": clabel,
+                "active": bool(r.get("active", True)),
+            }
+        )
+    p = distance_aliases_file_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "rules": clean_rows,
+    }
+    p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return []
+
+
+def normalize_distance_by_alias_rules(
+    raw_distance_name: str | None,
+    rules: list[dict[str, Any]] | None = None,
+) -> tuple[str, str]:
+    """Возвращает (ключ_группировки, label_для_UI) по справочнику алиасов."""
+    src = str(raw_distance_name or "").strip()
+    if not src:
+        return ("—", "—")
+    rule_rows = rules if rules is not None else load_distance_alias_rules()
+    norm_src = _norm_alias_token(src)
+    alias_map: dict[str, tuple[str, str]] = {}
+    for r in rule_rows:
+        if not bool(r.get("active", True)):
+            continue
+        ckey = str(r.get("canonical_key") or "").strip()
+        clabel = str(r.get("canonical_label") or "").strip()
+        alias = str(r.get("alias") or "").strip()
+        if not ckey or not clabel or not alias:
+            continue
+        alias_map[_norm_alias_token(alias)] = (ckey, clabel)
+        alias_map[_norm_alias_token(clabel)] = (ckey, clabel)
+        alias_map[_norm_alias_token(ckey)] = (ckey, clabel)
+    if norm_src in alias_map:
+        key, label = alias_map[norm_src]
+        return (key, label)
+    return (f"raw::{norm_src}", src)
 
 
 def ensure_cup_scoring_schema(db_path: Path | str | None = None) -> None:
@@ -251,6 +447,67 @@ def query_profile_search(db_path: Path | str, needle: str, limit: int = 50) -> l
     )
 
 
+def query_profile_search_enriched(
+    db_path: Path | str, needle: str, limit: int = 50
+) -> list[dict[str, Any]]:
+    """Поиск профилей с доп. полями для удобного выбора (последний год, старты)."""
+    n = (needle or "").strip()
+    if not n:
+        return []
+    lim = int(limit)
+    if n.isdigit():
+        return q_all(
+            db_path,
+            f"""
+            SELECT
+                p.id,
+                p.first_name,
+                p.last_name,
+                p.city,
+                p.gender,
+                p.age,
+                MAX(c.year) AS last_year,
+                COUNT(r.id) AS starts_total
+            FROM profiles p
+            LEFT JOIN results r ON r.profile_id = p.id
+            LEFT JOIN competitions c ON c.id = r.competition_id
+            WHERE p.id = ?
+            GROUP BY p.id
+            LIMIT {lim}
+            """,
+            (int(n),),
+        )
+    pat = f"%{n}%"
+    return q_all(
+        db_path,
+        f"""
+        SELECT
+            p.id,
+            p.first_name,
+            p.last_name,
+            p.city,
+            p.gender,
+            p.age,
+            MAX(c.year) AS last_year,
+            COUNT(r.id) AS starts_total,
+            CASE
+                WHEN LOWER(COALESCE(p.last_name, '')) = LOWER(?) THEN 0
+                WHEN LOWER(COALESCE(p.last_name, '')) LIKE LOWER(?) THEN 1
+                WHEN LOWER(COALESCE(p.first_name, '')) LIKE LOWER(?) THEN 2
+                ELSE 3
+            END AS _rank
+        FROM profiles p
+        LEFT JOIN results r ON r.profile_id = p.id
+        LEFT JOIN competitions c ON c.id = r.competition_id
+        WHERE p.last_name LIKE ? OR p.first_name LIKE ?
+        GROUP BY p.id
+        ORDER BY _rank, p.last_name, p.first_name
+        LIMIT {lim}
+        """,
+        (n, f"{n}%", f"{n}%", pat, pat),
+    )
+
+
 # ── События (отчёты и карточка) ─────────────────────────────────────────────
 
 
@@ -376,6 +633,288 @@ def query_competition_groups(db_path: Path | str, comp_id: int) -> list[dict[str
         """,
         (comp_id,),
     )
+
+
+def query_event_section_cards(
+    db_path: Path | str,
+    years: list[int] | None,
+    sports: list[str] | None,
+) -> dict[str, Any]:
+    """Карточки для раздела «Событие»: события, участники, команды, регионы, страны."""
+    w, plist = build_competition_filter_sql(years, sports, None)
+    params = tuple(plist)
+
+    events = q_one(db_path, f"SELECT COUNT(*) AS n FROM competitions c WHERE {w}", params)
+    total_events = int(events["n"]) if events and events.get("n") is not None else 0
+
+    part = q_one(
+        db_path,
+        f"""
+        SELECT COUNT(DISTINCT r.profile_id) AS n
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        WHERE r.profile_id IS NOT NULL AND COALESCE(r.dnf, 0) = 0 AND {w}
+        """,
+        params,
+    )
+    total_participants = int(part["n"]) if part and part.get("n") is not None else 0
+
+    teams = q_one(
+        db_path,
+        f"""
+        SELECT COUNT(DISTINCT TRIM(r.team)) AS n
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        WHERE COALESCE(r.dnf, 0) = 0 AND TRIM(COALESCE(r.team, '')) != '' AND {w}
+        """,
+        params,
+    )
+    total_teams = int(teams["n"]) if teams and teams.get("n") is not None else 0
+
+    reg = q_one(
+        db_path,
+        f"""
+        SELECT COUNT(DISTINCT reg_key) AS n
+        FROM (
+            SELECT CASE
+                WHEN p.region_id IS NOT NULL THEN 'id:' || CAST(p.region_id AS TEXT)
+                WHEN TRIM(COALESCE(p.region, '')) != '' THEN 'n:' || TRIM(p.region)
+                ELSE NULL
+            END AS reg_key
+            FROM profiles p
+            INNER JOIN results r ON r.profile_id = p.id
+            INNER JOIN competitions c ON c.id = r.competition_id
+            WHERE COALESCE(r.dnf, 0) = 0 AND {w}
+        ) t
+        WHERE reg_key IS NOT NULL
+        """,
+        params,
+    )
+    regions = int(reg["n"]) if reg and reg.get("n") is not None else 0
+
+    cntr = q_one(
+        db_path,
+        f"""
+        SELECT COUNT(DISTINCT c_key) AS n
+        FROM (
+            SELECT CASE
+                WHEN TRIM(COALESCE(p.country, '')) != '' THEN TRIM(p.country)
+                ELSE NULL
+            END AS c_key
+            FROM profiles p
+            INNER JOIN results r ON r.profile_id = p.id
+            INNER JOIN competitions c ON c.id = r.competition_id
+            WHERE COALESCE(r.dnf, 0) = 0 AND {w}
+        ) t
+        WHERE c_key IS NOT NULL
+        """,
+        params,
+    )
+    countries = int(cntr["n"]) if cntr and cntr.get("n") is not None else 0
+
+    return {
+        "total_events": total_events,
+        "total_participants": total_participants,
+        "teams_distinct": total_teams,
+        "regions_distinct": regions,
+        "countries_distinct": countries,
+    }
+
+
+def query_event_section_events_table(
+    db_path: Path | str,
+    years: list[int] | None,
+    sports: list[str] | None,
+) -> list[dict[str, Any]]:
+    """Таблица «События» для раздела события с агрегатами по финишам."""
+    w, plist = build_competition_filter_sql(years, sports, None)
+    return q_all(
+        db_path,
+        f"""
+        SELECT
+            c.year AS "Год",
+            c.title AS "Название события",
+            c.sport AS "Вид спорта",
+            COALESCE(cs.total_members, 0) AS "Количество участников",
+            COALESCE(cs.teams, 0) AS "Количество команд",
+            COALESCE(cs.regions, 0) AS "Регионов",
+            COALESCE((
+                SELECT COUNT(DISTINCT TRIM(COALESCE(p.country, '')))
+                FROM results r
+                INNER JOIN profiles p ON p.id = r.profile_id
+                WHERE r.competition_id = c.id
+                  AND COALESCE(r.dnf, 0) = 0
+                  AND TRIM(COALESCE(p.country, '')) != ''
+            ), 0) AS "Стран"
+        FROM competitions c
+        LEFT JOIN competition_stats cs ON cs.competition_id = c.id
+        WHERE {w}
+        ORDER BY c.year DESC, c.date DESC, c.title
+        """,
+        tuple(plist),
+    )
+
+
+def query_event_section_records_table(
+    db_path: Path | str,
+    years: list[int] | None,
+    sports: list[str] | None,
+) -> list[dict[str, Any]]:
+    """
+    Таблица «Рекорды события»: топ-3 результата по каждой дистанции внутри серии
+    (``competitions.title_short``), по финишному времени.
+    """
+    w, plist = build_competition_filter_sql(years, sports, None)
+    series_expr = (
+        "COALESCE(NULLIF(TRIM(c.title_short), ''), TRIM(c.title))"
+        if _table_has_column(db_path, "competitions", "title_short")
+        else "TRIM(c.title)"
+    )
+    return q_all(
+        db_path,
+        f"""
+        WITH comp_pool AS (
+            SELECT
+                c.id,
+                c.year,
+                c.title,
+                {series_expr} AS title_series
+            FROM competitions c
+            WHERE {w}
+        ),
+        ranked AS (
+            SELECT
+                cp.title_series AS event_series,
+                cp.year AS event_year,
+                d.id AS distance_id,
+                COALESCE(NULLIF(TRIM(d.name), ''), '—') AS distance_name,
+                TRIM(COALESCE(p.last_name, '') || ' ' || COALESCE(p.first_name, '')) AS athlete_name,
+                r.finish_time AS finish_time,
+                r.finish_time_sec AS finish_time_sec,
+                ROW_NUMBER() OVER (
+                    PARTITION BY cp.title_series, d.id
+                    ORDER BY r.finish_time_sec ASC, r.id ASC
+                ) AS rn
+            FROM results r
+            INNER JOIN comp_pool cp ON cp.id = r.competition_id
+            INNER JOIN distances d ON d.id = r.distance_id
+            LEFT JOIN profiles p ON p.id = r.profile_id
+            WHERE COALESCE(r.dnf, 0) = 0
+              AND r.finish_time_sec IS NOT NULL
+              AND TRIM(COALESCE(cp.title_series, '')) != ''
+        )
+        SELECT
+            event_series AS "Событие",
+            event_year AS "Год",
+            distance_name AS "Дистанция",
+            COALESCE(NULLIF(TRIM(athlete_name), ''), '—') AS "Участник",
+            COALESCE(NULLIF(TRIM(finish_time), ''), '—') AS "Время"
+        FROM ranked
+        WHERE rn <= 3
+        ORDER BY event_series, distance_id, finish_time_sec, event_year
+        """,
+        tuple(plist),
+    )
+
+
+def query_event_section_records_hierarchy(
+    db_path: Path | str,
+    years: list[int] | None,
+    sports: list[str] | None,
+    top_n: int = 5,
+) -> list[dict[str, Any]]:
+    """
+    Иерархическая выборка рекордов для UI:
+    серия события (title_short/title) -> дистанция -> топ-N результатов по времени
+    отдельно для мужчин и женщин (по всем годам).
+    """
+    w, plist = build_competition_filter_sql(years, sports, None)
+    n = max(1, int(top_n))
+    series_expr = (
+        "COALESCE(NULLIF(TRIM(c.title_short), ''), TRIM(c.title))"
+        if _table_has_column(db_path, "competitions", "title_short")
+        else "TRIM(c.title)"
+    )
+    base_rows = q_all(
+        db_path,
+        f"""
+        WITH comp_pool AS (
+            SELECT
+                c.id,
+                c.year,
+                c.title,
+                {series_expr} AS title_series
+            FROM competitions c
+            WHERE {w}
+        )
+        SELECT
+            cp.title_series AS event_series,
+            COALESCE(NULLIF(TRIM(d.name), ''), '—') AS distance_name,
+            LOWER(TRIM(COALESCE(p.gender, ''))) AS gender_code,
+            cp.year AS event_year,
+            cp.title AS event_title,
+            COALESCE(NULLIF(TRIM(COALESCE(p.last_name, '') || ' ' || COALESCE(p.first_name, '')), ''), '—') AS athlete_name,
+            COALESCE(NULLIF(TRIM(r.finish_time), ''), '—') AS finish_time,
+            r.finish_time_sec AS finish_time_sec
+        FROM results r
+        INNER JOIN comp_pool cp ON cp.id = r.competition_id
+        INNER JOIN distances d ON d.id = r.distance_id
+        LEFT JOIN profiles p ON p.id = r.profile_id
+        WHERE COALESCE(r.dnf, 0) = 0
+          AND r.finish_time_sec IS NOT NULL
+          AND LOWER(TRIM(COALESCE(p.gender, ''))) IN ('m', 'f')
+          AND TRIM(COALESCE(cp.title_series, '')) != ''
+        """,
+        tuple(plist),
+    )
+    rules = load_distance_alias_rules()
+    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for row in base_rows:
+        event_series = str(row.get("event_series") or "").strip()
+        if not event_series:
+            continue
+        gender_code = str(row.get("gender_code") or "").strip().lower()
+        if gender_code not in {"m", "f"}:
+            continue
+        d_key, d_label = normalize_distance_by_alias_rules(row.get("distance_name"), rules)
+        key = (event_series, d_key, gender_code)
+        item = dict(row)
+        item["distance_label"] = d_label
+        grouped.setdefault(key, []).append(item)
+
+    out: list[dict[str, Any]] = []
+    for (event_series, _dkey, gender_code), items in grouped.items():
+        items.sort(
+            key=lambda r: (
+                float(r.get("finish_time_sec") or 0),
+                int(r.get("event_year") or 0),
+                str(r.get("event_title") or ""),
+            )
+        )
+        for rank, row in enumerate(items[:n], start=1):
+            out.append(
+                {
+                    "Событие": event_series,
+                    "Дистанция": row.get("distance_label") or "—",
+                    "Пол": "Мужчины" if gender_code == "m" else "Женщины",
+                    "Место": rank,
+                    "Год": row.get("event_year"),
+                    "Этап": row.get("event_title"),
+                    "Участник": row.get("athlete_name"),
+                    "Время": row.get("finish_time"),
+                }
+            )
+    out.sort(
+        key=lambda r: (
+            str(r.get("Событие") or "").casefold(),
+            str(r.get("Дистанция") or "").casefold(),
+            0 if r.get("Пол") == "Мужчины" else 1,
+            int(r.get("Место") or 0),
+            int(r.get("Год") or 0),
+            str(r.get("Этап") or "").casefold(),
+        )
+    )
+    return out
 
 
 # ── Кубки ─────────────────────────────────────────────────────────────────
@@ -1324,6 +1863,267 @@ def query_profile_cup_rows_for_year(
         """,
         (pid, year),
     )
+
+
+def query_profile_kpi_all_time(db_path: Path | str, pid: int) -> dict[str, Any]:
+    """KPI участника за все годы по таблице results."""
+    row = q_one(
+        db_path,
+        """
+        SELECT
+            COUNT(*) AS starts_total,
+            SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN 1 ELSE 0 END) AS finishes_total,
+            SUM(CASE WHEN COALESCE(r.dnf, 0) != 0 THEN 1 ELSE 0 END) AS dnf_total,
+            COUNT(DISTINCT c.id) AS events_distinct,
+            COUNT(DISTINCT c.year) AS active_years,
+            COUNT(DISTINCT CASE WHEN COALESCE(r.dnf, 0) = 0 THEN r.distance_id END) AS distances_distinct,
+            ROUND(COALESCE(SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN d.distance_km ELSE 0 END), 0), 1) AS km_total,
+            MIN(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN r.finish_time_sec END) AS best_finish_time_sec,
+            SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 AND COALESCE(r.place_abs, 999999) = 1 THEN 1 ELSE 0 END) AS first_places,
+            SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 AND COALESCE(r.place_abs, 999999) = 2 THEN 1 ELSE 0 END) AS second_places,
+            SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 AND COALESCE(r.place_abs, 999999) = 3 THEN 1 ELSE 0 END) AS third_places
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        LEFT JOIN distances d ON d.id = r.distance_id
+        WHERE r.profile_id = ?
+        """,
+        (pid,),
+    )
+    return row or {}
+
+
+def query_profile_kpi_year(db_path: Path | str, pid: int, year: int) -> dict[str, Any]:
+    """KPI участника за конкретный год по таблице results."""
+    row = q_one(
+        db_path,
+        """
+        SELECT
+            COUNT(*) AS starts_total,
+            SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN 1 ELSE 0 END) AS finishes_total,
+            SUM(CASE WHEN COALESCE(r.dnf, 0) != 0 THEN 1 ELSE 0 END) AS dnf_total,
+            COUNT(DISTINCT c.id) AS events_distinct,
+            COUNT(DISTINCT CASE WHEN COALESCE(r.dnf, 0) = 0 THEN r.distance_id END) AS distances_distinct,
+            ROUND(COALESCE(SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN d.distance_km ELSE 0 END), 0), 1) AS km_total,
+            MIN(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN r.finish_time_sec END) AS best_finish_time_sec,
+            SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 AND COALESCE(r.place_abs, 999999) = 1 THEN 1 ELSE 0 END) AS first_places,
+            SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 AND COALESCE(r.place_abs, 999999) = 2 THEN 1 ELSE 0 END) AS second_places,
+            SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 AND COALESCE(r.place_abs, 999999) = 3 THEN 1 ELSE 0 END) AS third_places
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        LEFT JOIN distances d ON d.id = r.distance_id
+        WHERE r.profile_id = ? AND c.year = ?
+        """,
+        (pid, year),
+    )
+    return row or {}
+
+
+def query_profile_yearly_trends(db_path: Path | str, pid: int) -> list[dict[str, Any]]:
+    """Динамика участника по годам: старты, финиши, dnf, км, среднее время."""
+    return q_all(
+        db_path,
+        """
+        SELECT
+            c.year AS year,
+            COUNT(*) AS starts,
+            SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN 1 ELSE 0 END) AS finishes,
+            SUM(CASE WHEN COALESCE(r.dnf, 0) != 0 THEN 1 ELSE 0 END) AS dnf,
+            ROUND(COALESCE(SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN d.distance_km ELSE 0 END), 0), 1) AS km_total,
+            ROUND(AVG(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN r.finish_time_sec END), 1) AS avg_finish_time_sec,
+            ROUND(
+                100.0 * SUM(CASE WHEN COALESCE(r.dnf, 0) != 0 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0),
+                1
+            ) AS dnf_pct
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        LEFT JOIN distances d ON d.id = r.distance_id
+        WHERE r.profile_id = ? AND c.year IS NOT NULL
+        GROUP BY c.year
+        ORDER BY c.year
+        """,
+        (pid,),
+    )
+
+
+def query_profile_events_table(
+    db_path: Path | str,
+    pid: int,
+    years: list[int] | None = None,
+    sports: list[str] | None = None,
+    distance_labels: list[str] | None = None,
+    include_dnf: bool = True,
+    limit: int = 1000,
+) -> list[dict[str, Any]]:
+    """Универсальная таблица стартов участника с фильтрами."""
+    where: list[str] = ["r.profile_id = ?"]
+    params: list[Any] = [pid]
+    if years:
+        where.append("c.year IN (" + ",".join("?" * len(years)) + ")")
+        params.extend(years)
+    if sports:
+        where.append("c.sport IN (" + ",".join("?" * len(sports)) + ")")
+        params.extend(sports)
+    if distance_labels:
+        where.append("d.name IN (" + ",".join("?" * len(distance_labels)) + ")")
+        params.extend(distance_labels)
+    if not include_dnf:
+        where.append("COALESCE(r.dnf, 0) = 0")
+    wsql = " AND ".join(where)
+    return q_all(
+        db_path,
+        f"""
+        SELECT
+            c.year AS год,
+            c.date AS дата,
+            c.title AS событие,
+            c.sport AS вид,
+            COALESCE(d.name, '') AS дистанция,
+            ROUND(COALESCE(d.distance_km, 0), 2) AS км,
+            COALESCE(r.finish_time, '') AS время,
+            r.finish_time_sec AS время_сек,
+            r.place_abs AS место_абс,
+            r.place_gender AS место_пол,
+            COALESCE(r.group_name, '') AS группа,
+            COALESCE(r.team, '') AS команда,
+            CASE WHEN COALESCE(r.dnf, 0) = 0 THEN 'finish' ELSE 'dnf' END AS статус
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        LEFT JOIN distances d ON d.id = r.distance_id
+        WHERE {wsql}
+        ORDER BY c.date DESC, c.id DESC, r.id DESC
+        LIMIT {int(limit)}
+        """,
+        tuple(params),
+    )
+
+
+def query_profile_personal_bests(
+    db_path: Path | str,
+    pid: int,
+    year: int | None = None,
+    top_n: int = 1000,
+) -> list[dict[str, Any]]:
+    """PB по нормализованным дистанциям (через справочник алиасов)."""
+    where = "r.profile_id = ? AND COALESCE(r.dnf, 0) = 0 AND r.finish_time_sec IS NOT NULL"
+    params: list[Any] = [pid]
+    if year is not None:
+        where += " AND c.year = ?"
+        params.append(year)
+    rows = q_all(
+        db_path,
+        f"""
+        SELECT
+            c.year AS year,
+            c.date AS event_date,
+            c.title AS event_title,
+            COALESCE(d.name, '') AS distance_name,
+            r.finish_time AS finish_time,
+            r.finish_time_sec AS finish_time_sec,
+            r.place_abs AS place_abs
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        LEFT JOIN distances d ON d.id = r.distance_id
+        WHERE {where}
+        ORDER BY r.finish_time_sec ASC, c.date ASC, c.id ASC
+        LIMIT {int(top_n)}
+        """,
+        tuple(params),
+    )
+    rules = load_distance_alias_rules()
+    best_by_distance: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        d_key, d_label = normalize_distance_by_alias_rules(r.get("distance_name"), rules)
+        sec = r.get("finish_time_sec")
+        try:
+            sec_f = float(sec)
+        except (TypeError, ValueError):
+            continue
+        cur = best_by_distance.get(d_key)
+        if cur is None or sec_f < float(cur.get("время_сек") or 1e18):
+            best_by_distance[d_key] = {
+                "дистанция": d_label,
+                "время": r.get("finish_time"),
+                "время_сек": sec_f,
+                "год": r.get("year"),
+                "дата": r.get("event_date"),
+                "событие": r.get("event_title"),
+                "место_абс": r.get("place_abs"),
+            }
+    out = list(best_by_distance.values())
+    out.sort(key=lambda x: (str(x.get("дистанция") or "").casefold(), float(x.get("время_сек") or 0)))
+    return out
+
+
+def query_profile_team_summary(db_path: Path | str, pid: int) -> list[dict[str, Any]]:
+    """Команды участника: число финишей, событий и годы активности."""
+    rows = q_all(
+        db_path,
+        """
+        SELECT
+            TRIM(r.team) AS team_name,
+            COUNT(*) AS finishes,
+            COUNT(DISTINCT c.id) AS events,
+            GROUP_CONCAT(DISTINCT c.year) AS years_csv
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        WHERE r.profile_id = ?
+          AND COALESCE(r.dnf, 0) = 0
+          AND TRIM(COALESCE(r.team, '')) != ''
+        GROUP BY TRIM(r.team)
+        ORDER BY finishes DESC, team_name
+        """,
+        (pid,),
+    )
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        years_raw = str(r.get("years_csv") or "").split(",")
+        years_vals: list[int] = []
+        for y in years_raw:
+            ys = y.strip()
+            if ys.isdigit():
+                years_vals.append(int(ys))
+        years_vals = sorted(set(years_vals))
+        out.append(
+            {
+                "команда": r.get("team_name"),
+                "финишей": r.get("finishes"),
+                "событий": r.get("events"),
+                "годы": ", ".join(str(y) for y in years_vals) if years_vals else "—",
+            }
+        )
+    return out
+
+
+def query_profile_data_quality(db_path: Path | str, pid: int) -> list[dict[str, Any]]:
+    """Диагностика качества данных участника (для админской вкладки)."""
+    p = query_profile_row(db_path, pid) or {}
+    stats = q_one(
+        db_path,
+        """
+        SELECT
+            COUNT(*) AS starts_total,
+            SUM(CASE WHEN COALESCE(dnf, 0) = 0 THEN 1 ELSE 0 END) AS finishes_total,
+            SUM(CASE WHEN COALESCE(dnf, 0) != 0 THEN 1 ELSE 0 END) AS dnf_total,
+            SUM(CASE WHEN COALESCE(dnf, 0) = 0 AND (finish_time_sec IS NULL OR finish_time_sec <= 0) THEN 1 ELSE 0 END) AS bad_finish_time,
+            SUM(CASE WHEN COALESCE(dnf, 0) = 0 AND TRIM(COALESCE(finish_time, '')) = '' THEN 1 ELSE 0 END) AS missing_finish_time_text,
+            SUM(CASE WHEN distance_id IS NULL THEN 1 ELSE 0 END) AS missing_distance_id,
+            SUM(CASE WHEN competition_id IS NULL THEN 1 ELSE 0 END) AS missing_competition_id
+        FROM results
+        WHERE profile_id = ?
+        """,
+        (pid,),
+    ) or {}
+    checks: list[dict[str, Any]] = []
+    checks.append({"метрика": "Пустой пол в profiles", "значение": 1 if not str(p.get("gender") or "").strip() else 0})
+    checks.append({"метрика": "Пустой город в profiles", "значение": 1 if not str(p.get("city") or "").strip() else 0})
+    checks.append({"метрика": "Стартов всего", "значение": int(stats.get("starts_total") or 0)})
+    checks.append({"метрика": "Финишей", "значение": int(stats.get("finishes_total") or 0)})
+    checks.append({"метрика": "DNF", "значение": int(stats.get("dnf_total") or 0)})
+    checks.append({"метрика": "Финиши без finish_time_sec", "значение": int(stats.get("bad_finish_time") or 0)})
+    checks.append({"метрика": "Финиши без finish_time (текст)", "значение": int(stats.get("missing_finish_time_text") or 0)})
+    checks.append({"метрика": "Строки без distance_id", "значение": int(stats.get("missing_distance_id") or 0)})
+    checks.append({"метрика": "Строки без competition_id", "значение": int(stats.get("missing_competition_id") or 0)})
+    return checks
 
 
 # ── Общая статистика (фильтры: год, вид спорта, кубок) ───────────────────────

@@ -101,6 +101,7 @@ def sample_db() -> Path:
         INSERT INTO results VALUES (1, 1, 10, 100, 0, 3600.0, 'Team A', 1, 1, 2, 'M40', '01:00:00', '{}');
         INSERT INTO results VALUES (2, 2, 11, 100, 0, 7200.0, 'Team A', 5, 2, 4, 'M40', '02:00:00', '{}');
         INSERT INTO results VALUES (3, 1, 10, 101, 0, 3500.0, 'Team B', 2, 2, 1, 'M40', '00:58:00', '{}');
+        INSERT INTO results VALUES (9, 2, 11, 100, 1, NULL, 'Team A', NULL, NULL, NULL, 'M40', '', '{}');
         INSERT INTO cup_competitions VALUES (1, 1);
         INSERT INTO cup_competitions VALUES (2, 2);
         INSERT INTO cups VALUES (1, 'Super Cup', 2024, 'run', '{}');
@@ -193,6 +194,18 @@ def test_profile_search_by_id(sample_db: Path) -> None:
     rows = mq.query_profile_search(sample_db, "100", 10)
     assert len(rows) == 1
     assert rows[0]["id"] == 100
+    erows = mq.query_profile_search_enriched(sample_db, "100", 10)
+    assert len(erows) == 1
+    assert erows[0]["id"] == 100
+    assert int(erows[0]["starts_total"]) >= 1
+
+
+def test_profile_search_enriched_text(sample_db: Path) -> None:
+    rows = mq.query_profile_search_enriched(sample_db, "Test", 10)
+    assert len(rows) >= 1
+    first = rows[0]
+    assert "last_year" in first
+    assert "starts_total" in first
 
 
 def test_teams_top(sample_db: Path) -> None:
@@ -377,3 +390,164 @@ def test_general_stats_events_table(sample_db: Path) -> None:
     )
     assert len(rows_f) == 1
     assert rows_f[0]["год"] == 2024
+
+
+def test_event_section_cards_and_tables(sample_db: Path) -> None:
+    cards = mq.query_event_section_cards(sample_db, years=[2024], sports=["run"])
+    assert cards["total_events"] == 1
+    assert cards["total_participants"] == 2
+    assert cards["teams_distinct"] == 2
+    assert cards["regions_distinct"] >= 1
+    assert cards["countries_distinct"] >= 1
+
+    events = mq.query_event_section_events_table(sample_db, years=[2024], sports=["run"])
+    assert len(events) == 1
+    row = events[0]
+    assert row["Год"] == 2024
+    assert row["Количество участников"] == 3
+    assert row["Количество команд"] == 2
+    assert row["Регионов"] == 1
+    assert row["Стран"] == 1
+
+    records = mq.query_event_section_records_table(sample_db, years=[2024], sports=["run"])
+    assert len(records) == 2
+    first = records[0]
+    assert first["Событие"] == "Test Marathon"
+    assert first["Год"] == 2024
+    assert first["Дистанция"] == "42 km"
+    assert first["Время"] in {"00:58:00", "01:00:00"}
+
+
+def test_event_section_records_hierarchy(sample_db: Path) -> None:
+    rows = mq.query_event_section_records_hierarchy(
+        sample_db, years=[2024], sports=["run"], top_n=5
+    )
+    assert len(rows) == 2
+    for r in rows:
+        assert r["Событие"] == "Test Marathon"
+        assert r["Дистанция"] == "42 km"
+        assert 1 <= int(r["Место"]) <= 5
+        assert r["Пол"] == "Мужчины"
+        assert r["Год"] == 2024
+        assert "Test Marathon" in str(r["Этап"])
+        assert str(r["Время"]).strip() != ""
+    assert mq.query_event_section_records_hierarchy(
+        sample_db, years=[2024], sports=["ski"], top_n=5
+    ) == []
+
+
+def test_event_records_top5_across_years_not_per_distance_id(sample_db: Path) -> None:
+    conn = sqlite3.connect(sample_db)
+    conn.executescript(
+        """
+        INSERT INTO competitions VALUES (3, 'Test Marathon', '2023-07-01', 2023, 'run');
+        INSERT INTO competitions VALUES (4, 'Test Marathon', '2022-07-01', 2022, 'run');
+        INSERT INTO distances VALUES (12, 3, '42 km', 42.0, 0);
+        INSERT INTO distances VALUES (13, 4, '42 km', 42.0, 0);
+        INSERT INTO profiles VALUES (102, 'A', 'Runner', '', 'm', 29, 1995, 'Vologda',
+            NULL, 'VO', 36, 'Россия', '', 0, 0, 0, 0, 0, 0, '{}');
+        INSERT INTO profiles VALUES (103, 'B', 'Runner', '', 'm', 29, 1995, 'Vologda',
+            NULL, 'VO', 36, 'Россия', '', 0, 0, 0, 0, 0, 0, '{}');
+        INSERT INTO profiles VALUES (104, 'C', 'Runner', '', 'm', 29, 1995, 'Vologda',
+            NULL, 'VO', 36, 'Россия', '', 0, 0, 0, 0, 0, 0, '{}');
+        INSERT INTO profiles VALUES (105, 'D', 'Runner', '', 'm', 29, 1995, 'Vologda',
+            NULL, 'VO', 36, 'Россия', '', 0, 0, 0, 0, 0, 0, '{}');
+        INSERT INTO profiles VALUES (106, 'E', 'Runner', '', 'm', 29, 1995, 'Vologda',
+            NULL, 'VO', 36, 'Россия', '', 0, 0, 0, 0, 0, 0, '{}');
+        INSERT INTO results VALUES (4, 3, 12, 102, 0, 3450.0, 'Team X', 1, 1, 1, 'M', '00:57:30', '{}');
+        INSERT INTO results VALUES (5, 3, 12, 103, 0, 3460.0, 'Team X', 2, 2, 2, 'M', '00:57:40', '{}');
+        INSERT INTO results VALUES (6, 3, 12, 104, 0, 3470.0, 'Team X', 3, 3, 3, 'M', '00:57:50', '{}');
+        INSERT INTO results VALUES (7, 4, 13, 105, 0, 3480.0, 'Team X', 4, 4, 4, 'M', '00:58:00', '{}');
+        INSERT INTO results VALUES (8, 4, 13, 106, 0, 3490.0, 'Team X', 5, 5, 5, 'M', '00:58:10', '{}');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    rows = mq.query_event_section_records_hierarchy(
+        sample_db, years=None, sports=["run"], top_n=5
+    )
+    men_42 = [
+        r
+        for r in rows
+        if r["Событие"] == "Test Marathon"
+        and r["Дистанция"] == "42 km"
+        and r["Пол"] == "Мужчины"
+    ]
+    assert len(men_42) == 5
+
+
+def test_event_records_use_distance_alias_dictionary(sample_db: Path) -> None:
+    conn = sqlite3.connect(sample_db)
+    conn.executescript(
+        """
+        INSERT INTO competitions VALUES (5, 'Series HM', '2022-05-01', 2022, 'run');
+        INSERT INTO competitions VALUES (6, 'Series HM', '2023-05-01', 2023, 'run');
+        INSERT INTO distances VALUES (20, 5, 'Полмарафон', 21.1, 0);
+        INSERT INTO distances VALUES (21, 6, '21 км 97,5м', 21.0975, 0);
+        INSERT INTO profiles VALUES (201, 'M1', 'HM', '', 'm', 25, 1999, 'Vologda',
+            NULL, 'VO', 36, 'Россия', '', 0, 0, 0, 0, 0, 0, '{}');
+        INSERT INTO profiles VALUES (202, 'M2', 'HM', '', 'm', 25, 1999, 'Vologda',
+            NULL, 'VO', 36, 'Россия', '', 0, 0, 0, 0, 0, 0, '{}');
+        INSERT INTO profiles VALUES (203, 'F1', 'HM', '', 'f', 25, 1999, 'Vologda',
+            NULL, 'VO', 36, 'Россия', '', 0, 0, 0, 0, 0, 0, '{}');
+        INSERT INTO profiles VALUES (204, 'F2', 'HM', '', 'f', 25, 1999, 'Vologda',
+            NULL, 'VO', 36, 'Россия', '', 0, 0, 0, 0, 0, 0, '{}');
+        INSERT INTO results VALUES (30, 5, 20, 201, 0, 3700.0, '', 1, 1, 1, 'M', '01:01:40', '{}');
+        INSERT INTO results VALUES (31, 6, 21, 202, 0, 3650.0, '', 1, 1, 1, 'M', '01:00:50', '{}');
+        INSERT INTO results VALUES (32, 5, 20, 203, 0, 4100.0, '', 1, 1, 1, 'F', '01:08:20', '{}');
+        INSERT INTO results VALUES (33, 6, 21, 204, 0, 4050.0, '', 1, 1, 1, 'F', '01:07:30', '{}');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    rows = mq.query_event_section_records_hierarchy(sample_db, years=None, sports=["run"], top_n=5)
+    hm_rows = [r for r in rows if r["Событие"] == "Series HM"]
+    assert len(hm_rows) == 4
+    assert {r["Дистанция"] for r in hm_rows} == {"Полумарафон (21.1 км)"}
+    assert {r["Пол"] for r in hm_rows} == {"Мужчины", "Женщины"}
+
+
+def test_profile_analytics_queries(sample_db: Path) -> None:
+    k_all = mq.query_profile_kpi_all_time(sample_db, 100)
+    assert k_all["starts_total"] == 3
+    assert k_all["finishes_total"] == 2
+    assert k_all["dnf_total"] == 1
+    assert float(k_all["km_total"]) == 63.0
+    assert int(k_all["best_finish_time_sec"]) == 3600
+
+    k_2024 = mq.query_profile_kpi_year(sample_db, 100, 2024)
+    assert k_2024["starts_total"] == 1
+    assert k_2024["finishes_total"] == 1
+    assert k_2024["events_distinct"] == 1
+
+    trends = mq.query_profile_yearly_trends(sample_db, 100)
+    assert len(trends) == 2
+    y2023 = next(r for r in trends if r["year"] == 2023)
+    assert y2023["starts"] == 2
+    assert y2023["dnf"] == 1
+
+    ev_finish = mq.query_profile_events_table(
+        sample_db, 100, years=[2023], include_dnf=False
+    )
+    assert len(ev_finish) == 1
+    assert ev_finish[0]["статус"] == "finish"
+    ev_all = mq.query_profile_events_table(sample_db, 100, years=[2023], include_dnf=True)
+    assert len(ev_all) == 2
+
+    pb_all = mq.query_profile_personal_bests(sample_db, 100, year=None)
+    assert len(pb_all) >= 2
+    pb_21 = next(x for x in pb_all if x["дистанция"] == "21 km")
+    assert int(pb_21["время_сек"]) == 7200
+
+    teams = mq.query_profile_team_summary(sample_db, 100)
+    assert len(teams) == 1
+    assert teams[0]["команда"] == "Team A"
+    assert teams[0]["финишей"] == 2
+
+    quality = mq.query_profile_data_quality(sample_db, 100)
+    q_map = {r["метрика"]: r["значение"] for r in quality}
+    assert q_map["Стартов всего"] == 3
+    assert q_map["Финишей"] == 2
+    assert q_map["DNF"] == 1
