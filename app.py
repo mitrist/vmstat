@@ -22,7 +22,9 @@ import altair as alt
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import re
 import streamlit as st
+import streamlit.components.v1 as components
 
 import marathon_queries as mq
 
@@ -45,6 +47,51 @@ VM_ACCENT = "#93BDDD"
 VM_BLUE = "#93BDDD"
 # Подзаголовок к гистограммам на «Общая статистика» (курсив под названием)
 OBSH_BAR_TITLE_NOTE = "Линия тренда - скользящее среднее за 3 года"
+
+PAGE_ALIASES: dict[str, str] = {
+    "Общая статистика": "general",
+    "Интересные факты": "facts",
+    "Событие": "event",
+    "Участник": "participant",
+    "Команда": "team",
+    "Кубки": "cups",
+    "Админка": "admin",
+}
+
+SECTION_SUBMENUS: dict[str, list[tuple[str, str]]] = {
+    "Общая статистика": [
+        ("general-kpi", "Показатели"),
+        ("general-charts", "Графики"),
+        ("general-events", "События"),
+    ],
+    "Интересные факты": [
+        ("facts-day", "Факт дня"),
+        ("facts-collection", "Подборка фактов"),
+        ("facts-charts", "Графики"),
+        ("facts-geo", "География"),
+    ],
+    "Событие": [
+        ("event-list", "События"),
+        ("event-records", "Рекорды"),
+        ("event-detail", "Детали события"),
+    ],
+    "Участник": [
+        ("participant-search", "Поиск"),
+        ("participant-kpi", "KPI"),
+        ("participant-tabs", "Вкладки"),
+    ],
+    "Команда": [
+        ("team-kpi", "KPI"),
+        ("team-tabs", "Вкладки"),
+    ],
+    "Кубки": [
+        ("cups-list", "Кубки за год"),
+        ("cups-results", "Результаты"),
+    ],
+    "Админка": [
+        ("admin-aliases", "Справочник алиасов"),
+    ],
+}
 
 COUNTRY_TO_ISO3: dict[str, str] = {
     "россия": "RUS",
@@ -628,17 +675,28 @@ def _sidebar_read_page_from_url() -> str | None:
         key = s.strip().casefold()
     except Exception:
         return None
-    mapping = {
-        "general": "Общая статистика",
-        "event": "Событие",
-        "participant": "Участник",
-        "team": "Команда",
-        "cups": "Кубки",
-        "facts": "Интересные факты",
-        "interesting-facts": "Интересные факты",
-        "admin": "Админка",
-    }
-    return mapping.get(key)
+    for title, alias in PAGE_ALIASES.items():
+        if key == alias:
+            return title
+    if key == "interesting-facts":
+        return "Интересные факты"
+    return None
+
+
+def _sidebar_read_section_from_url() -> str | None:
+    """Параметр ?section=<anchor-id> для скролла к нужному блоку."""
+    try:
+        q = st.query_params
+        if "section" not in q:
+            return None
+        raw = q.get("section")
+        if raw is None:
+            return None
+        s = raw[0] if isinstance(raw, (list, tuple)) and len(raw) else str(raw)
+        section = str(s).strip()
+    except Exception:
+        return None
+    return section if re.fullmatch(r"[a-z0-9][a-z0-9_-]{1,60}", section) else None
 
 
 def _participant_id_from_url() -> int | None:
@@ -656,24 +714,81 @@ def _participant_id_from_url() -> int | None:
         return None
 
 
+def _section_anchor(section_id: str) -> None:
+    st.markdown(f'<div id="{html.escape(section_id)}"></div>', unsafe_allow_html=True)
+
+
+def _scroll_to_section_once(current_page: str) -> None:
+    section = _sidebar_read_section_from_url()
+    if not section:
+        return
+    key = f"{current_page}:{section}"
+    if st.session_state.get("_last_section_scroll_key") == key:
+        return
+    st.session_state["_last_section_scroll_key"] = key
+    script = f"""
+    <script>
+    (function() {{
+      const targetId = {section!r};
+      const tryScroll = () => {{
+        const docs = [window.document, window.parent?.document].filter(Boolean);
+        for (const d of docs) {{
+          const el = d.getElementById(targetId);
+          if (el) {{
+            el.scrollIntoView({{behavior: 'auto', block: 'start'}});
+            return true;
+          }}
+        }}
+        return false;
+      }};
+      if (!tryScroll()) {{
+        setTimeout(tryScroll, 120);
+        setTimeout(tryScroll, 300);
+        setTimeout(tryScroll, 700);
+      }}
+    }})();
+    </script>
+    """
+    if hasattr(st, "html"):
+        st.html(script)
+    else:
+        components.html(script, height=0)
+
+
 def render_sidebar_text_nav(pages: tuple[str, ...], current: str) -> None:
-    """Пункты меню: текст+иконка, текущий раздел — полужирно; остальные — ссылка ?i=."""
+    """Основное меню + раскрываемые подпункты перехода к блокам страницы."""
     icons = {
         "Общая статистика": "📊",
         "Событие": "🏁",
         "Участник": "👤",
         "Команда": "🛡️",
         "Кубки": "🏆",
+        "Интересные факты": "✨",
         "Админка": "⚙️",
     }
     parts: list[str] = ['<div class="vm-sidebar-text-nav">']
-    for j, title in enumerate(pages):
+    for title in pages:
         icon = icons.get(title, "•")
         esc = html.escape(f"{icon} {title}")
+        alias = PAGE_ALIASES.get(title, "general")
+        base_link = f"?page={alias}"
         if title == current:
             parts.append(f'<p class="vm-sidebar-here">{esc}</p>')
         else:
-            parts.append(f'<p><a href="?i={j}" target="_self">{esc}</a></p>')
+            parts.append(f'<p><a href="{base_link}" target="_self">{esc}</a></p>')
+        sub = SECTION_SUBMENUS.get(title) or []
+        if sub:
+            parts.append(
+                f'<details {"open" if title == current else ""} style="margin:-4px 0 6px 18px;">'
+                f'<summary style="font-size:0.82rem;color:{VM_MUTED};cursor:pointer;">Разделы</summary>'
+            )
+            for sec_id, sec_label in sub:
+                parts.append(
+                    f'<p style="margin:2px 0 2px 10px;">'
+                    f'<a href="{base_link}&section={html.escape(sec_id)}" target="_self">{html.escape(sec_label)}</a>'
+                    f"</p>"
+                )
+            parts.append("</details>")
     parts.append("</div>")
     st.sidebar.markdown("".join(parts), unsafe_allow_html=True)
 
@@ -784,6 +899,7 @@ def metric_plaque(label: str, value: int | str) -> None:
 
 
 def page_general_statistics() -> None:
+    _section_anchor("general-kpi")
     st.header("Сервис аналитики мероприятий ВологдаМарафон")
     path = db_path()
     if not require_db(path):
@@ -867,6 +983,7 @@ def page_general_statistics() -> None:
     with m5:
         metric_plaque("Стран (уник.)", cards.get("countries_distinct", 0))
 
+    _section_anchor("general-charts")
     st.subheader("Графики")
     g1, g2 = st.columns(2)
     with g1:
@@ -875,12 +992,23 @@ def page_general_statistics() -> None:
             st.caption("Нет данных для гистограммы событий по годам.")
         else:
             dfe2 = dfe.copy()
-            dfe2["year"] = dfe2["year"].astype(str)
+            dfe2["Год"] = dfe2["year"].astype(str)
+            dfe2["Событий"] = pd.to_numeric(dfe2["events"], errors="coerce").fillna(0).astype(int)
             st.caption("Количество событий по годам")
-            st.bar_chart(
-                dfe2.set_index("year")[["events"]],
-                use_container_width=True,
+            chart = (
+                alt.Chart(dfe2)
+                .mark_bar()
+                .encode(
+                    x=alt.X("Год:N", title="Год"),
+                    y=alt.Y("Событий:Q", title="Событий"),
+                    tooltip=[
+                        alt.Tooltip("Год:N", title="Год"),
+                        alt.Tooltip("Событий:Q", title="Событий"),
+                    ],
+                )
             )
+            labels = chart.mark_text(dy=-8).encode(text="Событий:Q")
+            st.altair_chart((chart + labels).properties(height=280), use_container_width=True)
 
     with g2:
         dfp = pd.DataFrame(mq.query_chart_unique_participants_by_year(path, yf, sf, cf))
@@ -888,13 +1016,25 @@ def page_general_statistics() -> None:
             st.caption("Нет данных для гистограммы участников по годам.")
         else:
             dfp2 = dfp.copy()
-            dfp2["year"] = dfp2["year"].astype(str)
+            dfp2["Год"] = dfp2["year"].astype(str)
+            dfp2["Участников"] = pd.to_numeric(dfp2["participants"], errors="coerce").fillna(0).astype(int)
             st.caption("Уникальных участников по годам")
-            st.bar_chart(
-                dfp2.set_index("year")[["participants"]],
-                use_container_width=True,
+            chart = (
+                alt.Chart(dfp2)
+                .mark_bar()
+                .encode(
+                    x=alt.X("Год:N", title="Год"),
+                    y=alt.Y("Участников:Q", title="Участников"),
+                    tooltip=[
+                        alt.Tooltip("Год:N", title="Год"),
+                        alt.Tooltip("Участников:Q", title="Участников"),
+                    ],
+                )
             )
+            labels = chart.mark_text(dy=-8).encode(text="Участников:Q")
+            st.altair_chart((chart + labels).properties(height=280), use_container_width=True)
 
+    _section_anchor("general-events")
     st.subheader("События")
     if "obsh_bar_drill" not in st.session_state:
         st.session_state["obsh_bar_drill"] = None
@@ -927,10 +1067,20 @@ def page_general_statistics() -> None:
         else:
             dfs2 = dfs.rename(columns={"sport": "Вид спорта", "n": "События"})
             st.caption("События по видам спорта")
-            st.bar_chart(
-                dfs2.set_index("Вид спорта")[["События"]],
-                use_container_width=True,
+            chart = (
+                alt.Chart(dfs2)
+                .mark_bar()
+                .encode(
+                    x=alt.X("Вид спорта:N", title="Вид спорта"),
+                    y=alt.Y("События:Q", title="События"),
+                    tooltip=[
+                        alt.Tooltip("Вид спорта:N", title="Вид спорта"),
+                        alt.Tooltip("События:Q", title="События"),
+                    ],
+                )
             )
+            labels = chart.mark_text(dy=-8).encode(text="События:Q")
+            st.altair_chart((chart + labels).properties(height=280), use_container_width=True)
 
     with p2:
         dfg = pd.DataFrame(mq.query_chart_participants_by_gender(path, yf, sf, cf))
@@ -939,15 +1089,26 @@ def page_general_statistics() -> None:
         else:
             map_g = {"m": "муж.", "f": "жен.", "не указан": "не указан"}
             dfg["gender_label"] = dfg["gender"].map(lambda g: map_g.get(str(g).lower(), str(g)))
-            dfg2 = dfg.rename(columns={"gender_label": "Пол", "n": "Участников"})
             st.caption("Участники по полу (уникальные профили)")
-            st.bar_chart(
-                dfg2.set_index("Пол")[["Участников"]],
-                use_container_width=True,
+            pie_gender = dfg.rename(columns={"gender_label": "Пол", "n": "Участников"})[["Пол", "Участников"]]
+            c_gender = (
+                alt.Chart(pie_gender)
+                .mark_arc()
+                .encode(
+                    theta=alt.Theta("Участников:Q", title="Участников"),
+                    color=alt.Color("Пол:N", title="Пол"),
+                    tooltip=[
+                        alt.Tooltip("Пол:N", title="Пол"),
+                        alt.Tooltip("Участников:Q", title="Участников"),
+                    ],
+                )
             )
+            c_text = c_gender.mark_text(radius=120).encode(text=alt.Text("Участников:Q", format=".0f"))
+            st.altair_chart((c_gender + c_text).properties(height=280), use_container_width=True)
 
 
 def page_interesting_facts() -> None:
+    _section_anchor("facts-day")
     st.header("Интересные факты")
     path = db_path()
     if not require_db(path):
@@ -986,6 +1147,7 @@ def page_interesting_facts() -> None:
     else:
         st.caption("Нет данных для выбранных фильтров.")
 
+    _section_anchor("facts-collection")
     st.subheader("Подборка фактов")
     f1, f2 = st.columns(2)
     with f1:
@@ -1017,6 +1179,7 @@ def page_interesting_facts() -> None:
         st.caption("Команды с самым длинным активным периодом.")
         _facts_table(teams, key="facts_table_teams")
 
+    _section_anchor("facts-charts")
     st.subheader("Графики")
     dc = pd.DataFrame(geo.get("cities") or [])
     if dc.empty:
@@ -1035,6 +1198,7 @@ def page_interesting_facts() -> None:
         t = c.mark_text(align="left", baseline="middle", dx=4).encode(text="Участников:Q")
         st.altair_chart((c + t).properties(height=500), use_container_width=True)
 
+    _section_anchor("facts-geo")
     st.subheader("География")
     city_rows = geo.get("cities") or []
     country_rows = pd.DataFrame(geo.get("countries") or [])
@@ -1076,6 +1240,7 @@ def page_interesting_facts() -> None:
 
 
 def page_event() -> None:
+    _section_anchor("event-list")
     st.header("Событие")
     path = db_path()
     if not require_db(path):
@@ -1142,6 +1307,7 @@ def page_event() -> None:
     else:
         st.dataframe(pd.DataFrame(event_rows), use_container_width=True, hide_index=True)
 
+    _section_anchor("event-records")
     st.subheader("Рекорды события")
     rec_rows = mq.query_event_section_records_hierarchy(
         path, years_filter, sports_filter, top_n=5
@@ -1156,6 +1322,7 @@ def page_event() -> None:
         else:
             st.markdown(frag, unsafe_allow_html=True)
 
+    _section_anchor("event-detail")
     st.subheader("Детали выбранного события")
     years_for_detail = years_filter if years_filter else years_all
     if not years_for_detail:
@@ -1644,6 +1811,7 @@ def _team_scoring_hierarchy_html(
 
 
 def page_participant() -> None:
+    _section_anchor("participant-search")
     st.header("Участник")
     path = db_path()
     if not require_db(path):
@@ -1782,6 +1950,7 @@ def show_participant_dashboard(path: Path, pid: int) -> None:
     stat_first_profile = _stat_int(p.get("stat_first"))
     stat_second_profile = _stat_int(p.get("stat_second"))
     stat_third_profile = _stat_int(p.get("stat_third"))
+    _section_anchor("participant-kpi")
     st.markdown("##### KPI участника")
     mode = st.segmented_control(
         "Режим KPI",
@@ -1833,11 +2002,35 @@ def show_participant_dashboard(path: Path, pid: int) -> None:
             f_st.update_layout(plot_bgcolor="white", paper_bgcolor="white", font=dict(color=VM_TEXT), xaxis_type="category")
             st.plotly_chart(f_st, use_container_width=True)
         with g2:
-            f_km = px.line(tr, x="year", y="km_total", markers=True, labels={"year": "Год", "km_total": "Км"})
-            f_km.update_traces(line_color=VM_ACCENT)
-            f_km.update_layout(plot_bgcolor="white", paper_bgcolor="white", font=dict(color=VM_TEXT), xaxis_type="category")
-            st.plotly_chart(f_km, use_container_width=True)
+            sport_rows = mq.query_profile_events_table(path, pid, years=None, include_dnf=True, limit=5000)
+            sport_df = pd.DataFrame(sport_rows)
+            if sport_df.empty:
+                st.caption("Нет данных по видам спорта.")
+            else:
+                pie_df = (
+                    sport_df.assign(вид=sport_df["вид"].fillna("").astype(str).str.strip())
+                    .assign(вид=lambda d: d["вид"].replace("", "не указан"))
+                    .groupby("вид", as_index=False)
+                    .size()
+                    .rename(columns={"size": "стартов"})
+                )
+                fig_sport = (
+                    alt.Chart(pie_df)
+                    .mark_arc()
+                    .encode(
+                        theta=alt.Theta("стартов:Q", title="Стартов"),
+                        color=alt.Color("вид:N", title="Вид спорта"),
+                        tooltip=[
+                            alt.Tooltip("вид:N", title="Вид спорта"),
+                            alt.Tooltip("стартов:Q", title="Стартов"),
+                        ],
+                    )
+                )
+                labels = fig_sport.mark_text(radius=120).encode(text="стартов:Q")
+                st.caption("Количество стартов по видам спорта")
+                st.altair_chart((fig_sport + labels).properties(height=280), use_container_width=True)
 
+    _section_anchor("participant-tabs")
     tabs = ["События", "Рекорды", "Кубки", "Команды"]
     if _is_admin_user():
         tabs.append("Качество данных")
@@ -1966,6 +2159,7 @@ def page_team() -> None:
     )
     year_value = None if year_filter == "Все" else int(year_filter)
 
+    _section_anchor("team-kpi")
     kpi = mq.query_team_kpi_extended(path, team, year=year_value) or {}
     st.subheader("KPI")
     k1, k2, k3, k4 = st.columns(4, gap="small")
@@ -1985,6 +2179,7 @@ def page_team() -> None:
         unsafe_allow_html=True,
     )
 
+    _section_anchor("team-tabs")
     tab_labels = [
         "Состав",
         "События",
@@ -2207,6 +2402,7 @@ def page_team() -> None:
 
 
 def page_cups() -> None:
+    _section_anchor("cups-list")
     st.header("Кубки")
     path = db_path()
     if not require_db(path):
@@ -2278,6 +2474,7 @@ def page_cups() -> None:
     cup_id = int(df_cups.iloc[selected_row_idx]["id"])
     cup_title = str(df_cups.iloc[selected_row_idx]["Наименование кубка"] or f"#{cup_id}")
 
+    _section_anchor("cups-results")
     st.subheader(f"Результаты: {cup_title} · {year}")
     tab_ind, tab_team, tab_team_champ = st.tabs(
         ["Личное первенство", "Командный зачёт", "Командное первенство"]
@@ -2442,6 +2639,7 @@ def page_admin() -> None:
         st.warning("Админка отключена в текущем окружении.")
         return
     st.header("Админка")
+    _section_anchor("admin-aliases")
     st.subheader("Справочник алиасов дистанций")
     st.caption(
         "Используется в разделе «Событие» для нормализации дистанций "
@@ -2548,6 +2746,7 @@ def main() -> None:
         page_admin()
     else:
         page_cups()
+    _scroll_to_section_once(page)
 
 
 if __name__ == "__main__":
