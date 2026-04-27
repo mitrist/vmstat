@@ -28,6 +28,10 @@ import marathon_queries as mq
 DEFAULT_DB = Path(os.environ.get("MARATHON_DB", str(mq.DEFAULT_DB)))
 APP_DIR = Path(__file__).resolve().parent
 SIDEBAR_LOGO = APP_DIR / "assets" / "vologdamarafon.png"
+FAVICON_LOCAL = APP_DIR / "favicon-32x32.png"
+FAVICON_ATTACHED = Path(
+    r"C:\Users\Pavlov DA\.cursor\projects\c-Projects-vm-stat\assets\c__Projects_vm_stat_favicon-32x32.png"
+)
 
 # Основные цвета сервиса
 VM_LINK = "#93BDDD"
@@ -93,6 +97,17 @@ def db_path() -> Path:
     return DEFAULT_DB
 
 
+def page_icon_path() -> str | None:
+    """Путь к favicon; сначала локальный файл проекта, затем файл из вложения."""
+    for p in (FAVICON_LOCAL, FAVICON_ATTACHED):
+        try:
+            if p.is_file():
+                return str(p)
+        except OSError:
+            continue
+    return None
+
+
 def inject_vm_styles() -> None:
     """CSS в духе navbar-vm + контент результатов."""
     st.markdown(
@@ -144,6 +159,18 @@ def inject_vm_styles() -> None:
         }}
         section[data-testid="stSidebar"] hr {{
             border-color: #b8cbe2;
+        }}
+        /* Более контрастная рамка селекторов/мультиселектов */
+        div[data-baseweb="select"] > div {{
+            border: 1px solid #8faac8 !important;
+            box-shadow: 0 0 0 1px rgba(143, 170, 200, 0.18);
+        }}
+        div[data-baseweb="select"] > div:hover {{
+            border-color: #6d90b6 !important;
+        }}
+        div[data-baseweb="select"] input::placeholder {{
+            color: #3f6690 !important;
+            opacity: 1;
         }}
         /* Сайдбар: навигация — только текст, без кружков/иконок (см. .vm-sidebar-text-nav) */
         .vm-sidebar-text-nav {{
@@ -447,12 +474,6 @@ def inject_vm_styles() -> None:
         """,
         unsafe_allow_html=True,
     )
-    st.markdown(
-        f'<div class="vm-brand-bar">ВОЛОГДА МАРАФОН<span class="sub">локальная аналитика · MVP</span></div>',
-        unsafe_allow_html=True,
-    )
-
-
 def require_db(path: Path) -> bool:
     if not path.is_file():
         st.error(
@@ -495,7 +516,7 @@ def render_sidebar_text_nav(pages: tuple[str, ...], current: str) -> None:
         if title == current:
             parts.append(f'<p class="vm-sidebar-here">{esc}</p>')
         else:
-            parts.append(f'<p><a href="?i={j}">{esc}</a></p>')
+            parts.append(f'<p><a href="?i={j}" target="_self">{esc}</a></p>')
     parts.append("</div>")
     st.sidebar.markdown("".join(parts), unsafe_allow_html=True)
 
@@ -606,7 +627,7 @@ def metric_plaque(label: str, value: int | str) -> None:
 
 
 def page_general_statistics() -> None:
-    st.header("Общая статистика")
+    st.header("Сервис аналитики мероприятий ВологдаМарафон")
     path = db_path()
     if not require_db(path):
         return
@@ -667,6 +688,7 @@ def page_general_statistics() -> None:
             options=cup_ids_opts,
             format_func=lambda i: cup_labels.get(int(i), str(i)),
             default=[],
+            placeholder="Выбрать Кубок",
             key="obsh_cup_ms",
         )
     else:
@@ -944,18 +966,13 @@ def _stat_int(val: object) -> int:
 
 
 def _is_admin_user() -> bool:
-    """Права администратора для скрытия чувствительных вкладок."""
-    if bool(st.session_state.get("is_admin", False)):
-        return True
-    try:
-        if hasattr(st, "secrets") and st.secrets and "admin" in st.secrets:
-            adm = st.secrets["admin"]
-            if bool(adm.get("enabled", False)):
-                # Без явной сессии не открываем admin-вкладку.
-                return bool(st.session_state.get("is_admin", False))
-    except Exception:
-        return bool(st.session_state.get("is_admin", False))
-    return False
+    """Админ-режим включается только локально через env VMSTAT_ADMIN_UI=1."""
+    return str(os.environ.get("VMSTAT_ADMIN_UI", "0")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
 
 
 def _cup_detail_age_group_options(rows: list[dict]) -> list[str]:
@@ -1284,6 +1301,99 @@ def _event_records_hierarchy_html(rows: list[dict[str, Any]]) -> str:
     return "".join(parts)
 
 
+def _team_scoring_hierarchy_html(
+    teams_rows: list[dict[str, Any]],
+    members_rows: list[dict[str, Any]],
+    stage_rows: list[dict[str, Any]],
+) -> str:
+    """Иерархия командного зачёта: команда -> участник -> этапы (расчётные очки)."""
+    from collections import defaultdict
+
+    by_team_members: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for r in members_rows:
+        team = str(r.get("команда") or "").strip()
+        if not team:
+            continue
+        by_team_members[team].append(r)
+
+    by_team_member_stages: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
+    for r in stage_rows:
+        team = str(r.get("команда") or "").strip()
+        pid = r.get("profile_id")
+        try:
+            pid_i = int(pid)
+        except (TypeError, ValueError):
+            continue
+        by_team_member_stages[(team, pid_i)].append(r)
+
+    parts: list[str] = [
+        """<div class="vm-cup-tree" role="tree">
+<div class="vm-cup-head"><span>Место</span><span>Команда</span><span>Очки</span><span>Участников</span></div>
+"""
+    ]
+    for rank, team_row in enumerate(teams_rows, start=1):
+        team = str(team_row.get("команда") or "").strip()
+        team_pts = int(team_row.get("очков") or 0)
+        mems = by_team_members.get(team, [])
+        mems_sorted = sorted(mems, key=lambda x: int(x.get("очков_7из8") or 0), reverse=True)
+        team_points_all_members = int(
+            sum(int(x.get("очков_7из8") or 0) for x in mems_sorted)
+        )
+        parts.append(
+            f'<details class="vm-cup-team"><summary>'
+            f'<span class="vm-cup-rank-cell"><span class="vm-cup-caret-t" aria-hidden="true"></span>{_esc_html(rank)}</span>'
+            f"<span>{_esc_html(team)}</span>"
+            f'<span style="text-align:right;font-variant-numeric:tabular-nums;">{_esc_html(team_pts)}</span>'
+            f'<span style="text-align:right;font-variant-numeric:tabular-nums;">{_esc_html(len(mems_sorted))}</span>'
+            f"</summary><div class='vm-cup-team-body'>"
+        )
+        for i, m in enumerate(mems_sorted, start=1):
+            pid = int(m.get("profile_id") or 0)
+            name = str(m.get("участник") or f"id {pid}")
+            pts_best7 = int(m.get("очков_7из8") or 0)
+            share = (
+                round((100.0 * pts_best7 / team_points_all_members), 1)
+                if team_points_all_members > 0
+                else 0.0
+            )
+            in_counted = i <= 5
+            badge = (
+                '<span class="vm-cup-badge">в зачёт</span>'
+                if in_counted
+                else '<span class="vm-cup-badge vm-cup-badge-muted">вне топ‑5</span>'
+            )
+            row_style = "background:#eaf7ea;" if in_counted else ""
+            parts.append(
+                f"<details class='vm-cup-member' style='{row_style}'><summary>"
+                f'<span class="vm-cup-name-cell"><span class="vm-cup-caret-m" aria-hidden="true"></span>{_esc_html(name)}</span>'
+                f'<span style="text-align:right;font-variant-numeric:tabular-nums;">{_esc_html(pts_best7)}</span>'
+                f'<span class="vm-cup-share">{_esc_html(share)}%</span>'
+                f"{badge}</summary>"
+            )
+            stg = by_team_member_stages.get((team, pid), [])
+            stg_sorted = sorted(stg, key=lambda x: int(x.get("этап") or 0))
+            parts.append("<table class='vm-cup-ev'><thead><tr>")
+            for h in ("Этап", "Событие", "Место, абсолют", "Очки (база)", "Бонус", "Очки (зачёт)", "Комментарий"):
+                parts.append(f"<th>{_esc_html(h)}</th>")
+            parts.append("</tr></thead><tbody>")
+            for s in stg_sorted:
+                parts.append(
+                    "<tr>"
+                    f"<td>{_esc_html(s.get('этап'))}</td>"
+                    f"<td>{_esc_html(s.get('событие'))}</td>"
+                    f"<td>{_esc_html(s.get('место_абс'))}</td>"
+                    f"<td>{_esc_html(s.get('очков_база'))}</td>"
+                    f"<td>{_esc_html(s.get('очков_бонус'))}</td>"
+                    f"<td>{_esc_html(s.get('очков_в_командный'))}</td>"
+                    f"<td>{_esc_html(s.get('комментарий'))}</td>"
+                    "</tr>"
+                )
+            parts.append("</tbody></table></details>")
+        parts.append("</div></details>")
+    parts.append("</div>")
+    return "".join(parts)
+
+
 def page_participant() -> None:
     st.header("Участник")
     path = db_path()
@@ -1589,7 +1699,7 @@ def page_team() -> None:
     st.header("Команда")
     st.caption(
         "Команда задаётся полем **team** в результатах соревнований. "
-        "Очки в кубках берутся из **profile_cup_results** для участников команды."
+        "Страница показывает KPI, состав, события, срезы, географию, тренды и кубковые блоки."
     )
     path = db_path()
     if not require_db(path):
@@ -1609,66 +1719,258 @@ def page_team() -> None:
     if not team:
         return
 
-    stats = mq.query_team_stats(path, team)
-    if not stats:
-        st.error("Нет финишей для этой команды в выбранных данных.")
+    base_stats = mq.query_team_stats(path, team)
+    if not base_stats:
+        st.error("Нет стартов для этой команды в выбранных данных.")
         return
 
-    st.subheader("Сводка по команде")
-    t1, t2, t3 = st.columns(3, gap="small")
-    with t1:
-        metric_plaque("Участников (уник.)", stats["participants"])
-    with t2:
-        metric_plaque("Всего финишей", stats["finishes"])
-    with t3:
-        metric_plaque("Активных лет участия", stats["active_years_count"])
+    year_options = sorted(set(base_stats.get("active_years_list") or []), reverse=True)
+    year_filter = st.selectbox(
+        "Год",
+        options=["Все"] + year_options,
+        index=0,
+        key=f"team_page_year_{team}",
+    )
+    year_value = None if year_filter == "Все" else int(year_filter)
 
-    years_str = ", ".join(str(y) for y in stats.get("active_years_list") or [])
+    kpi = mq.query_team_kpi_extended(path, team, year=year_value) or {}
+    st.subheader("KPI")
+    k1, k2, k3, k4 = st.columns(4, gap="small")
+    with k1:
+        metric_plaque("Участников (уник.)", int(kpi.get("participants_distinct") or 0))
+    with k2:
+        metric_plaque("Стартов", int(kpi.get("starts_total") or 0))
+    with k3:
+        metric_plaque("Финишей / DNF", f"{int(kpi.get('finishes_total') or 0)} / {int(kpi.get('dnf_total') or 0)}")
+    with k4:
+        metric_plaque("Километраж", f"{float(kpi.get('km_total') or 0.0):.1f} км")
+
+    years_str = ", ".join(str(y) for y in (kpi.get("active_years_list") or []))
     st.markdown(
         f'<p style="color:{VM_MUTED};font-size:0.9rem;margin:4px 0 16px 0;">'
         f"<b>Годы участия в событиях:</b> {years_str or '—'}</p>",
         unsafe_allow_html=True,
     )
 
-    st.subheader("Очки в кубках")
+    tab_labels = [
+        "Состав",
+        "События",
+        "Дистанции и спорт",
+        "География",
+        "Тренды",
+        "Кубки (legacy)",
+        "Кубки (расчёт team_scoring)",
+        "Командное первенство",
+    ]
+    show_quality_tab = _is_admin_user()
+    if show_quality_tab:
+        tab_labels.append("Диагностика")
+    tabs = st.tabs(tab_labels)
+    tab_roster, tab_events, tab_sport, tab_geo, tab_trends, tab_cups_legacy, tab_cups_calc, tab_champ = tabs[:8]
+    tab_quality = tabs[8] if show_quality_tab else None
+
+    with tab_roster:
+        roster = pd.DataFrame(mq.query_team_roster_stats(path, team, year=year_value))
+        if roster.empty:
+            st.caption("Нет данных состава для выбранного фильтра.")
+        else:
+            name_filter = st.text_input(
+                "Поиск участника",
+                key=f"team_roster_filter_{team}",
+                placeholder="Фамилия или имя",
+            ).strip().casefold()
+            if name_filter:
+                roster = roster[
+                    roster["athlete"].fillna("").astype(str).str.casefold().str.contains(name_filter)
+                ]
+            roster = roster.rename(
+                columns={
+                    "athlete": "Участник",
+                    "gender": "Пол",
+                    "age": "Возраст",
+                    "city": "Город",
+                    "starts_total": "Старты",
+                    "finishes_total": "Финиши",
+                    "dnf_total": "DNF",
+                    "km_total": "Км",
+                    "best_place_abs": "Лучшее место (абс.)",
+                }
+            )
+            st.dataframe(roster, use_container_width=True, hide_index=True)
+
+    with tab_events:
+        event_search = st.text_input(
+            "Поиск события",
+            key=f"team_events_filter_{team}",
+            placeholder="Подстрока в названии события",
+        )
+        events_df = pd.DataFrame(
+            mq.query_team_events_table(path, team, year=year_value, event_search=event_search)
+        )
+        if events_df.empty:
+            st.caption("События не найдены.")
+        else:
+            events_df = events_df.rename(
+                columns={
+                    "event_title": "Событие",
+                    "event_date": "Дата",
+                    "year": "Год",
+                    "sport": "Вид",
+                    "team_participants": "Участников команды",
+                    "team_finishes": "Финишей",
+                    "best_place_abs": "Лучшее место",
+                    "best_athlete": "Лучший участник",
+                }
+            )
+            st.dataframe(events_df, use_container_width=True, hide_index=True)
+
+    with tab_sport:
+        slices = mq.query_team_sport_distance_slices(path, team, year=year_value)
+        by_sport = pd.DataFrame(slices.get("by_sport") or [])
+        by_distance = pd.DataFrame(slices.get("by_distance") or [])
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**По видам спорта**")
+            st.dataframe(by_sport, use_container_width=True, hide_index=True)
+        with c2:
+            st.markdown("**По дистанциям**")
+            st.dataframe(by_distance, use_container_width=True, hide_index=True)
+
+    with tab_geo:
+        geo = mq.query_team_geography(path, team, year=year_value)
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.markdown("**Города**")
+            st.dataframe(pd.DataFrame(geo.get("cities") or []), use_container_width=True, hide_index=True)
+        with c2:
+            st.markdown("**Регионы**")
+            st.dataframe(pd.DataFrame(geo.get("regions") or []), use_container_width=True, hide_index=True)
+        with c3:
+            st.markdown("**Страны**")
+            st.dataframe(pd.DataFrame(geo.get("countries") or []), use_container_width=True, hide_index=True)
+
+    with tab_trends:
+        trends_df = pd.DataFrame(mq.query_team_yearly_trends(path, team))
+        if trends_df.empty:
+            st.caption("Нет годовой динамики.")
+        else:
+            st.dataframe(trends_df, use_container_width=True, hide_index=True)
+            fig = px.line(
+                trends_df,
+                x="year",
+                y=["starts", "finishes", "km_total"],
+                markers=True,
+                title="Динамика стартов, финишей и километража",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
     year_opts = mq.query_team_year_options_for_cups(path, team)
     cy = datetime.date.today().year
     if not year_opts:
         year_opts = [cy]
     default_year = cy if cy in year_opts else year_opts[0]
     cup_year = st.selectbox(
-        "Год учёта кубков",
+        "Год для кубковых блоков",
         options=year_opts,
         index=year_opts.index(default_year) if default_year in year_opts else 0,
-        key="team_cup_year",
-        help="По умолчанию — текущий календарный год, если есть данные; иначе последний год из базы.",
+        key=f"team_cup_year_{team}",
     )
 
-    cup_rows = mq.query_team_cup_points_for_year(path, team, int(cup_year))
-    if not cup_rows:
-        st.info(f"За **{cup_year}** нет строк в profile_cup_results для участников этой команды.")
-    else:
-        df = pd.DataFrame(cup_rows)
-        df = df.rename(
-            columns={
-                "athlete": "Участник",
-                "cup": "Кубок",
-                "distance": "Дистанция",
-                "place": "Место",
-                "cup_group": "Группа",
-                "points": "Очки",
-            }
-        )
-        drop_cols = [c for c in ("profile_id",) if c in df.columns]
-        if drop_cols:
-            df = df.drop(columns=drop_cols, errors="ignore")
-        st.dataframe(df, use_container_width=True, hide_index=True)
+    with tab_cups_legacy:
+        cup_rows = mq.query_team_cup_points_for_year(path, team, int(cup_year))
+        if not cup_rows:
+            st.info(f"За **{cup_year}** нет строк в profile_cup_results для участников этой команды.")
+        else:
+            df = pd.DataFrame(cup_rows).rename(
+                columns={
+                    "athlete": "Участник",
+                    "cup": "Кубок",
+                    "distance": "Дистанция",
+                    "place": "Место",
+                    "cup_group": "Группа",
+                    "points": "Очки",
+                }
+            )
+            if "profile_id" in df.columns:
+                df = df.drop(columns=["profile_id"], errors="ignore")
+            st.dataframe(df, use_container_width=True, hide_index=True)
 
-    with st.expander("Топ команд по числу финишей (справочно)"):
-        st.dataframe(
-            pd.DataFrame(mq.query_teams_top(path, year=None, limit=40)),
-            use_container_width=True,
-        )
+    with tab_cups_calc:
+        cups_for_year = mq.query_profile_cup_summaries_for_year(path, int(cup_year))
+        if not cups_for_year:
+            st.info("За выбранный год нет кубков.")
+        else:
+            cup_label_map = {f"{int(r['id'])} · {str(r.get('кубок') or '—')}": int(r["id"]) for r in cups_for_year}
+            selected_label = st.selectbox(
+                "Кубок (расчётный блок)",
+                options=list(cup_label_map.keys()),
+                key=f"team_calc_cup_pick_{team}_{cup_year}",
+            )
+            cup_id = cup_label_map[selected_label]
+            if mq.is_team_scoring_enabled(int(cup_id), int(cup_year)):
+                stage_map = mq.load_stage_index_map()
+                rec = mq.compute_team_scoring_for_cup_year(
+                    path, cup_id=cup_id, year=int(cup_year), stage_map=stage_map, rule_version="team_v1"
+                )
+                st.caption(
+                    f"Пересчёт выполнен: этапов={rec.get('stage_rows', 0)}, "
+                    f"участников={rec.get('member_rows', 0)}, команд={rec.get('team_rows', 0)}."
+                )
+                team_tot = mq.query_team_scoring_team_totals(path, cup_id, int(cup_year), rule_version="team_v1")
+                if team_tot:
+                    members = mq.query_team_scoring_member_totals(
+                        path, cup_id, int(cup_year), team_name=team, rule_version="team_v1"
+                    )
+                    stages = mq.query_team_scoring_stage_points(
+                        path, cup_id, int(cup_year), team_name=team, rule_version="team_v1"
+                    )
+                    st.markdown("**Итоги команды в расчётном контуре**")
+                    st.dataframe(pd.DataFrame([r for r in team_tot if r.get("Команда") == team]), use_container_width=True, hide_index=True)
+                    st.markdown("**Участники команды**")
+                    st.dataframe(pd.DataFrame(members), use_container_width=True, hide_index=True)
+                    st.markdown("**Поэтапные очки**")
+                    st.dataframe(pd.DataFrame(stages), use_container_width=True, hide_index=True)
+                else:
+                    st.info("Нет расчётных строк для выбранных параметров.")
+            else:
+                st.info("Расчёт team_scoring доступен только для cup_id=54 и year=2026. Для остальных случаев используйте legacy-вкладку.")
+
+    with tab_champ:
+        cups_for_year = mq.query_profile_cup_summaries_for_year(path, int(cup_year))
+        if not cups_for_year:
+            st.info("За выбранный год нет кубков.")
+        else:
+            cup_label_map = {f"{int(r['id'])} · {str(r.get('кубок') or '—')}": int(r["id"]) for r in cups_for_year}
+            selected_label = st.selectbox(
+                "Кубок (матрица)",
+                options=list(cup_label_map.keys()),
+                key=f"team_champ_cup_pick_{team}_{cup_year}",
+            )
+            cup_id = cup_label_map[selected_label]
+            if mq.is_team_scoring_enabled(int(cup_id), int(cup_year)):
+                stage_map = mq.load_stage_index_map()
+                mq.compute_team_scoring_for_cup_year(
+                    path, cup_id=cup_id, year=int(cup_year), stage_map=stage_map, rule_version="team_v1"
+                )
+                mat = mq.query_team_championship_matrix(
+                    path, cup_id=cup_id, year=int(cup_year), stage_map=stage_map, rule_version="team_v1"
+                )
+                rows = mat.get("rows") or []
+                if not rows:
+                    st.info("Нет данных для матрицы командного первенства.")
+                else:
+                    dfm = pd.DataFrame(rows)
+                    base_cols = ["Место", "Команда"]
+                    stage_cols = [str(x.get("label")) for x in (mat.get("stage_columns") or [])]
+                    show_cols = [c for c in base_cols + stage_cols + ["Итого"] if c in dfm.columns]
+                    st.dataframe(dfm[show_cols], use_container_width=True, hide_index=True)
+            else:
+                st.info("Матрица командного первенства доступна только для cup_id=54 и year=2026.")
+
+    if show_quality_tab and tab_quality is not None:
+        with tab_quality:
+            qdf = pd.DataFrame(mq.query_team_data_quality(path, team, year=year_value))
+            st.dataframe(qdf, use_container_width=True, hide_index=True)
 
 
 def page_cups() -> None:
@@ -1716,26 +2018,38 @@ def page_cups() -> None:
         st.warning(f"За **{year}** нет строк в profile_cup_results.")
         return
 
-    st.caption("Выберите кубок в списке — таблица результатов внизу обновится (без отдельного списка).")
-    nopts = list(range(len(summaries)))
-    idx = st.radio(
-        "Кубок",
-        options=nopts,
-        format_func=lambda i: (
-            f"{str(summaries[i].get('кубок') or '—')}"
-            f"  ·  {int(summaries[i].get('участников') or 0)} участн."
-        ),
-        key=f"cup_filter_{year}",
-        label_visibility="collapsed",
-        horizontal=False,
+    st.caption("Выберите кубок в таблице — результаты ниже обновятся.")
+    df_cups = pd.DataFrame(
+        [
+            {
+                "id": int(r["id"]),
+                "Наименование кубка": str(r.get("кубок") or "—"),
+                "Количество участников": int(r.get("участников") or 0),
+            }
+            for r in summaries
+        ]
     )
-    if idx is None:
-        idx = 0
-    cup_id = int(summaries[int(idx)]["id"])
-    cup_title = str(summaries[int(idx)].get("кубок") or f"#{cup_id}")
+    cup_pick_ev = st.dataframe(
+        df_cups[["Наименование кубка", "Количество участников"]],
+        use_container_width=True,
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key=f"cups_pick_df_{year}",
+        height=min(340, 74 + len(df_cups) * 36),
+    )
+    selected_row_idx: int | None = None
+    if cup_pick_ev.selection.rows:
+        selected_row_idx = int(cup_pick_ev.selection.rows[0])
+    if selected_row_idx is None:
+        selected_row_idx = 0
+    cup_id = int(df_cups.iloc[selected_row_idx]["id"])
+    cup_title = str(df_cups.iloc[selected_row_idx]["Наименование кубка"] or f"#{cup_id}")
 
     st.subheader(f"Результаты: {cup_title} · {year}")
-    tab_ind, tab_team = st.tabs(["Личное первенство", "Командный зачёт"])
+    tab_ind, tab_team, tab_team_champ = st.tabs(
+        ["Личное первенство", "Командный зачёт", "Командное первенство"]
+    )
 
     with tab_ind:
         detail = mq.query_profile_cup_detail_for_year_cup(path, year, cup_id)
@@ -1799,48 +2113,108 @@ def page_cups() -> None:
             st.dataframe(pd.DataFrame(view), use_container_width=True, hide_index=True)
 
     with tab_team:
-        score_rows = mq.query_cup_team_score_rows(path, cup_id, year)
-        if not score_rows:
-            st.info(
-                "Нет данных: для участников с очками в **profile_cup_results** за этот кубок и год "
-                "не найдено ни одного финиша в соревнованиях кубка (**cup_competitions**) "
-                "с непустым **results.team**."
+        if int(cup_id) == 54 and int(year) == 2026:
+            st.caption(
+                "Логика расчёта: очки по месту в абсолюте в разрезе пола зависят от этапа и дистанции. "
+                "Этапы 1–6: 7+ км (600/598/596..., с 7 места шаг -1), 5–6 км (598/596/..., с 6 места шаг -1). "
+                "Этапы 7–8: 10–21 км (602/600/599..., далее шаг -1), 5 км (598/596/..., с 6 места шаг -1), "
+                "на 2–3 км очки не начисляются. Для 50+ добавляется +15 очков в командный зачёт, "
+                "но итог за этап не выше очков 1 места. Участнику в зачёт идёт 7 из 8 лучших этапов, "
+                "команде — сумма 5 лучших участников."
             )
-        else:
-            tneedle = st.text_input(
-                "Показать команды (подстрока в названии)",
-                key=f"cups_team_filter_{year}_{cup_id}",
-                placeholder="Пусто — все команды",
+            stage_map = mq.load_stage_index_map()
+            rec = mq.compute_team_scoring_for_cup_year(
+                path, cup_id=cup_id, year=year, stage_map=stage_map, rule_version="team_v1"
             )
-            needle = tneedle.strip().casefold()
-            if needle:
-                score_rows = [
-                    r
-                    for r in score_rows
-                    if needle in (r.get("команда") or "").strip().casefold()
-                ]
-            if not score_rows:
-                st.caption("После фильтра команд не осталось.")
+            st.caption(
+                f"Пересчёт выполнен: этапов={rec.get('stage_rows', 0)}, "
+                f"участников={rec.get('member_rows', 0)}, команд={rec.get('team_rows', 0)}."
+            )
+            team_tot = mq.query_team_scoring_team_totals(path, cup_id, year, rule_version="team_v1")
+            if not team_tot:
+                st.info("Нет расчётных строк командного зачёта для выбранного кубка и года.")
             else:
-                st.caption(
-                    "Сумма в командный зачёт = сумма **очков пяти лучших участников** "
-                    "(очки из **profile_cup_results.total_points**, по каждому этапу — целое после округления). "
-                    "Таблица: **место · команда · очки**; под участником — **все его финиши** в соревнованиях этого кубка за год "
-                    "(**results** + **cup_competitions**). Очки — только из **profile_cup_results.total_points**: "
-                    "по **`raw.competition.id`** (как у **results.competition_id**) или по паре **название этапа из raw + дистанция** "
-                    "(без одной общей суммы на все строки)."
+                all_members = mq.query_team_scoring_member_totals(
+                    path, cup_id, year, team_name=None, rule_version="team_v1"
+                )
+                all_stages = mq.query_team_scoring_stage_points(
+                    path, cup_id, year, team_name=None, rule_version="team_v1"
                 )
                 with st.spinner("Загрузка…"):
-                    frag = _cup_team_hierarchy_html(
-                        _cup_team_aggregate_points(score_rows), path, cup_id, year
-                    )
+                    frag = _team_scoring_hierarchy_html(team_tot, all_members, all_stages)
                 if hasattr(st, "html"):
                     st.html(frag)
                 else:
                     st.markdown(frag, unsafe_allow_html=True)
+        else:
+            score_rows = mq.query_cup_team_score_rows(path, cup_id, year)
+            if not score_rows:
+                st.info(
+                    "Нет данных: для участников с очками в **profile_cup_results** за этот кубок и год "
+                    "не найдено ни одного финиша в соревнованиях кубка (**cup_competitions**) "
+                    "с непустым **results.team**."
+                )
+            else:
+                tneedle = st.text_input(
+                    "Показать команды (подстрока в названии)",
+                    key=f"cups_team_filter_legacy_{year}_{cup_id}",
+                    placeholder="Пусто — все команды",
+                )
+                needle = tneedle.strip().casefold()
+                if needle:
+                    score_rows = [
+                        r
+                        for r in score_rows
+                        if needle in (r.get("команда") or "").strip().casefold()
+                    ]
+                if not score_rows:
+                    st.caption("После фильтра команд не осталось.")
+                else:
+                    st.caption(
+                        "Сумма в командный зачёт = сумма **очков пяти лучших участников** "
+                        "(очки из **profile_cup_results.total_points**, по каждому этапу — целое после округления). "
+                        "Таблица: **место · команда · очки**; под участником — **все его финиши** в соревнованиях этого кубка за год "
+                        "(**results** + **cup_competitions**)."
+                    )
+                    with st.spinner("Загрузка…"):
+                        frag = _cup_team_hierarchy_html(
+                            _cup_team_aggregate_points(score_rows), path, cup_id, year
+                        )
+                    if hasattr(st, "html"):
+                        st.html(frag)
+                    else:
+                        st.markdown(frag, unsafe_allow_html=True)
+
+    with tab_team_champ:
+        stage_map = mq.load_stage_index_map()
+        if not stage_map:
+            st.info("Не найдена карта этапов (.cursor/etapy.yaml).")
+        else:
+            if int(cup_id) == 54 and int(year) == 2026:
+                mq.compute_team_scoring_for_cup_year(
+                    path, cup_id=cup_id, year=year, stage_map=stage_map, rule_version="team_v1"
+                )
+                mat = mq.query_team_championship_matrix(
+                    path, cup_id=cup_id, year=year, stage_map=stage_map, rule_version="team_v1"
+                )
+                rows = mat.get("rows") or []
+                if not rows:
+                    st.info("Нет данных для матрицы командного первенства.")
+                else:
+                    dfm = pd.DataFrame(rows)
+                    base_cols = ["Место", "Команда"]
+                    stage_cols = [str(x.get("label")) for x in (mat.get("stage_columns") or [])]
+                    show_cols = base_cols + stage_cols + ["Итого"]
+                    show_cols = [c for c in show_cols if c in dfm.columns]
+                    st.dataframe(dfm[show_cols], use_container_width=True, hide_index=True)
+            else:
+                st.info("Матрица командного первенства доступна для Кубка беговых марафонов 2026 (id 54).")
 
 
 def page_admin() -> None:
+    if not _is_admin_user():
+        st.warning("Админка отключена в текущем окружении.")
+        return
     st.header("Админка")
     st.subheader("Справочник алиасов дистанций")
     st.caption(
@@ -1891,21 +2265,25 @@ def page_admin() -> None:
 
 
 def main() -> None:
+    icon = page_icon_path()
     st.set_page_config(
         page_title="ВологдаМарафон — аналитика",
+        page_icon=icon if icon else None,
         layout="wide",
         initial_sidebar_state="expanded",
     )
     inject_vm_styles()
 
-    PAGES: tuple[str, ...] = (
+    pages: list[str] = [
         "Общая статистика",
         "Событие",
         "Участник",
         "Команда",
         "Кубки",
-        "Админка",
-    )
+    ]
+    if _is_admin_user():
+        pages.append("Админка")
+    PAGES: tuple[str, ...] = tuple(pages)
     if SIDEBAR_LOGO.is_file():
         st.sidebar.image(str(SIDEBAR_LOGO), use_container_width=True)
     i_from_url = _sidebar_read_nav_i_from_url()

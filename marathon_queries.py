@@ -17,6 +17,8 @@ DEFAULT_DB = Path(os.environ.get("MARATHON_DB", "marathon.db"))
 DEFAULT_DISTANCE_ALIASES_FILE = (
     Path(__file__).resolve().parent / "config" / "distance_aliases.json"
 )
+DEFAULT_STAGES_FILE = Path(__file__).resolve().parent / ".cursor" / "etapy.yaml"
+LEGACY_STAGES_FILE = Path(__file__).resolve().parent / ".cursor" / "etapi.md"
 
 
 @contextmanager
@@ -245,6 +247,607 @@ def ensure_cup_scoring_schema(db_path: Path | str | None = None) -> None:
         return
     with connect(path) as c:
         cup_scoring.ensure_cup_scoring_tables(c)
+
+
+def ensure_team_scoring_schema(db_path: Path | str | None = None) -> None:
+    """Создаёт таблицы расчёта командного зачёта (CREATE IF NOT EXISTS)."""
+    path = Path(db_path) if db_path is not None else DEFAULT_DB
+    if not path.is_file():
+        return
+    with connect(path) as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS team_scoring_stage_points (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rule_version TEXT NOT NULL,
+                cup_id INTEGER NOT NULL,
+                year INTEGER NOT NULL,
+                stage_index INTEGER NOT NULL,
+                competition_id INTEGER NOT NULL,
+                profile_id INTEGER NOT NULL,
+                team_name TEXT NOT NULL,
+                gender TEXT,
+                age INTEGER,
+                distance_id INTEGER,
+                distance_km REAL,
+                place_abs INTEGER,
+                base_points INTEGER NOT NULL,
+                bonus_points INTEGER NOT NULL,
+                points_for_team INTEGER NOT NULL,
+                first_place_cap INTEGER NOT NULL,
+                source_result_id INTEGER,
+                computed_at TEXT,
+                UNIQUE(rule_version, cup_id, year, stage_index, profile_id)
+            );
+            CREATE TABLE IF NOT EXISTS team_scoring_member_totals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rule_version TEXT NOT NULL,
+                cup_id INTEGER NOT NULL,
+                year INTEGER NOT NULL,
+                team_name TEXT NOT NULL,
+                profile_id INTEGER NOT NULL,
+                points_sum_all_stages INTEGER NOT NULL,
+                points_best7_of8 INTEGER NOT NULL,
+                stages_counted_json TEXT,
+                computed_at TEXT,
+                UNIQUE(rule_version, cup_id, year, team_name, profile_id)
+            );
+            CREATE TABLE IF NOT EXISTS team_scoring_team_totals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                rule_version TEXT NOT NULL,
+                cup_id INTEGER NOT NULL,
+                year INTEGER NOT NULL,
+                team_name TEXT NOT NULL,
+                team_points_top5 INTEGER NOT NULL,
+                members_counted_json TEXT,
+                computed_at TEXT,
+                UNIQUE(rule_version, cup_id, year, team_name)
+            );
+            """
+        )
+        c.commit()
+
+
+def load_stage_index_map(path: Path | str | None = None) -> dict[int, int]:
+    """Парсит карту этапов из .cursor/etapi.md (форматы `Этап 1 id 298` или `1:298`)."""
+    p = Path(path) if path is not None else DEFAULT_STAGES_FILE
+    if not p.is_file():
+        p = LEGACY_STAGES_FILE
+    if not p.is_file():
+        return {}
+    try:
+        txt = p.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    out: dict[int, int] = {}
+    for line in txt.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        m1 = re.search(r"этап\s*(\d+)\s*id\s*(\d+)", s, flags=re.IGNORECASE)
+        if m1:
+            out[int(m1.group(2))] = int(m1.group(1))
+            continue
+        m2 = re.match(r"(\d+)\s*[:=-]\s*(\d+)$", s)
+        if m2:
+            out[int(m2.group(2))] = int(m2.group(1))
+    return out
+
+
+def _score_linear(place_abs: int, first: int, second: int, linear_from_place: int) -> int:
+    if place_abs <= 0:
+        return 0
+    if place_abs == 1:
+        return first
+    if place_abs == 2:
+        return second
+    start = second - 1
+    delta = max(0, place_abs - linear_from_place)
+    return max(0, start - delta)
+
+
+def calc_team_stage_base_points(
+    stage_index: int,
+    distance_km: float | None,
+    place_abs: int | None,
+) -> tuple[int, int]:
+    """
+    Базовые очки этапа (без бонуса) и cap (= очки за 1 место для данного правила).
+    Возвращает (base_points, first_place_cap).
+    """
+    if place_abs is None or place_abs <= 0:
+        return (0, 0)
+    km = float(distance_km or 0.0)
+    p = int(place_abs)
+    if 1 <= stage_index <= 6:
+        if km >= 7.0:
+            if p <= 6:
+                return (600 - (p - 1) * 2, 600)
+            return (max(0, 589 - (p - 7)), 600)
+        if 5.0 <= km <= 6.0:
+            if p <= 5:
+                return (598 - (p - 1) * 2, 598)
+            return (max(0, 589 - (p - 6)), 598)
+        return (0, 0)
+    if stage_index in (7, 8):
+        if 10.0 <= km <= 21.0:
+            if p == 1:
+                return (602, 602)
+            if p == 2:
+                return (600, 602)
+            return (max(0, 599 - (p - 3)), 602)
+        if 4.7 <= km <= 5.3:
+            if p <= 5:
+                return (598 - (p - 1) * 2, 598)
+            return (max(0, 589 - (p - 6)), 598)
+        if 2.0 <= km <= 3.0:
+            return (0, 0)
+        return (0, 0)
+    return (0, 0)
+
+
+def _resolve_distance_km(distance_km: Any, distance_name: str | None) -> float:
+    """Нормализация км дистанции: берём поле distance_km, иначе парсим из названия."""
+    try:
+        km = float(distance_km)
+        if km > 0:
+            return km
+    except (TypeError, ValueError):
+        pass
+    name = (distance_name or "").strip().casefold().replace(",", ".")
+    nums = re.findall(r"\d+(?:\.\d+)?", name)
+    if not nums:
+        return 0.0
+    try:
+        n0 = float(nums[0])
+    except ValueError:
+        return 0.0
+    if "км" in name or "km" in name:
+        return n0
+    if "м" in name:
+        return n0 / 1000.0
+    return n0
+
+
+def compute_team_scoring_for_cup_year(
+    db_path: Path | str,
+    cup_id: int,
+    year: int,
+    stage_map: dict[int, int] | None = None,
+    rule_version: str = "team_v1",
+) -> dict[str, int]:
+    """
+    Пересчитывает таблицы team_scoring_* для cup_id/year.
+    Правила: лучшая строка участника в этапе, бонус 50+ = +15, cap очков не выше 1 места.
+    """
+    ensure_team_scoring_schema(db_path)
+    stage_ix_map = stage_map if stage_map is not None else load_stage_index_map()
+    if not stage_ix_map:
+        return {"stage_rows": 0, "member_rows": 0, "team_rows": 0}
+    comp_ids = sorted(stage_ix_map.keys())
+    comp_placeholders = ",".join("?" * len(comp_ids))
+    base_rows = q_all(
+        db_path,
+        f"""
+        SELECT
+            r.id AS result_id,
+            r.competition_id,
+            r.profile_id,
+            TRIM(COALESCE(r.team, '')) AS team_name,
+            COALESCE(NULLIF(TRIM(p.gender), ''), '') AS gender,
+            p.age AS age,
+            r.distance_id,
+            d.distance_km,
+            d.name AS distance_name,
+            r.place_abs,
+            r.place_gender
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id AND c.year = ?
+        LEFT JOIN profiles p ON p.id = r.profile_id
+        LEFT JOIN distances d ON d.id = r.distance_id
+        WHERE COALESCE(r.dnf, 0) = 0
+          AND r.profile_id IS NOT NULL
+          AND TRIM(COALESCE(r.team, '')) != ''
+          AND (r.place_gender IS NOT NULL OR r.place_abs IS NOT NULL)
+          AND r.competition_id IN ({comp_placeholders})
+        """,
+        tuple([year] + comp_ids),
+    )
+    by_stage_profile: dict[tuple[int, int], dict[str, Any]] = {}
+    for r in base_rows:
+        comp_id = int(r["competition_id"])
+        if comp_id not in stage_ix_map:
+            continue
+        stage_idx = int(stage_ix_map[comp_id])
+        km = _resolve_distance_km(r.get("distance_km"), r.get("distance_name"))
+        place_for_score = r.get("place_gender")
+        if place_for_score is None:
+            place_for_score = r.get("place_abs")
+        base_pts, cap = calc_team_stage_base_points(stage_idx, km, place_for_score)
+        if base_pts <= 0:
+            continue
+        age = r.get("age")
+        bonus = 15 if age is not None and int(age) >= 50 else 0
+        pts_team = min(base_pts + bonus, cap)
+        key = (stage_idx, int(r["profile_id"]))
+        cur = by_stage_profile.get(key)
+        cand = {
+            "stage_index": stage_idx,
+            "competition_id": comp_id,
+            "profile_id": int(r["profile_id"]),
+            "team_name": str(r.get("team_name") or "").strip(),
+            "gender": str(r.get("gender") or "").strip(),
+            "age": int(age) if age is not None else None,
+            "distance_id": r.get("distance_id"),
+            "distance_km": float(km),
+            "place_abs": int(r.get("place_abs") or 0),
+            "base_points": int(base_pts),
+            "bonus_points": int(bonus),
+            "points_for_team": int(pts_team),
+            "first_place_cap": int(cap),
+            "source_result_id": int(r["result_id"]),
+        }
+        if cur is None or int(cand["points_for_team"]) > int(cur["points_for_team"]):
+            by_stage_profile[key] = cand
+    chosen_rows = list(by_stage_profile.values())
+    with connect(db_path) as c:
+        now = datetime.now(timezone.utc).isoformat()
+        c.execute(
+            "DELETE FROM team_scoring_stage_points WHERE rule_version=? AND cup_id=? AND year=?",
+            (rule_version, cup_id, year),
+        )
+        c.execute(
+            "DELETE FROM team_scoring_member_totals WHERE rule_version=? AND cup_id=? AND year=?",
+            (rule_version, cup_id, year),
+        )
+        c.execute(
+            "DELETE FROM team_scoring_team_totals WHERE rule_version=? AND cup_id=? AND year=?",
+            (rule_version, cup_id, year),
+        )
+        if chosen_rows:
+            c.executemany(
+                """
+                INSERT INTO team_scoring_stage_points (
+                    rule_version, cup_id, year, stage_index, competition_id, profile_id,
+                    team_name, gender, age, distance_id, distance_km, place_abs,
+                    base_points, bonus_points, points_for_team, first_place_cap,
+                    source_result_id, computed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        rule_version,
+                        cup_id,
+                        year,
+                        int(r["stage_index"]),
+                        int(r["competition_id"]),
+                        int(r["profile_id"]),
+                        str(r["team_name"]),
+                        str(r["gender"]),
+                        r["age"],
+                        r["distance_id"],
+                        float(r["distance_km"]),
+                        int(r["place_abs"]),
+                        int(r["base_points"]),
+                        int(r["bonus_points"]),
+                        int(r["points_for_team"]),
+                        int(r["first_place_cap"]),
+                        int(r["source_result_id"]),
+                        now,
+                    )
+                    for r in chosen_rows
+                ],
+            )
+        # member totals: best 7 of 8
+        stage_rows = [
+            {
+                "team_name": str(r["team_name"]),
+                "profile_id": int(r["profile_id"]),
+                "stage_index": int(r["stage_index"]),
+                "points_for_team": int(r["points_for_team"]),
+            }
+            for r in chosen_rows
+        ]
+        by_member: dict[tuple[str, int], list[dict[str, Any]]] = {}
+        for r in stage_rows:
+            k = (str(r["team_name"]), int(r["profile_id"]))
+            by_member.setdefault(k, []).append(r)
+        member_rows: list[tuple[Any, ...]] = []
+        team_acc: dict[str, list[tuple[int, int]]] = {}
+        for (team_name, profile_id), rr in by_member.items():
+            rr_sorted = sorted(
+                rr, key=lambda x: int(x.get("points_for_team") or 0), reverse=True
+            )
+            best7 = rr_sorted[:7]
+            points_all = int(sum(int(x.get("points_for_team") or 0) for x in rr_sorted))
+            points_best7 = int(sum(int(x.get("points_for_team") or 0) for x in best7))
+            stages_json = json.dumps(
+                [
+                    {
+                        "stage_index": int(x.get("stage_index") or 0),
+                        "points": int(x.get("points_for_team") or 0),
+                    }
+                    for x in best7
+                ],
+                ensure_ascii=False,
+            )
+            member_rows.append(
+                (
+                    rule_version,
+                    cup_id,
+                    year,
+                    team_name,
+                    profile_id,
+                    points_all,
+                    points_best7,
+                    stages_json,
+                    now,
+                )
+            )
+            team_acc.setdefault(team_name, []).append((profile_id, points_best7))
+        if member_rows:
+            c.executemany(
+                """
+                INSERT INTO team_scoring_member_totals (
+                    rule_version, cup_id, year, team_name, profile_id,
+                    points_sum_all_stages, points_best7_of8, stages_counted_json, computed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                member_rows,
+            )
+        team_rows: list[tuple[Any, ...]] = []
+        for team_name, vals in team_acc.items():
+            vals_sorted = sorted(vals, key=lambda x: x[1], reverse=True)
+            top5 = vals_sorted[:5]
+            team_points = int(sum(v for _, v in top5))
+            members_json = json.dumps(
+                [{"profile_id": int(pid), "points_best7_of8": int(pts)} for pid, pts in top5],
+                ensure_ascii=False,
+            )
+            team_rows.append(
+                (
+                    rule_version,
+                    cup_id,
+                    year,
+                    team_name,
+                    team_points,
+                    members_json,
+                    now,
+                )
+            )
+        if team_rows:
+            c.executemany(
+                """
+                INSERT INTO team_scoring_team_totals (
+                    rule_version, cup_id, year, team_name,
+                    team_points_top5, members_counted_json, computed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                team_rows,
+            )
+        c.commit()
+    return {
+        "stage_rows": len(chosen_rows),
+        "member_rows": len(member_rows),
+        "team_rows": len(team_rows),
+    }
+
+
+def query_team_scoring_team_totals(
+    db_path: Path | str, cup_id: int, year: int, rule_version: str = "team_v1"
+) -> list[dict[str, Any]]:
+    return q_all(
+        db_path,
+        """
+        SELECT
+            team_name AS команда,
+            team_points_top5 AS очков,
+            members_counted_json AS members_json
+        FROM team_scoring_team_totals
+        WHERE rule_version=? AND cup_id=? AND year=?
+        ORDER BY очков DESC, команда
+        """,
+        (rule_version, cup_id, year),
+    )
+
+
+def query_team_scoring_member_totals(
+    db_path: Path | str, cup_id: int, year: int, team_name: str | None = None, rule_version: str = "team_v1"
+) -> list[dict[str, Any]]:
+    if team_name is None:
+        return q_all(
+            db_path,
+            """
+            SELECT
+                m.team_name AS команда,
+                m.profile_id,
+                TRIM(COALESCE(p.last_name, '') || ' ' || COALESCE(p.first_name, '')) AS участник,
+                m.points_best7_of8 AS очков_7из8,
+                m.points_sum_all_stages AS очков_всего,
+                m.stages_counted_json
+            FROM team_scoring_member_totals m
+            LEFT JOIN profiles p ON p.id = m.profile_id
+            WHERE m.rule_version=? AND m.cup_id=? AND m.year=?
+            ORDER BY m.team_name, m.points_best7_of8 DESC, участник
+            """,
+            (rule_version, cup_id, year),
+        )
+    return q_all(
+        db_path,
+        """
+        SELECT
+            m.team_name AS команда,
+            m.profile_id,
+            TRIM(COALESCE(p.last_name, '') || ' ' || COALESCE(p.first_name, '')) AS участник,
+            m.points_best7_of8 AS очков_7из8,
+            m.points_sum_all_stages AS очков_всего,
+            m.stages_counted_json
+        FROM team_scoring_member_totals m
+        LEFT JOIN profiles p ON p.id = m.profile_id
+        WHERE m.rule_version=? AND m.cup_id=? AND m.year=? AND m.team_name=?
+        ORDER BY m.points_best7_of8 DESC, участник
+        """,
+        (rule_version, cup_id, year, team_name),
+    )
+
+
+def query_team_scoring_stage_points(
+    db_path: Path | str,
+    cup_id: int,
+    year: int,
+    team_name: str | None = None,
+    rule_version: str = "team_v1",
+) -> list[dict[str, Any]]:
+    """Детализация очков по этапам для участников командного зачёта."""
+    if team_name is None:
+        return q_all(
+            db_path,
+            """
+            SELECT
+                sp.team_name AS команда,
+                sp.profile_id,
+                sp.stage_index AS этап,
+                sp.competition_id,
+                COALESCE(c.title, '') AS событие,
+                TRIM(COALESCE(p.last_name, '') || ' ' || COALESCE(p.first_name, '')) AS участник,
+                sp.place_abs AS место_абс,
+                sp.base_points AS очков_база,
+                sp.bonus_points AS очков_бонус,
+                sp.points_for_team AS очков_в_командный,
+                CASE WHEN sp.bonus_points > 0 THEN 'Группа 50+ бонус 15 очков' ELSE '' END AS комментарий
+            FROM team_scoring_stage_points sp
+            LEFT JOIN profiles p ON p.id = sp.profile_id
+            LEFT JOIN competitions c ON c.id = sp.competition_id
+            WHERE sp.rule_version=? AND sp.cup_id=? AND sp.year=?
+            ORDER BY sp.team_name, sp.stage_index, sp.points_for_team DESC, участник
+            """,
+            (rule_version, cup_id, year),
+        )
+    return q_all(
+        db_path,
+        """
+        SELECT
+            sp.team_name AS команда,
+            sp.profile_id,
+            sp.stage_index AS этап,
+            sp.competition_id,
+            COALESCE(c.title, '') AS событие,
+            TRIM(COALESCE(p.last_name, '') || ' ' || COALESCE(p.first_name, '')) AS участник,
+            sp.place_abs AS место_абс,
+            sp.base_points AS очков_база,
+            sp.bonus_points AS очков_бонус,
+            sp.points_for_team AS очков_в_командный,
+            CASE WHEN sp.bonus_points > 0 THEN 'Группа 50+ бонус 15 очков' ELSE '' END AS комментарий
+        FROM team_scoring_stage_points sp
+        LEFT JOIN profiles p ON p.id = sp.profile_id
+        LEFT JOIN competitions c ON c.id = sp.competition_id
+        WHERE sp.rule_version=? AND sp.cup_id=? AND sp.year=? AND sp.team_name=?
+        ORDER BY sp.stage_index, sp.points_for_team DESC, участник
+        """,
+        (rule_version, cup_id, year, team_name),
+    )
+
+
+def query_team_championship_matrix(
+    db_path: Path | str,
+    cup_id: int,
+    year: int,
+    stage_map: dict[int, int] | None = None,
+    rule_version: str = "team_v1",
+) -> dict[str, Any]:
+    """
+    Матрица командного первенства:
+    строки = команды, колонки = этапы (из stage_map), значение = 100-(место-1),
+    где место считается по сумме очков top-5 участников команды на этапе.
+    """
+    smap = stage_map if stage_map is not None else load_stage_index_map()
+    if not smap:
+        return {"stage_columns": [], "rows": []}
+    stage_to_comp: dict[int, int] = {}
+    for comp_id, stage_idx in smap.items():
+        if 1 <= int(stage_idx) <= 8:
+            stage_to_comp[int(stage_idx)] = int(comp_id)
+    if not stage_to_comp:
+        return {"stage_columns": [], "rows": []}
+    stage_indices = sorted(stage_to_comp.keys())
+    comp_ids = [stage_to_comp[s] for s in stage_indices]
+    ph = ",".join("?" * len(comp_ids))
+    comp_rows = q_all(
+        db_path,
+        f"""
+        SELECT id, COALESCE(NULLIF(TRIM(title), ''), 'Этап') AS title
+        FROM competitions
+        WHERE id IN ({ph})
+        """,
+        tuple(comp_ids),
+    )
+    comp_title: dict[int, str] = {int(r["id"]): str(r["title"]) for r in comp_rows}
+    stage_columns: list[dict[str, Any]] = [
+        {
+            "stage_index": s,
+            "competition_id": stage_to_comp[s],
+            "label": comp_title.get(stage_to_comp[s], f"Этап {s}"),
+        }
+        for s in stage_indices
+    ]
+
+    stage_rows = q_all(
+        db_path,
+        """
+        SELECT stage_index, team_name, profile_id, points_for_team
+        FROM team_scoring_stage_points
+        WHERE rule_version=? AND cup_id=? AND year=?
+        """,
+        (rule_version, cup_id, year),
+    )
+    from collections import defaultdict
+
+    by_stage_team_profile: dict[tuple[int, str, int], int] = defaultdict(int)
+    for r in stage_rows:
+        st = int(r.get("stage_index") or 0)
+        team = str(r.get("team_name") or "").strip()
+        pid = int(r.get("profile_id") or 0)
+        if st not in stage_to_comp or not team or pid <= 0:
+            continue
+        pts = int(r.get("points_for_team") or 0)
+        key = (st, team, pid)
+        if pts > by_stage_team_profile[key]:
+            by_stage_team_profile[key] = pts
+
+    by_stage_team_values: dict[int, dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
+    for (st, team, _pid), pts in by_stage_team_profile.items():
+        by_stage_team_values[st][team].append(int(pts))
+
+    stage_team_top5_sum: dict[int, dict[str, int]] = defaultdict(dict)
+    all_teams: set[str] = set()
+    for st, teams in by_stage_team_values.items():
+        for team, arr in teams.items():
+            all_teams.add(team)
+            arr_sorted = sorted(arr, reverse=True)
+            stage_team_top5_sum[st][team] = int(sum(arr_sorted[:5]))
+
+    # ранжирование команд внутри каждого этапа и перевод в очки матрицы 100..1
+    stage_rank_points: dict[int, dict[str, int]] = defaultdict(dict)
+    for st, teams in stage_team_top5_sum.items():
+        ordered = sorted(teams.items(), key=lambda x: x[1], reverse=True)
+        for rank, (team, _v) in enumerate(ordered, start=1):
+            stage_rank_points[st][team] = max(0, 100 - (rank - 1))
+
+    row_list: list[dict[str, Any]] = []
+    for team in sorted(all_teams):
+        row: dict[str, Any] = {"Команда": team}
+        total = 0
+        for sc in stage_columns:
+            st = int(sc["stage_index"])
+            val = int(stage_rank_points.get(st, {}).get(team, 0))
+            row[str(sc["label"])] = val
+            total += val
+        row["Итого"] = int(total)
+        row_list.append(row)
+    row_list.sort(key=lambda x: int(x.get("Итого") or 0), reverse=True)
+    for i, r in enumerate(row_list, start=1):
+        r["Место"] = i
+    return {"stage_columns": stage_columns, "rows": row_list}
 
 
 # ── Сводка и сезон ────────────────────────────────────────────────────────
@@ -2578,6 +3181,353 @@ def query_team_cup_points_for_year(
         """,
         (year, t),
     )
+
+
+def query_team_kpi_extended(
+    db_path: Path | str,
+    team_name: str,
+    year: int | None = None,
+) -> dict[str, Any] | None:
+    """Расширенные KPI команды: участники, старты, финиши, DNF, километраж, годы."""
+    t = team_name.strip()
+    if not t:
+        return None
+    params: list[Any] = [t]
+    year_sql = ""
+    if year is not None:
+        year_sql = " AND c.year = ?"
+        params.append(int(year))
+    row = q_one(
+        db_path,
+        f"""
+        SELECT
+            COUNT(*) AS starts_total,
+            SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN 1 ELSE 0 END) AS finishes_total,
+            SUM(CASE WHEN COALESCE(r.dnf, 0) != 0 THEN 1 ELSE 0 END) AS dnf_total,
+            COUNT(DISTINCT CASE WHEN r.profile_id IS NOT NULL THEN r.profile_id END) AS participants_distinct,
+            ROUND(COALESCE(SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN d.distance_km ELSE 0 END), 0), 1) AS km_total,
+            COUNT(DISTINCT c.year) AS active_years_count
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        LEFT JOIN distances d ON d.id = r.distance_id
+        WHERE TRIM(COALESCE(r.team, '')) = ? {year_sql}
+        """,
+        tuple(params),
+    )
+    if not row:
+        return None
+    years_rows = q_all(
+        db_path,
+        f"""
+        SELECT DISTINCT c.year AS y
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        WHERE TRIM(COALESCE(r.team, '')) = ?
+          AND c.year IS NOT NULL
+          {year_sql}
+        ORDER BY c.year
+        """,
+        tuple(params),
+    )
+    starts_total = int(row.get("starts_total") or 0)
+    if starts_total <= 0:
+        return None
+    years = [int(x["y"]) for x in years_rows if x.get("y") is not None]
+    return {
+        "participants_distinct": int(row.get("participants_distinct") or 0),
+        "starts_total": starts_total,
+        "finishes_total": int(row.get("finishes_total") or 0),
+        "dnf_total": int(row.get("dnf_total") or 0),
+        "km_total": float(row.get("km_total") or 0.0),
+        "active_years_count": int(row.get("active_years_count") or 0),
+        "active_years_list": years,
+    }
+
+
+def query_team_roster_stats(
+    db_path: Path | str,
+    team_name: str,
+    year: int | None = None,
+) -> list[dict[str, Any]]:
+    """Состав команды с базовой статистикой по участникам."""
+    t = team_name.strip()
+    params: list[Any] = [t]
+    year_sql = ""
+    if year is not None:
+        year_sql = " AND c.year = ?"
+        params.append(int(year))
+    return q_all(
+        db_path,
+        f"""
+        SELECT
+            p.id AS profile_id,
+            TRIM(COALESCE(p.last_name, '') || ' ' || COALESCE(p.first_name, '')) AS athlete,
+            COALESCE(p.gender, '') AS gender,
+            p.age AS age,
+            COALESCE(p.city, '') AS city,
+            COUNT(*) AS starts_total,
+            SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN 1 ELSE 0 END) AS finishes_total,
+            SUM(CASE WHEN COALESCE(r.dnf, 0) != 0 THEN 1 ELSE 0 END) AS dnf_total,
+            ROUND(COALESCE(SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN d.distance_km ELSE 0 END), 0), 1) AS km_total,
+            MIN(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN r.place_abs END) AS best_place_abs
+        FROM results r
+        LEFT JOIN competitions c ON c.id = r.competition_id
+        LEFT JOIN distances d ON d.id = r.distance_id
+        LEFT JOIN profiles p ON p.id = r.profile_id
+        WHERE TRIM(COALESCE(r.team, '')) = ? {year_sql}
+        GROUP BY p.id, athlete, gender, age, city
+        ORDER BY finishes_total DESC, starts_total DESC, athlete
+        """,
+        tuple(params),
+    )
+
+
+def query_team_events_table(
+    db_path: Path | str,
+    team_name: str,
+    year: int | None = None,
+    event_search: str | None = None,
+    limit: int = 1000,
+) -> list[dict[str, Any]]:
+    """Таблица событий команды: участие, финиши и лучший участник."""
+    t = team_name.strip()
+    where: list[str] = ["TRIM(COALESCE(r.team, '')) = ?"]
+    params: list[Any] = [t]
+    if year is not None:
+        where.append("c.year = ?")
+        params.append(int(year))
+    if event_search and event_search.strip():
+        where.append("LOWER(COALESCE(c.title, '')) LIKE LOWER(?)")
+        params.append(f"%{event_search.strip()}%")
+    wsql = " AND ".join(where)
+    return q_all(
+        db_path,
+        f"""
+        SELECT
+            c.id AS competition_id,
+            COALESCE(c.title, '') AS event_title,
+            COALESCE(c.date, '') AS event_date,
+            c.year AS year,
+            COALESCE(c.sport, '') AS sport,
+            COUNT(DISTINCT CASE WHEN r.profile_id IS NOT NULL THEN r.profile_id END) AS team_participants,
+            SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN 1 ELSE 0 END) AS team_finishes,
+            MIN(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN r.place_abs END) AS best_place_abs,
+            MIN(
+                CASE
+                    WHEN COALESCE(r.dnf, 0) = 0 AND r.place_abs = (
+                        SELECT MIN(r2.place_abs)
+                        FROM results r2
+                        WHERE r2.competition_id = r.competition_id
+                          AND TRIM(COALESCE(r2.team, '')) = TRIM(COALESCE(r.team, ''))
+                          AND COALESCE(r2.dnf, 0) = 0
+                    )
+                    THEN TRIM(COALESCE(p.last_name, '') || ' ' || COALESCE(p.first_name, ''))
+                END
+            ) AS best_athlete
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        LEFT JOIN profiles p ON p.id = r.profile_id
+        WHERE {wsql}
+        GROUP BY c.id, event_title, event_date, year, sport
+        ORDER BY event_date DESC, c.id DESC
+        LIMIT {int(limit)}
+        """,
+        tuple(params),
+    )
+
+
+def query_team_sport_distance_slices(
+    db_path: Path | str,
+    team_name: str,
+    year: int | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Срезы команды по виду спорта и дистанциям."""
+    t = team_name.strip()
+    params: list[Any] = [t]
+    year_sql = ""
+    if year is not None:
+        year_sql = " AND c.year = ?"
+        params.append(int(year))
+    by_sport = q_all(
+        db_path,
+        f"""
+        SELECT
+            COALESCE(c.sport, '') AS sport,
+            COUNT(*) AS starts,
+            SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN 1 ELSE 0 END) AS finishes,
+            ROUND(COALESCE(SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN d.distance_km ELSE 0 END), 0), 1) AS km_total
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        LEFT JOIN distances d ON d.id = r.distance_id
+        WHERE TRIM(COALESCE(r.team, '')) = ? {year_sql}
+        GROUP BY COALESCE(c.sport, '')
+        ORDER BY starts DESC, sport
+        """,
+        tuple(params),
+    )
+    by_distance = q_all(
+        db_path,
+        f"""
+        SELECT
+            COALESCE(d.name, '—') AS distance,
+            ROUND(COALESCE(d.distance_km, 0), 2) AS distance_km,
+            COUNT(*) AS starts,
+            SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN 1 ELSE 0 END) AS finishes
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        LEFT JOIN distances d ON d.id = r.distance_id
+        WHERE TRIM(COALESCE(r.team, '')) = ? {year_sql}
+        GROUP BY distance, distance_km
+        ORDER BY starts DESC, distance_km DESC, distance
+        """,
+        tuple(params),
+    )
+    return {"by_sport": by_sport, "by_distance": by_distance}
+
+
+def query_team_geography(
+    db_path: Path | str,
+    team_name: str,
+    year: int | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """География участников команды: города/регионы/страны."""
+    t = team_name.strip()
+    params: list[Any] = [t]
+    year_sql = ""
+    if year is not None:
+        year_sql = " AND c.year = ?"
+        params.append(int(year))
+    cities = q_all(
+        db_path,
+        f"""
+        SELECT
+            COALESCE(NULLIF(TRIM(p.city), ''), '—') AS city,
+            COUNT(DISTINCT CASE WHEN r.profile_id IS NOT NULL THEN r.profile_id END) AS participants
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        LEFT JOIN profiles p ON p.id = r.profile_id
+        WHERE TRIM(COALESCE(r.team, '')) = ? {year_sql}
+        GROUP BY city
+        ORDER BY participants DESC, city
+        LIMIT 30
+        """,
+        tuple(params),
+    )
+    regions = q_all(
+        db_path,
+        f"""
+        SELECT
+            COALESCE(NULLIF(TRIM(p.region), ''), '—') AS region,
+            COUNT(DISTINCT CASE WHEN r.profile_id IS NOT NULL THEN r.profile_id END) AS participants
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        LEFT JOIN profiles p ON p.id = r.profile_id
+        WHERE TRIM(COALESCE(r.team, '')) = ? {year_sql}
+        GROUP BY region
+        ORDER BY participants DESC, region
+        LIMIT 30
+        """,
+        tuple(params),
+    )
+    countries = q_all(
+        db_path,
+        f"""
+        SELECT
+            COALESCE(NULLIF(TRIM(p.country), ''), '—') AS country,
+            COUNT(DISTINCT CASE WHEN r.profile_id IS NOT NULL THEN r.profile_id END) AS participants
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        LEFT JOIN profiles p ON p.id = r.profile_id
+        WHERE TRIM(COALESCE(r.team, '')) = ? {year_sql}
+        GROUP BY country
+        ORDER BY participants DESC, country
+        LIMIT 30
+        """,
+        tuple(params),
+    )
+    return {"cities": cities, "regions": regions, "countries": countries}
+
+
+def query_team_yearly_trends(db_path: Path | str, team_name: str) -> list[dict[str, Any]]:
+    """Годовой тренд команды: старты, финиши, DNF, километраж, DNF%."""
+    t = team_name.strip()
+    if not t:
+        return []
+    return q_all(
+        db_path,
+        """
+        SELECT
+            c.year AS year,
+            COUNT(*) AS starts,
+            SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN 1 ELSE 0 END) AS finishes,
+            SUM(CASE WHEN COALESCE(r.dnf, 0) != 0 THEN 1 ELSE 0 END) AS dnf,
+            ROUND(COALESCE(SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN d.distance_km ELSE 0 END), 0), 1) AS km_total,
+            ROUND(
+                100.0 * SUM(CASE WHEN COALESCE(r.dnf, 0) != 0 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0),
+                1
+            ) AS dnf_pct
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        LEFT JOIN distances d ON d.id = r.distance_id
+        WHERE TRIM(COALESCE(r.team, '')) = ? AND c.year IS NOT NULL
+        GROUP BY c.year
+        ORDER BY c.year
+        """,
+        (t,),
+    )
+
+
+def query_team_data_quality(
+    db_path: Path | str,
+    team_name: str,
+    year: int | None = None,
+) -> list[dict[str, Any]]:
+    """Диагностика качества данных команды (admin-only в UI)."""
+    t = team_name.strip()
+    if not t:
+        return []
+    params: list[Any] = [t]
+    year_sql = ""
+    if year is not None:
+        year_sql = " AND c.year = ?"
+        params.append(int(year))
+    row = q_one(
+        db_path,
+        f"""
+        SELECT
+            COUNT(*) AS starts_total,
+            SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN 1 ELSE 0 END) AS finishes_total,
+            SUM(CASE WHEN COALESCE(r.dnf, 0) != 0 THEN 1 ELSE 0 END) AS dnf_total,
+            SUM(CASE WHEN TRIM(COALESCE(r.team, '')) = '' THEN 1 ELSE 0 END) AS missing_team,
+            SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 AND r.place_abs IS NULL THEN 1 ELSE 0 END) AS missing_place_abs,
+            SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 AND r.place_gender IS NULL THEN 1 ELSE 0 END) AS missing_place_gender,
+            SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 AND r.place_group IS NULL THEN 1 ELSE 0 END) AS missing_place_group,
+            SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 AND (d.distance_km IS NULL OR d.distance_km <= 0) THEN 1 ELSE 0 END) AS bad_distance_km,
+            SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 AND (r.finish_time_sec IS NULL OR r.finish_time_sec <= 0) THEN 1 ELSE 0 END) AS bad_finish_time_sec
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        LEFT JOIN distances d ON d.id = r.distance_id
+        WHERE TRIM(COALESCE(r.team, '')) = ? {year_sql}
+        """,
+        tuple(params),
+    ) or {}
+    checks = [
+        {"метрика": "Стартов всего", "значение": int(row.get("starts_total") or 0)},
+        {"метрика": "Финишей", "значение": int(row.get("finishes_total") or 0)},
+        {"метрика": "DNF", "значение": int(row.get("dnf_total") or 0)},
+        {"метрика": "Пустая команда", "значение": int(row.get("missing_team") or 0)},
+        {"метрика": "Финиши без place_abs", "значение": int(row.get("missing_place_abs") or 0)},
+        {"метрика": "Финиши без place_gender", "значение": int(row.get("missing_place_gender") or 0)},
+        {"метрика": "Финиши без place_group", "значение": int(row.get("missing_place_group") or 0)},
+        {"метрика": "Финиши с некорректной distance_km", "значение": int(row.get("bad_distance_km") or 0)},
+        {"метрика": "Финиши без finish_time_sec", "значение": int(row.get("bad_finish_time_sec") or 0)},
+    ]
+    return checks
+
+
+def is_team_scoring_enabled(cup_id: int, year: int) -> bool:
+    """Новый контур расчёта team_scoring включён только для cup_id=54 и year=2026."""
+    return int(cup_id) == 54 and int(year) == 2026
 
 
 def query_data_health(db_path: Path | str) -> dict[str, Any]:

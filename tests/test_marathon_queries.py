@@ -365,6 +365,52 @@ def test_team_detail_and_cups(sample_db: Path) -> None:
     assert ("Mini Cup", 10.0) in cups_pts
 
 
+def test_team_extended_queries(sample_db: Path) -> None:
+    kpi = mq.query_team_kpi_extended(sample_db, "Team A")
+    assert kpi is not None
+    assert kpi["participants_distinct"] == 1
+    assert kpi["starts_total"] == 3
+    assert kpi["finishes_total"] == 2
+    assert kpi["dnf_total"] == 1
+    assert float(kpi["km_total"]) == 63.0
+    assert kpi["active_years_list"] == [2023, 2024]
+
+    kpi_2024 = mq.query_team_kpi_extended(sample_db, "Team A", year=2024)
+    assert kpi_2024 is not None
+    assert kpi_2024["starts_total"] == 1
+    assert kpi_2024["finishes_total"] == 1
+
+    roster = mq.query_team_roster_stats(sample_db, "Team A")
+    assert len(roster) == 1
+    assert roster[0]["athlete"] == "Testov Ivan"
+    assert roster[0]["best_place_abs"] == 1
+
+    events = mq.query_team_events_table(sample_db, "Team A", year=2024, event_search="marath")
+    assert len(events) == 1
+    assert events[0]["event_title"] == "Test Marathon"
+    assert events[0]["best_athlete"] == "Testov Ivan"
+
+    slices = mq.query_team_sport_distance_slices(sample_db, "Team A")
+    assert slices["by_sport"][0]["sport"] == "run"
+    assert slices["by_sport"][0]["starts"] == 3
+    assert len(slices["by_distance"]) == 2
+
+    geo = mq.query_team_geography(sample_db, "Team A")
+    assert geo["cities"][0]["city"] == "Vologda"
+    assert geo["regions"][0]["region"] == "VO"
+    assert geo["countries"][0]["country"] == "Россия"
+
+    trends = mq.query_team_yearly_trends(sample_db, "Team A")
+    assert [r["year"] for r in trends] == [2023, 2024]
+    assert int(next(r for r in trends if r["year"] == 2023)["dnf"]) == 1
+
+    quality = mq.query_team_data_quality(sample_db, "Team A")
+    q_map = {r["метрика"]: r["значение"] for r in quality}
+    assert q_map["Стартов всего"] == 3
+    assert q_map["Финишей"] == 2
+    assert q_map["DNF"] == 1
+
+
 def test_cups_for_obsh_header_filter(sample_db: Path) -> None:
     all_c = mq.query_cups_for_obsh_header_filter(sample_db, None, None)
     ids = {r["id"] for r in all_c}
@@ -551,3 +597,143 @@ def test_profile_analytics_queries(sample_db: Path) -> None:
     assert q_map["Стартов всего"] == 3
     assert q_map["Финишей"] == 2
     assert q_map["DNF"] == 1
+
+
+def test_calc_team_stage_base_points_rules() -> None:
+    assert mq.calc_team_stage_base_points(1, 10.0, 1) == (600, 600)
+    assert mq.calc_team_stage_base_points(1, 10.0, 2) == (598, 600)
+    assert mq.calc_team_stage_base_points(1, 10.0, 7) == (589, 600)
+    assert mq.calc_team_stage_base_points(1, 5.0, 1) == (598, 598)
+    assert mq.calc_team_stage_base_points(1, 5.5, 6) == (589, 598)
+    assert mq.calc_team_stage_base_points(7, 10.0, 1) == (602, 602)
+    assert mq.calc_team_stage_base_points(7, 10.0, 3) == (599, 602)
+    assert mq.calc_team_stage_base_points(7, 5.0, 1) == (598, 598)
+    assert mq.calc_team_stage_base_points(7, 2.5, 1) == (0, 0)
+
+
+def test_compute_team_scoring_for_cup_year(sample_db: Path) -> None:
+    conn = sqlite3.connect(sample_db)
+    conn.executescript(
+        """
+        INSERT INTO profiles VALUES (150, 'Old', 'Runner', '', 'm', 55, 1971, 'Vologda',
+            NULL, 'VO', 36, 'Россия', '', 0, 0, 0, 0, 0, 0, '{}');
+        INSERT INTO results VALUES (40, 1, 10, 150, 0, 3400.0, 'Team C', 1, 1, 1, 'M50', '00:56:40', '{}');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    out = mq.compute_team_scoring_for_cup_year(
+        sample_db, cup_id=1, year=2024, stage_map={1: 1}, rule_version="team_test_v1"
+    )
+    assert out["stage_rows"] >= 3
+    teams = mq.query_team_scoring_team_totals(
+        sample_db, cup_id=1, year=2024, rule_version="team_test_v1"
+    )
+    assert len(teams) >= 2
+    members = mq.query_team_scoring_member_totals(
+        sample_db, cup_id=1, year=2024, team_name="Team C", rule_version="team_test_v1"
+    )
+    assert len(members) == 1
+    assert members[0]["очков_7из8"] == 600
+
+
+def test_compute_team_scoring_uses_place_gender(sample_db: Path) -> None:
+    conn = sqlite3.connect(sample_db)
+    conn.executescript(
+        """
+        INSERT INTO profiles VALUES (160, 'Maria', 'Testova', '', 'f', 35, 1991, 'Vologda',
+            NULL, 'VO', 36, 'Россия', '', 0, 0, 0, 0, 0, 0, '{}');
+        INSERT INTO results VALUES (41, 1, 10, 160, 0, 3900.0, 'Team F', 10, 1, 1, 'F35', '01:05:00', '{}');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    out = mq.compute_team_scoring_for_cup_year(
+        sample_db, cup_id=1, year=2024, stage_map={1: 1}, rule_version="team_test_gender_v1"
+    )
+    assert out["stage_rows"] >= 1
+    members = mq.query_team_scoring_member_totals(
+        sample_db, cup_id=1, year=2024, team_name="Team F", rule_version="team_test_gender_v1"
+    )
+    assert len(members) == 1
+    assert members[0]["очков_7из8"] == 600
+
+
+def test_team_scoring_feature_gate() -> None:
+    assert mq.is_team_scoring_enabled(54, 2026) is True
+    assert mq.is_team_scoring_enabled(54, 2025) is False
+    assert mq.is_team_scoring_enabled(1, 2026) is False
+
+
+def test_team_championship_matrix_shape(sample_db: Path) -> None:
+    conn = sqlite3.connect(sample_db)
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS team_scoring_stage_points (
+            rule_version TEXT NOT NULL,
+            cup_id INTEGER NOT NULL,
+            year INTEGER NOT NULL,
+            profile_id INTEGER NOT NULL,
+            result_id INTEGER NOT NULL,
+            competition_id INTEGER NOT NULL,
+            distance_id INTEGER NOT NULL,
+            stage_index INTEGER NOT NULL,
+            team_name TEXT NOT NULL,
+            finish_time_sec REAL,
+            distance_km REAL,
+            place_for_score INTEGER,
+            points_base INTEGER NOT NULL,
+            points_bonus INTEGER NOT NULL,
+            points_awarded INTEGER NOT NULL,
+            points_for_team INTEGER NOT NULL DEFAULT 0,
+            points_cap INTEGER NOT NULL,
+            age INTEGER,
+            gender TEXT,
+            computed_at TEXT,
+            PRIMARY KEY (rule_version, cup_id, year, result_id)
+        );
+        CREATE TABLE IF NOT EXISTS team_scoring_member_totals (
+            rule_version TEXT NOT NULL,
+            cup_id INTEGER NOT NULL,
+            year INTEGER NOT NULL,
+            profile_id INTEGER NOT NULL,
+            team_name TEXT NOT NULL,
+            points_best7 INTEGER NOT NULL,
+            stages_json TEXT,
+            computed_at TEXT,
+            PRIMARY KEY (rule_version, cup_id, year, profile_id)
+        );
+        CREATE TABLE IF NOT EXISTS team_scoring_team_totals (
+            rule_version TEXT NOT NULL,
+            cup_id INTEGER NOT NULL,
+            year INTEGER NOT NULL,
+            team_name TEXT NOT NULL,
+            points_top5 INTEGER NOT NULL,
+            members_json TEXT,
+            computed_at TEXT,
+            PRIMARY KEY (rule_version, cup_id, year, team_name)
+        );
+        INSERT INTO team_scoring_team_totals
+            (rule_version, cup_id, year, team_name, points_top5, members_json, computed_at)
+        VALUES ('team_v1', 54, 2026, 'Team A', 1200, '[]', '2026-01-01T00:00:00Z');
+        INSERT INTO team_scoring_stage_points
+            (rule_version, cup_id, year, profile_id, result_id, competition_id, distance_id, stage_index,
+             team_name, finish_time_sec, distance_km, place_for_score, points_base, points_bonus,
+             points_awarded, points_for_team, points_cap, age, gender, computed_at)
+        VALUES ('team_v1', 54, 2026, 100, 9001, 1, 10, 1, 'Team A', 3600, 10, 1, 600, 0, 600, 600, 600, 30, 'm', '2026-01-01T00:00:00Z');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    mat = mq.query_team_championship_matrix(
+        sample_db, cup_id=54, year=2026, stage_map={1: 1}, rule_version="team_v1"
+    )
+    assert "rows" in mat and isinstance(mat["rows"], list)
+    assert "stage_columns" in mat and isinstance(mat["stage_columns"], list)
+    assert len(mat["rows"]) == 1
+    first = mat["rows"][0]
+    assert first["Команда"] == "Team A"
+    assert first["Итого"] == 100
