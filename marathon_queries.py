@@ -1080,7 +1080,21 @@ def query_profile_search_enriched(
             """,
             (int(n),),
         )
+    tokens = [t for t in re.split(r"\s+", n.strip()) if t]
     pat = f"%{n}%"
+    where_parts: list[str] = [
+        "(LOWER(COALESCE(p.last_name, '')) LIKE LOWER(?) OR LOWER(COALESCE(p.first_name, '')) LIKE LOWER(?))",
+        "LOWER(TRIM(COALESCE(p.last_name, '') || ' ' || COALESCE(p.first_name, ''))) LIKE LOWER(?)",
+        "LOWER(TRIM(COALESCE(p.first_name, '') || ' ' || COALESCE(p.last_name, ''))) LIKE LOWER(?)",
+    ]
+    params: list[Any] = [pat, pat, pat, pat]
+    for t in tokens:
+        tpat = f"%{t}%"
+        where_parts.append(
+            "(LOWER(COALESCE(p.last_name, '')) LIKE LOWER(?) OR LOWER(COALESCE(p.first_name, '')) LIKE LOWER(?))"
+        )
+        params.extend([tpat, tpat])
+    where_sql = " OR ".join(where_parts)
     return q_all(
         db_path,
         f"""
@@ -1097,17 +1111,44 @@ def query_profile_search_enriched(
                 WHEN LOWER(COALESCE(p.last_name, '')) = LOWER(?) THEN 0
                 WHEN LOWER(COALESCE(p.last_name, '')) LIKE LOWER(?) THEN 1
                 WHEN LOWER(COALESCE(p.first_name, '')) LIKE LOWER(?) THEN 2
+                WHEN LOWER(TRIM(COALESCE(p.last_name, '') || ' ' || COALESCE(p.first_name, ''))) LIKE LOWER(?) THEN 3
+                WHEN LOWER(TRIM(COALESCE(p.first_name, '') || ' ' || COALESCE(p.last_name, ''))) LIKE LOWER(?) THEN 4
                 ELSE 3
             END AS _rank
         FROM profiles p
         LEFT JOIN results r ON r.profile_id = p.id
         LEFT JOIN competitions c ON c.id = r.competition_id
-        WHERE p.last_name LIKE ? OR p.first_name LIKE ?
+        WHERE {where_sql}
         GROUP BY p.id
         ORDER BY _rank, p.last_name, p.first_name
         LIMIT {lim}
         """,
-        (n, f"{n}%", f"{n}%", pat, pat),
+        tuple([n, f"{n}%", f"{n}%", pat, pat] + params),
+    )
+
+
+def query_profile_autocomplete_options(
+    db_path: Path | str, limit: int = 20000
+) -> list[dict[str, Any]]:
+    """Список профилей для единого autocomplete-поля участника."""
+    lim = int(limit)
+    return q_all(
+        db_path,
+        f"""
+        SELECT
+            p.id,
+            p.first_name,
+            p.last_name,
+            p.city,
+            MAX(c.year) AS last_year,
+            COUNT(r.id) AS starts_total
+        FROM profiles p
+        LEFT JOIN results r ON r.profile_id = p.id
+        LEFT JOIN competitions c ON c.id = r.competition_id
+        GROUP BY p.id
+        ORDER BY p.last_name, p.first_name
+        LIMIT {lim}
+        """,
     )
 
 
@@ -3523,6 +3564,306 @@ def query_team_data_quality(
         {"метрика": "Финиши без finish_time_sec", "значение": int(row.get("bad_finish_time_sec") or 0)},
     ]
     return checks
+
+
+def _build_interesting_facts_where(year: int | None, sport: str | None) -> tuple[str, list[Any]]:
+    parts: list[str] = []
+    params: list[Any] = []
+    if year is not None:
+        parts.append("c.year = ?")
+        params.append(int(year))
+    if sport and str(sport).strip():
+        parts.append("c.sport = ?")
+        params.append(str(sport).strip())
+    return (" AND ".join(parts) if parts else "1=1"), params
+
+
+def query_interesting_facts_loyal_participants(
+    db_path: Path | str,
+    year: int | None = None,
+    sport: str | None = None,
+    min_starts: int = 1,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Самые преданные участники: максимум активных лет и стартов."""
+    w, params = _build_interesting_facts_where(year, sport)
+    params = list(params) + [max(1, int(min_starts))]
+    return q_all(
+        db_path,
+        f"""
+        SELECT
+            r.profile_id AS profile_id,
+            TRIM(COALESCE(p.last_name, '') || ' ' || COALESCE(p.first_name, '')) AS participant,
+            COUNT(DISTINCT c.year) AS active_years,
+            COUNT(*) AS starts,
+            SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN 1 ELSE 0 END) AS finishes,
+            ROUND(COALESCE(SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN d.distance_km ELSE 0 END), 0), 1) AS km_total
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        LEFT JOIN distances d ON d.id = r.distance_id
+        LEFT JOIN profiles p ON p.id = r.profile_id
+        WHERE r.profile_id IS NOT NULL AND {w}
+        GROUP BY r.profile_id, participant
+        HAVING COUNT(*) >= ?
+        ORDER BY active_years DESC, starts DESC, km_total DESC, participant
+        LIMIT {int(limit)}
+        """,
+        tuple(params),
+    )
+
+
+def query_interesting_facts_finish_rate(
+    db_path: Path | str,
+    year: int | None = None,
+    sport: str | None = None,
+    min_starts: int = 5,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Железные финишеры: максимум finish-rate при достаточном числе стартов."""
+    w, params = _build_interesting_facts_where(year, sport)
+    params = list(params) + [max(1, int(min_starts))]
+    return q_all(
+        db_path,
+        f"""
+        SELECT
+            r.profile_id AS profile_id,
+            TRIM(COALESCE(p.last_name, '') || ' ' || COALESCE(p.first_name, '')) AS participant,
+            COUNT(*) AS starts,
+            SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN 1 ELSE 0 END) AS finishes,
+            ROUND(
+                100.0 * SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0),
+                1
+            ) AS finish_rate_pct
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        LEFT JOIN profiles p ON p.id = r.profile_id
+        WHERE r.profile_id IS NOT NULL AND {w}
+        GROUP BY r.profile_id, participant
+        HAVING COUNT(*) >= ?
+        ORDER BY finish_rate_pct DESC, finishes DESC, starts DESC, participant
+        LIMIT {int(limit)}
+        """,
+        tuple(params),
+    )
+
+
+def query_interesting_facts_universal_participants(
+    db_path: Path | str,
+    year: int | None = None,
+    min_starts: int = 1,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Универсалы по спорту: участники с максимальным покрытием видов спорта."""
+    params: list[Any] = []
+    year_sql = ""
+    if year is not None:
+        year_sql = " AND c.year = ?"
+        params.append(int(year))
+    params.append(max(1, int(min_starts)))
+    return q_all(
+        db_path,
+        f"""
+        SELECT
+            r.profile_id AS profile_id,
+            TRIM(COALESCE(p.last_name, '') || ' ' || COALESCE(p.first_name, '')) AS participant,
+            COUNT(*) AS starts,
+            COUNT(DISTINCT COALESCE(NULLIF(TRIM(c.sport), ''), 'unknown')) AS sports_count,
+            GROUP_CONCAT(DISTINCT COALESCE(NULLIF(TRIM(c.sport), ''), 'unknown')) AS sports_list
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        LEFT JOIN profiles p ON p.id = r.profile_id
+        WHERE r.profile_id IS NOT NULL {year_sql}
+        GROUP BY r.profile_id, participant
+        HAVING COUNT(*) >= ?
+        ORDER BY sports_count DESC, starts DESC, participant
+        LIMIT {int(limit)}
+        """,
+        tuple(params),
+    )
+
+
+def query_interesting_facts_km_leaders(
+    db_path: Path | str,
+    year: int | None = None,
+    sport: str | None = None,
+    min_starts: int = 1,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Лидеры по суммарному километражу (по финишам)."""
+    w, params = _build_interesting_facts_where(year, sport)
+    params = list(params) + [max(1, int(min_starts))]
+    return q_all(
+        db_path,
+        f"""
+        SELECT
+            r.profile_id AS profile_id,
+            TRIM(COALESCE(p.last_name, '') || ' ' || COALESCE(p.first_name, '')) AS participant,
+            COUNT(*) AS starts,
+            SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN 1 ELSE 0 END) AS finishes,
+            ROUND(COALESCE(SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN d.distance_km ELSE 0 END), 0), 1) AS km_total
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        LEFT JOIN distances d ON d.id = r.distance_id
+        LEFT JOIN profiles p ON p.id = r.profile_id
+        WHERE r.profile_id IS NOT NULL AND {w}
+        GROUP BY r.profile_id, participant
+        HAVING COUNT(*) >= ?
+        ORDER BY km_total DESC, finishes DESC, participant
+        LIMIT {int(limit)}
+        """,
+        tuple(params),
+    )
+
+
+def query_interesting_facts_distance_frequency(
+    db_path: Path | str,
+    year: int | None = None,
+    sport: str | None = None,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Топ дистанций по числу стартов и участников."""
+    w, params = _build_interesting_facts_where(year, sport)
+    return q_all(
+        db_path,
+        f"""
+        SELECT
+            COALESCE(NULLIF(TRIM(d.name), ''), '—') AS distance,
+            ROUND(COALESCE(d.distance_km, 0), 2) AS distance_km,
+            COUNT(*) AS starts,
+            COUNT(DISTINCT CASE WHEN r.profile_id IS NOT NULL THEN r.profile_id END) AS participants
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        LEFT JOIN distances d ON d.id = r.distance_id
+        WHERE {w}
+        GROUP BY distance, distance_km
+        ORDER BY starts DESC, participants DESC, distance_km DESC, distance
+        LIMIT {int(limit)}
+        """,
+        tuple(params),
+    )
+
+
+def query_interesting_facts_km_by_sport(
+    db_path: Path | str,
+    year: int | None = None,
+) -> list[dict[str, Any]]:
+    """Суммарный километраж по видам спорта."""
+    params: list[Any] = []
+    year_sql = ""
+    if year is not None:
+        year_sql = "WHERE c.year = ?"
+        params.append(int(year))
+    return q_all(
+        db_path,
+        f"""
+        SELECT
+            COALESCE(NULLIF(TRIM(c.sport), ''), 'unknown') AS sport,
+            ROUND(COALESCE(SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN d.distance_km ELSE 0 END), 0), 1) AS km_total,
+            COUNT(*) AS starts,
+            SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN 1 ELSE 0 END) AS finishes
+        FROM competitions c
+        LEFT JOIN results r ON r.competition_id = c.id
+        LEFT JOIN distances d ON d.id = r.distance_id
+        {year_sql}
+        GROUP BY COALESCE(NULLIF(TRIM(c.sport), ''), 'unknown')
+        ORDER BY km_total DESC, starts DESC, COALESCE(NULLIF(TRIM(c.sport), ''), 'unknown')
+        """,
+        tuple(params),
+    )
+
+
+def query_interesting_facts_team_longevity(
+    db_path: Path | str,
+    year: int | None = None,
+    sport: str | None = None,
+    min_starts: int = 5,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Команды-долгожители: длительность периода активности и объем стартов."""
+    w, params = _build_interesting_facts_where(year, sport)
+    params = list(params) + [max(1, int(min_starts))]
+    return q_all(
+        db_path,
+        f"""
+        SELECT
+            TRIM(r.team) AS team,
+            MIN(c.year) AS first_year,
+            MAX(c.year) AS last_year,
+            (MAX(c.year) - MIN(c.year) + 1) AS active_span_years,
+            COUNT(*) AS starts,
+            COUNT(DISTINCT CASE WHEN r.profile_id IS NOT NULL THEN r.profile_id END) AS participants
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        WHERE TRIM(COALESCE(r.team, '')) != '' AND c.year IS NOT NULL AND {w}
+        GROUP BY team
+        HAVING COUNT(*) >= ?
+        ORDER BY active_span_years DESC, starts DESC, participants DESC, team
+        LIMIT {int(limit)}
+        """,
+        tuple(params),
+    )
+
+
+def query_interesting_facts_geography(
+    db_path: Path | str,
+    year: int | None = None,
+    sport: str | None = None,
+    limit: int = 10,
+) -> dict[str, list[dict[str, Any]]]:
+    """География участников: города, регионы и страны."""
+    w, params = _build_interesting_facts_where(year, sport)
+    cities = q_all(
+        db_path,
+        f"""
+        SELECT
+            COALESCE(NULLIF(TRIM(p.city), ''), '—') AS city,
+            COUNT(DISTINCT CASE WHEN r.profile_id IS NOT NULL THEN r.profile_id END) AS participants,
+            COUNT(*) AS starts
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        LEFT JOIN profiles p ON p.id = r.profile_id
+        WHERE {w}
+        GROUP BY city
+        ORDER BY participants DESC, starts DESC, city
+        LIMIT {int(limit)}
+        """,
+        tuple(params),
+    )
+    regions = q_all(
+        db_path,
+        f"""
+        SELECT
+            COALESCE(NULLIF(TRIM(p.region), ''), '—') AS region,
+            COUNT(DISTINCT CASE WHEN r.profile_id IS NOT NULL THEN r.profile_id END) AS participants,
+            COUNT(*) AS starts
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        LEFT JOIN profiles p ON p.id = r.profile_id
+        WHERE {w}
+        GROUP BY region
+        ORDER BY participants DESC, starts DESC, region
+        LIMIT {int(limit)}
+        """,
+        tuple(params),
+    )
+    countries = q_all(
+        db_path,
+        f"""
+        SELECT
+            COALESCE(NULLIF(TRIM(p.country), ''), '—') AS country,
+            COUNT(DISTINCT CASE WHEN r.profile_id IS NOT NULL THEN r.profile_id END) AS participants,
+            COUNT(*) AS starts
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        LEFT JOIN profiles p ON p.id = r.profile_id
+        WHERE {w}
+        GROUP BY country
+        ORDER BY participants DESC, starts DESC, country
+        LIMIT {int(limit)}
+        """,
+        tuple(params),
+    )
+    return {"cities": cities, "regions": regions, "countries": countries}
 
 
 def is_team_scoring_enabled(cup_id: int, year: int) -> bool:

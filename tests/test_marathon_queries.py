@@ -737,3 +737,57 @@ def test_team_championship_matrix_shape(sample_db: Path) -> None:
     first = mat["rows"][0]
     assert first["Команда"] == "Team A"
     assert first["Итого"] == 100
+
+
+def test_interesting_facts_queries(sample_db: Path) -> None:
+    conn = sqlite3.connect(sample_db)
+    conn.executescript(
+        """
+        INSERT INTO competitions VALUES (7, 'Bike Stage', '2024-08-01', 2024, 'bike');
+        INSERT INTO competitions VALUES (8, 'Ski Stage', '2024-12-01', 2024, 'ski');
+        INSERT INTO distances VALUES (30, 7, '40 km', 40.0, 0);
+        INSERT INTO distances VALUES (31, 8, '10 km', 10.0, 0);
+        INSERT INTO results VALUES (50, 7, 30, 100, 0, 5000.0, 'Team A', 3, 2, 1, 'M40', '01:23:20', '{}');
+        INSERT INTO results VALUES (51, 8, 31, 100, 0, 4200.0, 'Team A', 2, 1, 1, 'M40', '01:10:00', '{}');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    loyal = mq.query_interesting_facts_loyal_participants(sample_db, year=None, sport=None, min_starts=1, limit=5)
+    assert len(loyal) > 0
+    assert loyal[0]["participant"] == "Testov Ivan"
+    assert int(loyal[0]["active_years"]) >= 2
+
+    finishers = mq.query_interesting_facts_finish_rate(sample_db, year=2024, sport="run", min_starts=1, limit=5)
+    assert len(finishers) > 0
+    assert finishers[0]["participant"] in {"Testov Ivan", "Secondov Petr"}
+    assert float(finishers[0]["finish_rate_pct"]) >= 100.0
+
+    universals = mq.query_interesting_facts_universal_participants(sample_db, year=2024, min_starts=1, limit=5)
+    top_u = next(r for r in universals if r["participant"] == "Testov Ivan")
+    assert int(top_u["sports_count"]) == 3
+
+    km = mq.query_interesting_facts_km_leaders(sample_db, year=2024, sport=None, min_starts=1, limit=5)
+    assert len(km) > 0
+    assert km[0]["participant"] == "Testov Ivan"
+    assert float(km[0]["km_total"]) >= 52.0
+
+    freq = mq.query_interesting_facts_distance_frequency(sample_db, year=2024, sport="run", limit=10)
+    assert len(freq) >= 1
+    assert any(r["distance"] == "42 km" for r in freq)
+
+    km_by_sport = mq.query_interesting_facts_km_by_sport(sample_db, year=2024)
+    sport_map = {r["sport"]: float(r["km_total"] or 0) for r in km_by_sport}
+    assert sport_map["run"] >= 84.0
+    assert sport_map["bike"] >= 40.0
+    assert sport_map["ski"] >= 10.0
+
+    teams = mq.query_interesting_facts_team_longevity(sample_db, year=None, sport=None, min_starts=1, limit=5)
+    assert len(teams) > 0
+    assert teams[0]["team"] in {"Team A", "Team B"}
+
+    geo = mq.query_interesting_facts_geography(sample_db, year=2024, sport="run", limit=5)
+    assert "cities" in geo and "regions" in geo
+    assert len(geo["cities"]) >= 1
+    assert len(geo["regions"]) >= 1

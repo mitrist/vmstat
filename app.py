@@ -18,6 +18,7 @@ import html
 import os
 from pathlib import Path
 
+import altair as alt
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -44,6 +45,70 @@ VM_ACCENT = "#93BDDD"
 VM_BLUE = "#93BDDD"
 # Подзаголовок к гистограммам на «Общая статистика» (курсив под названием)
 OBSH_BAR_TITLE_NOTE = "Линия тренда - скользящее среднее за 3 года"
+
+COUNTRY_TO_ISO3: dict[str, str] = {
+    "россия": "RUS",
+    "российская федерация": "RUS",
+    "russia": "RUS",
+    "беларусь": "BLR",
+    "belarus": "BLR",
+    "казахстан": "KAZ",
+    "kazakhstan": "KAZ",
+    "украина": "UKR",
+    "ukraine": "UKR",
+    "кыргызстан": "KGZ",
+    "киргизия": "KGZ",
+    "kyrgyzstan": "KGZ",
+    "узбекистан": "UZB",
+    "uzbekistan": "UZB",
+    "армения": "ARM",
+    "armenia": "ARM",
+    "азербайджан": "AZE",
+    "azerbaijan": "AZE",
+    "грузия": "GEO",
+    "georgia": "GEO",
+    "латвия": "LVA",
+    "latvia": "LVA",
+    "литва": "LTU",
+    "lithuania": "LTU",
+    "эстония": "EST",
+    "estonia": "EST",
+    "германия": "DEU",
+    "germany": "DEU",
+    "польша": "POL",
+    "poland": "POL",
+    "сша": "USA",
+    "соединенные штаты": "USA",
+    "united states": "USA",
+    "канада": "CAN",
+    "canada": "CAN",
+}
+
+ISO3_TO_CENTER: dict[str, tuple[float, float]] = {
+    "RUS": (61.5240, 105.3188),
+    "BLR": (53.7098, 27.9534),
+    "KAZ": (48.0196, 66.9237),
+    "UKR": (48.3794, 31.1656),
+    "KGZ": (41.2044, 74.7661),
+    "UZB": (41.3775, 64.5853),
+    "ARM": (40.0691, 45.0382),
+    "AZE": (40.1431, 47.5769),
+    "GEO": (42.3154, 43.3569),
+    "LVA": (56.8796, 24.6032),
+    "LTU": (55.1694, 23.8813),
+    "EST": (58.5953, 25.0136),
+    "DEU": (51.1657, 10.4515),
+    "POL": (51.9194, 19.1451),
+    "USA": (39.8283, -98.5795),
+    "CAN": (56.1304, -106.3468),
+}
+
+
+def _country_to_iso3(country: str | None) -> str | None:
+    if not country:
+        return None
+    key = " ".join(str(country).strip().casefold().replace("ё", "е").split())
+    return COUNTRY_TO_ISO3.get(key)
 
 
 def _st_plotly_chart_supports_on_select() -> bool:
@@ -84,6 +149,57 @@ def _obsh_parse_year_from_plotly_event(event: object) -> int | None:
         return int(float(s))
     except (TypeError, ValueError):
         return None
+
+
+def _facts_prepare_df(rows: list[dict[str, Any]]) -> pd.DataFrame:
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    if "km_total" in df.columns:
+        df["km_total"] = pd.to_numeric(df["km_total"], errors="coerce").fillna(0.0).round(1)
+    if "profile_id" in df.columns:
+        pid_num = pd.to_numeric(df["profile_id"], errors="coerce")
+        df["profile_id"] = pid_num.map(
+            lambda x: f"https://vm-stat.ru/?page=participant&pid={int(x)}" if pd.notna(x) else ""
+        )
+    rename_map = {
+        "participant": "Участник",
+        "active_years": "Активных лет",
+        "starts": "Стартовал всего",
+        "finishes": "Финишировал всего",
+        "km_total": "Пройдено километров",
+        "finish_rate_pct": "Процент финишей",
+        "sports_count": "Видов спорта",
+        "sports_list": "Виды спорта",
+        "distance": "Дистанция",
+        "distance_km": "Км дистанции",
+        "participants": "Участников",
+        "team": "Команда",
+        "first_year": "Первый год",
+        "last_year": "Последний год",
+        "active_span_years": "Активный период (лет)",
+        "city": "Город",
+        "region": "Регион",
+        "country": "Страна",
+        "sport": "Вид спорта",
+        "profile_id": "profile_id",
+    }
+    return df.rename(columns=rename_map)
+
+
+def _facts_table(rows: list[dict[str, Any]], key: str) -> None:
+    df = _facts_prepare_df(rows)
+    if df.empty:
+        st.caption("Нет данных для таблицы.")
+        return
+    cfg: dict[str, Any] = {}
+    if "profile_id" in df.columns:
+        cfg["profile_id"] = st.column_config.LinkColumn(
+            "profile_id",
+            help="Открыть страницу участника",
+            display_text=r".*pid=(\d+)",
+        )
+    st.dataframe(df, use_container_width=True, hide_index=True, key=key, column_config=cfg or None)
 
 
 def db_path() -> Path:
@@ -499,6 +615,47 @@ def _sidebar_read_nav_i_from_url() -> int | None:
     return i
 
 
+def _sidebar_read_page_from_url() -> str | None:
+    """Стабильный параметр ?page=<alias> для прямой навигации без зависимости от индекса."""
+    try:
+        q = st.query_params
+        if "page" not in q:
+            return None
+        raw = q.get("page")
+        if raw is None:
+            return None
+        s = raw[0] if isinstance(raw, (list, tuple)) and len(raw) else str(raw)
+        key = s.strip().casefold()
+    except Exception:
+        return None
+    mapping = {
+        "general": "Общая статистика",
+        "event": "Событие",
+        "participant": "Участник",
+        "team": "Команда",
+        "cups": "Кубки",
+        "facts": "Интересные факты",
+        "interesting-facts": "Интересные факты",
+        "admin": "Админка",
+    }
+    return mapping.get(key)
+
+
+def _participant_id_from_url() -> int | None:
+    """Читает pid из URL-параметров: ?pid=123."""
+    try:
+        q = st.query_params
+        if "pid" not in q:
+            return None
+        raw = q.get("pid")
+        if raw is None:
+            return None
+        s = raw[0] if isinstance(raw, (list, tuple)) and len(raw) else str(raw)
+        return int(str(s).strip())
+    except (TypeError, ValueError):
+        return None
+
+
 def render_sidebar_text_nav(pages: tuple[str, ...], current: str) -> None:
     """Пункты меню: текст+иконка, текущий раздел — полужирно; остальные — ссылка ?i=."""
     icons = {
@@ -717,54 +874,26 @@ def page_general_statistics() -> None:
         if dfe.empty:
             st.caption("Нет данных для гистограммы событий по годам.")
         else:
-            fig_e = px.bar(
-                dfe,
-                x="year",
-                y="events",
-                labels={"year": "Год", "events": "Событий"},
+            dfe2 = dfe.copy()
+            dfe2["year"] = dfe2["year"].astype(str)
+            st.caption("Количество событий по годам")
+            st.bar_chart(
+                dfe2.set_index("year")[["events"]],
+                use_container_width=True,
             )
-            fig_e.update_traces(marker_color=VM_ACCENT)
-            fig_e.update_layout(
-                plot_bgcolor="white",
-                paper_bgcolor="white",
-                font=dict(color=VM_TEXT),
-                xaxis_type="category",
-            )
-            _layout_year_bar_with_labels_and_ma3(
-                fig_e, dfe, "events", "Количество событий по годам"
-            )
-            plot_e_kw: dict[str, Any] = {"use_container_width": True}
-            if _st_plotly_chart_supports_on_select():
-                plot_e_kw["key"] = "obsh_e_bar"
-                plot_e_kw["on_select"] = "rerun"
-                plot_e_kw["selection_mode"] = "points"
-            event_e = st.plotly_chart(fig_e, **plot_e_kw)
-            y_from_bar = _obsh_parse_year_from_plotly_event(event_e)
-            if y_from_bar is not None:
-                st.session_state["obsh_bar_drill"] = y_from_bar
 
     with g2:
         dfp = pd.DataFrame(mq.query_chart_unique_participants_by_year(path, yf, sf, cf))
         if dfp.empty:
             st.caption("Нет данных для гистограммы участников по годам.")
         else:
-            fig_p = px.bar(
-                dfp,
-                x="year",
-                y="participants",
-                labels={"year": "Год", "participants": "Уникальных участников"},
+            dfp2 = dfp.copy()
+            dfp2["year"] = dfp2["year"].astype(str)
+            st.caption("Уникальных участников по годам")
+            st.bar_chart(
+                dfp2.set_index("year")[["participants"]],
+                use_container_width=True,
             )
-            fig_p.update_traces(marker_color=VM_ACCENT)
-            fig_p.update_layout(
-                plot_bgcolor="white",
-                paper_bgcolor="white",
-                font=dict(color=VM_TEXT),
-                xaxis_type="category",
-            )
-            _layout_year_bar_with_labels_and_ma3(
-                fig_p, dfp, "participants", "Уникальных участников по годам"
-            )
-            st.plotly_chart(fig_p, use_container_width=True)
 
     st.subheader("События")
     if "obsh_bar_drill" not in st.session_state:
@@ -796,16 +925,12 @@ def page_general_statistics() -> None:
         if dfs.empty:
             st.caption("Нет данных для диаграммы по видам спорта.")
         else:
-            fig_s = px.pie(
-                dfs,
-                names="sport",
-                values="n",
-                title="События по видам спорта",
-                hole=0.35,
-                color_discrete_sequence=px.colors.sequential.RdPu,
+            dfs2 = dfs.rename(columns={"sport": "Вид спорта", "n": "События"})
+            st.caption("События по видам спорта")
+            st.bar_chart(
+                dfs2.set_index("Вид спорта")[["События"]],
+                use_container_width=True,
             )
-            fig_s.update_layout(font=dict(color=VM_TEXT), paper_bgcolor="white")
-            st.plotly_chart(fig_s, use_container_width=True)
 
     with p2:
         dfg = pd.DataFrame(mq.query_chart_participants_by_gender(path, yf, sf, cf))
@@ -814,16 +939,140 @@ def page_general_statistics() -> None:
         else:
             map_g = {"m": "муж.", "f": "жен.", "не указан": "не указан"}
             dfg["gender_label"] = dfg["gender"].map(lambda g: map_g.get(str(g).lower(), str(g)))
-            fig_g = px.pie(
-                dfg,
-                names="gender_label",
-                values="n",
-                title="Участники по полу (уникальные профили)",
-                hole=0.35,
-                color_discrete_sequence=px.colors.sequential.Blues_r,
+            dfg2 = dfg.rename(columns={"gender_label": "Пол", "n": "Участников"})
+            st.caption("Участники по полу (уникальные профили)")
+            st.bar_chart(
+                dfg2.set_index("Пол")[["Участников"]],
+                use_container_width=True,
             )
-            fig_g.update_layout(font=dict(color=VM_TEXT), paper_bgcolor="white")
-            st.plotly_chart(fig_g, use_container_width=True)
+
+
+def page_interesting_facts() -> None:
+    st.header("Интересные факты")
+    path = db_path()
+    if not require_db(path):
+        return
+
+    min_starts = 1
+    year_val = None
+    sport_val = None
+
+    loyal = mq.query_interesting_facts_loyal_participants(
+        path, year=year_val, sport=sport_val, min_starts=int(min_starts), limit=100
+    )
+    finishers = mq.query_interesting_facts_finish_rate(
+        path, year=year_val, sport=sport_val, min_starts=int(min_starts), limit=100
+    )
+    km_leaders = mq.query_interesting_facts_km_leaders(
+        path, year=year_val, sport=sport_val, min_starts=int(min_starts), limit=100
+    )
+    universals = mq.query_interesting_facts_universal_participants(
+        path, year=year_val, min_starts=int(min_starts), limit=100
+    )
+    distances = mq.query_interesting_facts_distance_frequency(path, year=year_val, sport=sport_val, limit=100)
+    teams = mq.query_interesting_facts_team_longevity(
+        path, year=year_val, sport=sport_val, min_starts=int(min_starts), limit=100
+    )
+    geo = mq.query_interesting_facts_geography(path, year=year_val, sport=sport_val, limit=100)
+
+    st.subheader("Факт дня")
+    if loyal:
+        top = loyal[0]
+        st.caption("Как считается: лидер по активным годам, затем по числу стартов.")
+        metric_plaque(
+            "Самый преданный участник",
+            f"{top.get('participant', '—')} · {int(top.get('active_years') or 0)} лет",
+        )
+    else:
+        st.caption("Нет данных для выбранных фильтров.")
+
+    st.subheader("Подборка фактов")
+    f1, f2 = st.columns(2)
+    with f1:
+        st.markdown("**Самые преданные участники**")
+        st.caption("Топ по активным годам участия.")
+        _facts_table(loyal, key="facts_table_loyal")
+    with f2:
+        st.markdown("**Железные финишеры**")
+        st.caption("Топ по проценту финишей.")
+        _facts_table(finishers, key="facts_table_finishers")
+
+    f3, f4 = st.columns(2)
+    with f3:
+        st.markdown("**Лидеры по километражу**")
+        st.caption("Суммарный километраж по финишам.")
+        _facts_table(km_leaders, key="facts_table_km")
+    with f4:
+        st.markdown("**Универсалы по видам спорта**")
+        st.caption("Чем больше покрытие видов спорта, тем выше место.")
+        _facts_table(universals, key="facts_table_universals")
+
+    f5, f6 = st.columns(2)
+    with f5:
+        st.markdown("**Топ дистанций**")
+        st.caption("Самые частые дистанции по числу стартов.")
+        _facts_table(distances, key="facts_table_distances")
+    with f6:
+        st.markdown("**Команды-долгожители**")
+        st.caption("Команды с самым длинным активным периодом.")
+        _facts_table(teams, key="facts_table_teams")
+
+    st.subheader("Графики")
+    dc = pd.DataFrame(geo.get("cities") or [])
+    if dc.empty:
+        st.caption("Нет данных по географии.")
+    else:
+        city_chart = dc.head(20).rename(columns={"city": "Город", "participants": "Участников"})
+        st.caption("Топ городов по участникам")
+        c = (
+            alt.Chart(city_chart)
+            .mark_bar()
+            .encode(
+                x=alt.X("Участников:Q", title="Участников"),
+                y=alt.Y("Город:N", sort="-x", title="Город"),
+            )
+        )
+        t = c.mark_text(align="left", baseline="middle", dx=4).encode(text="Участников:Q")
+        st.altair_chart((c + t).properties(height=500), use_container_width=True)
+
+    st.subheader("География")
+    city_rows = geo.get("cities") or []
+    country_rows = pd.DataFrame(geo.get("countries") or [])
+    if country_rows.empty:
+        st.caption("Нет данных по странам для построения карты.")
+    else:
+        country_rows = country_rows[country_rows["country"] != "—"].copy()
+        if country_rows.empty:
+            st.caption("Нет валидных названий стран для карты.")
+        else:
+            country_rows["iso3"] = country_rows["country"].map(_country_to_iso3)
+            country_rows = country_rows[country_rows["iso3"].notna()].copy()
+            country_rows = country_rows.drop_duplicates(subset=["iso3"], keep="first")
+            st.caption("Карта по странам: круг означает, что из страны были участники.")
+            if country_rows.empty:
+                st.caption("Страны есть, но для них пока нет ISO-кодов в словаре отображения.")
+            else:
+                country_rows = country_rows.sort_values("participants", ascending=False)
+                country_rows["lat"] = country_rows["iso3"].map(
+                    lambda k: ISO3_TO_CENTER.get(str(k), (None, None))[0]
+                )
+                country_rows["lon"] = country_rows["iso3"].map(
+                    lambda k: ISO3_TO_CENTER.get(str(k), (None, None))[1]
+                )
+                map_df = country_rows.dropna(subset=["lat", "lon"]).copy()
+                if map_df.empty:
+                    st.caption("Нет координат стран для карты (нужно расширить словарь ISO3_TO_CENTER).")
+                else:
+                    map_df = map_df.rename(columns={"participants": "size"})
+                    st.map(map_df[["lat", "lon", "size"]], size="size", use_container_width=True)
+
+    gr1, gr2 = st.columns(2)
+    with gr1:
+        st.markdown("**Города**")
+        st.dataframe(pd.DataFrame(city_rows), use_container_width=True, hide_index=True)
+    with gr2:
+        st.markdown("**Регионы**")
+        st.dataframe(pd.DataFrame(geo.get("regions") or []), use_container_width=True, hide_index=True)
 
 
 def page_event() -> None:
@@ -1400,39 +1649,28 @@ def page_participant() -> None:
     if not require_db(path):
         return
 
-    st.caption("Быстрый выбор: введите фамилию/имя или id участника.")
-    needle = st.text_input(
-        "ФИО или id",
-        placeholder="Например: Иванов или 2139",
-        key="part_needle_unified",
-    )
-    rows: list[dict] = []
-    if needle.strip():
-        rows = mq.query_profile_search_enriched(path, needle.strip(), 80)
-
-    picked_pid: int | None = None
-    if rows:
-        st.caption("Выберите участника из выпадающего списка.")
-        options = [int(r["id"]) for r in rows]
-        labels = {
-            int(r["id"]): (
-                f"{(r.get('last_name') or '').strip()}, "
-                f"{(r.get('first_name') or '').strip()}, "
-                f"{(r.get('city') or '').strip() or '—'}, "
-                f"id {int(r['id'])}"
-            )
-            for r in rows
-        }
-        picked_pid = st.selectbox(
-            "Варианты",
-            options=options,
-            format_func=lambda i: labels.get(int(i), f"id {int(i)}"),
-            index=None,
-            placeholder="Начните печатать и выберите участника...",
-            key="part_pick_selectbox",
+    st.caption("Быстрый выбор: начните вводить фамилию/имя/id — подсказки появятся в этом же поле.")
+    ac_rows = mq.query_profile_autocomplete_options(path, limit=20000)
+    ac_labels: list[str] = []
+    ac_map: dict[str, int] = {}
+    for r in ac_rows:
+        rid = int(r.get("id") or 0)
+        if rid <= 0:
+            continue
+        label = (
+            f"{(r.get('last_name') or '').strip()} {(r.get('first_name') or '').strip()} · "
+            f"{(r.get('city') or '').strip() or '—'} · id {rid}"
         )
-        if picked_pid is not None:
-            picked_pid = int(picked_pid)
+        ac_labels.append(label)
+        ac_map[label] = rid
+    picked_label = st.selectbox(
+        "ФИО или id",
+        options=ac_labels,
+        index=None,
+        placeholder="Начните вводить фамилию, имя или id...",
+        key="part_single_autocomplete",
+    )
+    picked_pid: int | None = ac_map.get(str(picked_label)) if picked_label else None
 
     if "participant_recent_ids" not in st.session_state:
         st.session_state["participant_recent_ids"] = []
@@ -1472,16 +1710,11 @@ def page_participant() -> None:
                 st.caption("Список недавних пока пуст.")
 
     active_pid: int | None = picked_pid if picked_pid is not None else recent_pick
-    if active_pid is None and needle.strip().isdigit():
-        active_pid = int(needle.strip())
+    if active_pid is None:
+        active_pid = _participant_id_from_url()
 
     if active_pid is None:
-        if needle.strip() and not rows:
-            st.warning("Ничего не найдено.")
-        elif needle.strip() and rows:
-            st.caption("Выберите участника в выпадающем списке.")
-        elif not needle.strip():
-            st.caption("Введите запрос в поиск или выберите участника из недавних.")
+        st.caption("Введите запрос в поле выше или выберите участника из недавних.")
         return
 
     hist = [int(active_pid)] + [int(x) for x in recent_ids if int(x) != int(active_pid)]
@@ -2269,6 +2502,7 @@ def main() -> None:
 
     pages: list[str] = [
         "Общая статистика",
+        "Интересные факты",
         "Событие",
         "Участник",
         "Команда",
@@ -2279,9 +2513,13 @@ def main() -> None:
     PAGES: tuple[str, ...] = tuple(pages)
     if SIDEBAR_LOGO.is_file():
         st.sidebar.image(str(SIDEBAR_LOGO), use_container_width=True)
-    i_from_url = _sidebar_read_nav_i_from_url()
-    if i_from_url is not None and 0 <= i_from_url < len(PAGES):
-        st.session_state["nav_page"] = PAGES[i_from_url]
+    page_from_url = _sidebar_read_page_from_url()
+    if page_from_url in PAGES:
+        st.session_state["nav_page"] = str(page_from_url)
+    else:
+        i_from_url = _sidebar_read_nav_i_from_url()
+        if i_from_url is not None and 0 <= i_from_url < len(PAGES):
+            st.session_state["nav_page"] = PAGES[i_from_url]
     if st.session_state.get("nav_page") not in PAGES:
         st.session_state["nav_page"] = PAGES[0]
     page: str = st.session_state["nav_page"]
@@ -2298,6 +2536,8 @@ def main() -> None:
 
     if page == "Общая статистика":
         page_general_statistics()
+    elif page == "Интересные факты":
+        page_interesting_facts()
     elif page == "Событие":
         page_event()
     elif page == "Участник":
