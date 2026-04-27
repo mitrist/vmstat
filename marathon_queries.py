@@ -19,6 +19,17 @@ DEFAULT_DISTANCE_ALIASES_FILE = (
 )
 DEFAULT_STAGES_FILE = Path(__file__).resolve().parent / ".cursor" / "etapy.yaml"
 LEGACY_STAGES_FILE = Path(__file__).resolve().parent / ".cursor" / "etapi.md"
+# Fallback-карта этапов для Бегового кубка 2026 (cup_id=54), если файл карты недоступен.
+DEFAULT_STAGE_INDEX_MAP: dict[int, int] = {
+    298: 1,
+    299: 2,
+    300: 3,
+    301: 4,
+    302: 5,
+    303: 6,
+    304: 7,
+    305: 8,
+}
 
 
 @contextmanager
@@ -314,7 +325,7 @@ def load_stage_index_map(path: Path | str | None = None) -> dict[int, int]:
     if not p.is_file():
         p = LEGACY_STAGES_FILE
     if not p.is_file():
-        return {}
+        return dict(DEFAULT_STAGE_INDEX_MAP)
     try:
         txt = p.read_text(encoding="utf-8")
     except OSError:
@@ -331,7 +342,7 @@ def load_stage_index_map(path: Path | str | None = None) -> dict[int, int]:
         m2 = re.match(r"(\d+)\s*[:=-]\s*(\d+)$", s)
         if m2:
             out[int(m2.group(2))] = int(m2.group(1))
-    return out
+    return out if out else dict(DEFAULT_STAGE_INDEX_MAP)
 
 
 def _score_linear(place_abs: int, first: int, second: int, linear_from_place: int) -> int:
