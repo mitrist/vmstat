@@ -1982,8 +1982,7 @@ def page_cups() -> None:
     st.caption(
         "Сводка кубков за год — **profile_cup_results**. Личное первенство — те же строки + **cup_results**. "
         "Командное первенство — сумма очков **пяти лучших участников** (из **profile_cup_results.total_points**, "
-        "команда из **results** по **cup_competitions**). "
-        "При пустой базе: `python crawler_full.py` / `python sync.py` или `python fill_profile_cup_results.py`."
+        "команда из **results** по **cup_competitions**)."
     )
 
     year_opts = mq.query_profile_cup_result_years(path)
@@ -2081,13 +2080,7 @@ def page_cups() -> None:
                 )
             filtered = _filter_cup_detail_rows(detail, sn, gmode, age_sel)
             st.caption(
-                f"Показано строк: **{len(filtered)}** из {len(detail)}. "
-                "**Место** из `cup_results` (абсолют / по полу / в группе); "
-                "если строки в `cup_results` нет — `place_abs` из `profile_cup_results`. "
-                "**Очки** — из `cup_results.raw` → массив **competition_points** (элемент с тем же "
-                "**competition_id**, что и этап строки, поле **points**); иначе расчёт "
-                "`cup_scoring_computed_finishes` (**2026_run_v1**, `python compute_cup_scoring.py`); "
-                "иначе `profile_cup_results.total_points`."
+                f"Показано строк: **{len(filtered)}** из {len(detail)}."
             )
             hide = (
                 "last_name",
