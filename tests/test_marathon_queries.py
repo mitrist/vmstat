@@ -791,3 +791,55 @@ def test_interesting_facts_queries(sample_db: Path) -> None:
     assert "cities" in geo and "regions" in geo
     assert len(geo["cities"]) >= 1
     assert len(geo["regions"]) >= 1
+
+
+def test_competitions_admin_queries_and_save(tmp_path: Path) -> None:
+    db = tmp_path / "admin_comp.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE TABLE competitions (
+            id INTEGER PRIMARY KEY,
+            title TEXT,
+            title_short TEXT,
+            date TEXT,
+            year INTEGER,
+            sport TEXT,
+            is_relay INTEGER,
+            is_published INTEGER,
+            page_url TEXT,
+            raw TEXT
+        );
+        INSERT INTO competitions
+        VALUES (99, 'Old Title', 'S', '2025-09-01', 2025, 'run', 0, 1, 'http://x', '{}');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    years = mq.query_competition_years_admin(db)
+    assert 2025 in years
+    rows = mq.query_competitions_admin_rows(db, year=2025, limit=50)
+    assert len(rows) == 1 and int(rows[0]["id"]) == 99
+
+    errs = mq.save_competitions_admin_rows(
+        db,
+        [
+            {
+                "id": 99,
+                "title": "New Title",
+                "title_short": "S2",
+                "date": "2025-09-02",
+                "year": 2025,
+                "sport": "run",
+                "is_relay": 0,
+                "is_published": 0,
+                "page_url": "http://y",
+            }
+        ],
+    )
+    assert errs == []
+
+    row2 = mq.query_competitions_admin_rows(db, year=None, limit=10)
+    assert row2[0]["title"] == "New Title"
+    assert int(row2[0]["is_published"]) == 0

@@ -3905,3 +3905,175 @@ def query_data_health(db_path: Path | str) -> dict[str, Any]:
         """,
     )
     return row or {}
+
+
+# ── Админка: таблица competitions ─────────────────────────────────────────────
+
+_ADMIN_COMP_EDIT_COLS = (
+    "title",
+    "title_short",
+    "date",
+    "year",
+    "sport",
+    "is_relay",
+    "is_published",
+    "page_url",
+)
+
+
+def query_competition_years_admin(db_path: Path | str) -> list[int]:
+    rows = q_all(
+        db_path,
+        """
+        SELECT DISTINCT year AS y
+        FROM competitions
+        WHERE year IS NOT NULL
+        ORDER BY year DESC
+        """,
+        (),
+    )
+    out: list[int] = []
+    for r in rows:
+        try:
+            out.append(int(r["y"]))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def query_competitions_admin_rows(
+    db_path: Path | str,
+    *,
+    year: int | None,
+    limit: int = 800,
+) -> list[dict[str, Any]]:
+    cols = ["id"]
+    cols.extend(
+        c for c in _ADMIN_COMP_EDIT_COLS if _table_has_column(db_path, "competitions", c)
+    )
+    col_sql = ", ".join(cols)
+    lim = max(10, min(int(limit), 5000))
+
+    if year is None:
+        sql = (
+            f"SELECT {col_sql} FROM competitions "
+            "ORDER BY date DESC NULLS LAST, id DESC LIMIT ?"
+        )
+        params: tuple[Any, ...] = (lim,)
+    else:
+        sql = (
+            f"SELECT {col_sql} FROM competitions WHERE year = ? "
+            "ORDER BY date DESC NULLS LAST, id DESC LIMIT ?"
+        )
+        params = (int(year), lim)
+
+    return q_all(db_path, sql, params)
+
+
+def query_competitions_admin_count(db_path: Path | str, year: int | None) -> int:
+    if year is None:
+        row = q_one(db_path, "SELECT COUNT(*) AS n FROM competitions", ())
+    else:
+        row = q_one(db_path, "SELECT COUNT(*) AS n FROM competitions WHERE year = ?", (int(year),))
+    if not row:
+        return 0
+    try:
+        return int(row.get("n") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _norm_sql_int_optional(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, float) and (value != value):  # NaN
+        return None
+    if isinstance(value, str) and not str(value).strip():
+        return None
+    try:
+        return int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _norm_flag01(value: Any) -> int:
+    if value in (True, 1):
+        return 1
+    if value in (False, 0, None, ""):
+        return 0
+    s = str(value).strip().casefold()
+    if s in ("1", "true", "yes", "on", "да"):
+        return 1
+    try:
+        return 1 if int(float(s)) else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _norm_str(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and (value != value):
+        return ""
+    return str(value)
+
+
+def save_competitions_admin_rows(
+    db_path: Path | str,
+    rows: list[dict[str, Any]],
+) -> list[str]:
+    """
+    Обновляет существующие строки по id. Поле id и сырой raw не меняются здесь.
+    Возвращает список сообщений об ошибках (пустой — всё ок).
+    """
+    dbp = Path(db_path)
+    # Какие колонки реально есть
+    editable: list[str] = [
+        c for c in _ADMIN_COMP_EDIT_COLS if _table_has_column(dbp, "competitions", c)
+    ]
+    if not editable:
+        return ["В таблице competitions нет ожидаемых колонок для редактирования."]
+
+    set_sql = ", ".join(f"{c} = ?" for c in editable)
+    errs: list[str] = []
+
+    with connect(dbp) as conn:
+        for raw in rows:
+            try:
+                rid = raw.get("id")
+                if rid is None or (isinstance(rid, float) and rid != rid):
+                    errs.append("Пропуск строки: нет id.")
+                    continue
+                if isinstance(rid, str) and not str(rid).strip().isdigit():
+                    errs.append("Пропуск строки: неверный id.")
+                    continue
+                cid = int(rid)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                errs.append("Пропуск строки: неверный id.")
+                continue
+
+            row = conn.execute(
+                "SELECT 1 FROM competitions WHERE id = ? LIMIT 1", (cid,)
+            ).fetchone()
+            if not row:
+                errs.append(f"id={cid}: запись не найдена.")
+                continue
+
+            values: list[Any] = []
+            for c in editable:
+                if c == "year":
+                    yv = _norm_sql_int_optional(raw.get("year"))
+                    values.append(yv)
+                elif c in ("is_relay", "is_published"):
+                    values.append(_norm_flag01(raw.get(c)))
+                else:
+                    values.append(_norm_str(raw.get(c)))
+
+            conn.execute(
+                f"UPDATE competitions SET {set_sql} WHERE id = ?",
+                (*values, cid),
+            )
+
+        conn.commit()
+
+    return errs

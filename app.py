@@ -55,7 +55,6 @@ PAGE_ALIASES: dict[str, str] = {
     "Участник": "participant",
     "Команда": "team",
     "Кубки": "cups",
-    "Админка": "admin",
 }
 
 SECTION_SUBMENUS: dict[str, list[tuple[str, str]]] = {
@@ -88,10 +87,10 @@ SECTION_SUBMENUS: dict[str, list[tuple[str, str]]] = {
         ("cups-list", "Кубки за год"),
         ("cups-results", "Результаты"),
     ],
-    "Админка": [
-        ("admin-aliases", "Справочник алиасов"),
-    ],
 }
+
+# Внутренний ключ сессии: панель администратора открывается только по секретному ?page=<slug>.
+ADMIN_PANEL_PAGE = "__vm_secret_admin__"
 
 COUNTRY_TO_ISO3: dict[str, str] = {
     "россия": "RUS",
@@ -681,7 +680,11 @@ def _sidebar_read_page_from_url() -> str | None:
         if raw is None:
             return None
         s = raw[0] if isinstance(raw, (list, tuple)) and len(raw) else str(raw)
-        key = s.strip().casefold()
+        page_raw = str(s).strip()
+        slug = _resolve_admin_route_slug()
+        if slug and page_raw == slug.strip():
+            return ADMIN_PANEL_PAGE
+        key = page_raw.casefold()
     except Exception:
         return None
     for title, alias in PAGE_ALIASES.items():
@@ -773,7 +776,6 @@ def render_sidebar_text_nav(pages: tuple[str, ...], current: str) -> None:
         "Команда": "🛡️",
         "Кубки": "🏆",
         "Интересные факты": "✨",
-        "Админка": "⚙️",
     }
     parts: list[str] = ['<div class="vm-sidebar-text-nav">']
     for title in pages:
@@ -1406,6 +1408,25 @@ def _is_admin_user() -> bool:
         "yes",
         "on",
     }
+
+
+def _resolve_admin_route_slug() -> str | None:
+    """
+    Секретный сегмент URL: ?page=<slug> открывает панель администратора без пункта в меню.
+    Задаётся VMSTAT_ADMIN_ROUTE или [admin] route_slug в .streamlit/secrets.toml.
+    """
+    env_sl = str(os.environ.get("VMSTAT_ADMIN_ROUTE", "")).strip()
+    if env_sl:
+        return env_sl
+    try:
+        adm: Any = st.secrets.get("admin", {}) if hasattr(st, "secrets") else {}
+        if isinstance(adm, dict):
+            rs = str(adm.get("route_slug") or "").strip()
+            if rs:
+                return rs
+    except Exception:
+        return None
+    return None
 
 
 def _cup_detail_age_group_options(rows: list[dict]) -> list[str]:
@@ -2652,10 +2673,25 @@ def page_cups() -> None:
 
 
 def page_admin() -> None:
-    if not _is_admin_user():
-        st.warning("Админка отключена в текущем окружении.")
+    slug = _resolve_admin_route_slug()
+    if not slug:
+        st.error(
+            "Панель администратора недоступна: не задан секретный путь. Укажите переменную окружения "
+            "**VMSTAT_ADMIN_ROUTE** или ключ **[admin]** **route_slug** в `.streamlit/secrets.toml`."
+        )
         return
-    st.header("Админка")
+    path = DEFAULT_DB
+    if not mq.db_exists(path):
+        st.warning(f"База недоступна по пути `{path}`. Установите MARATHON_DB или соберите marathon.db.")
+
+    st.header("Панель администратора")
+    base_pub = "?page=%s" % PAGE_ALIASES["Общая статистика"]
+    st.markdown(
+        f"<p>Секретная страница (нет в меню). Обратно на сайт: "
+        f'<a href="{html.escape(base_pub)}">общая статистика</a>.</p>',
+        unsafe_allow_html=True,
+    )
+
     _section_anchor("admin-aliases")
     st.subheader("Справочник алиасов дистанций")
     st.caption(
@@ -2704,6 +2740,105 @@ def page_admin() -> None:
             st.success("Справочник сохранён.")
             st.rerun()
 
+    _section_anchor("admin-competitions")
+    st.subheader("Таблица competitions")
+    st.caption(
+        "Редактирование метаданных событий (название, дата, год, вид спорта, признаки). "
+        "Колонку **raw** можно менять только скриптами синхронизации."
+    )
+    if require_db(path):
+        years_admin = mq.query_competition_years_admin(path)
+        cnt_all = mq.query_competitions_admin_count(path, None)
+        year_labels = ["Все годы"] + [str(y) for y in years_admin]
+
+        picked = st.selectbox(
+            "Фильтр по году соревнования",
+            options=year_labels,
+            key="admin_comp_year_select",
+        )
+        year_val: int | None = None if picked == "Все годы" else int(picked)
+        total = mq.query_competitions_admin_count(path, year_val)
+        lim_cap = 800
+        caption_tail = ""
+        if total > lim_cap:
+            caption_tail = (
+                f"В базе **{total}** строк при выбранном фильтре — показываются первые **{lim_cap}**. "
+                "Уточните год или редактируйте порциями."
+            )
+        else:
+            caption_tail = f"Строк к показу: **{total}**."
+        if cnt_all != total:
+            caption_tail += f" Всего событий в базе: **{cnt_all}**."
+        st.caption(caption_tail)
+
+        rows_admin = mq.query_competitions_admin_rows(path, year=year_val, limit=lim_cap)
+        df_comp = pd.DataFrame(rows_admin)
+
+        if not df_comp.empty:
+            if "year" in df_comp.columns:
+                df_comp["year"] = pd.to_numeric(df_comp["year"], errors="coerce").astype(
+                    "Int64"
+                )
+            for ic in ("is_relay", "is_published"):
+                if ic in df_comp.columns:
+                    df_comp[ic] = (
+                        pd.to_numeric(df_comp[ic], errors="coerce").fillna(0).astype(int)
+                    )
+
+            cc: dict[str, Any] = {}
+            if "id" in df_comp.columns:
+                cc["id"] = st.column_config.NumberColumn("ID", disabled=True, format="%d")
+            if "title" in df_comp.columns:
+                cc["title"] = st.column_config.TextColumn("Название")
+            if "title_short" in df_comp.columns:
+                cc["title_short"] = st.column_config.TextColumn("Кратко")
+            if "date" in df_comp.columns:
+                cc["date"] = st.column_config.TextColumn("Дата")
+            if "year" in df_comp.columns:
+                cc["year"] = st.column_config.NumberColumn(
+                    "Год", min_value=1980, max_value=2100, step=1
+                )
+            if "sport" in df_comp.columns:
+                cc["sport"] = st.column_config.TextColumn("Спорт")
+            if "is_relay" in df_comp.columns:
+                cc["is_relay"] = st.column_config.NumberColumn(
+                    "Эстафета", min_value=0, max_value=1, step=1
+                )
+            if "is_published" in df_comp.columns:
+                cc["is_published"] = st.column_config.NumberColumn(
+                    "Опубликовано", min_value=0, max_value=1, step=1
+                )
+            if "page_url" in df_comp.columns:
+                cc["page_url"] = st.column_config.TextColumn("Страница события")
+
+            edited_comp = st.data_editor(
+                df_comp,
+                use_container_width=True,
+                hide_index=True,
+                num_rows="fixed",
+                key="admin_competitions_editor",
+                column_config=cc,
+            )
+
+            saved_c = st.button(
+                "Сохранить изменения competitions",
+                key="admin_save_competitions",
+                type="primary",
+            )
+            if saved_c:
+                recs = edited_comp.to_dict(orient="records")
+                errs = mq.save_competitions_admin_rows(path, recs)
+                if errs:
+                    for er in errs[:40]:
+                        st.warning(er)
+                    if len(errs) > 40:
+                        st.warning(f"… ещё {len(errs) - 40} ошибок.")
+                else:
+                    st.success(f"Обновлено строк: **{len(recs)}**.")
+                    st.rerun()
+        else:
+            st.info("Нет строк в **competitions** по выбранному фильтру.")
+
 
 def main() -> None:
     icon = page_icon_path()
@@ -2723,23 +2858,29 @@ def main() -> None:
         "Команда",
         "Кубки",
     ]
-    if _is_admin_user():
-        pages.append("Админка")
     PAGES: tuple[str, ...] = tuple(pages)
     if SIDEBAR_LOGO.is_file():
         st.sidebar.image(str(SIDEBAR_LOGO), use_container_width=True)
     page_from_url = _sidebar_read_page_from_url()
-    if page_from_url in PAGES:
+    if page_from_url == ADMIN_PANEL_PAGE:
+        st.session_state["nav_page"] = ADMIN_PANEL_PAGE
+    elif page_from_url in PAGES:
         st.session_state["nav_page"] = str(page_from_url)
     else:
         i_from_url = _sidebar_read_nav_i_from_url()
         if i_from_url is not None and 0 <= i_from_url < len(PAGES):
             st.session_state["nav_page"] = PAGES[i_from_url]
-    if st.session_state.get("nav_page") not in PAGES:
+    nav_now = st.session_state.get("nav_page")
+    if nav_now != ADMIN_PANEL_PAGE and nav_now not in PAGES:
         st.session_state["nav_page"] = PAGES[0]
-    page: str = st.session_state["nav_page"]
+    page: str = str(st.session_state["nav_page"])
+
+    sidebar_here = page if page in PAGES else ""
     st.sidebar.divider()
-    render_sidebar_text_nav(PAGES, page)
+    render_sidebar_text_nav(PAGES, sidebar_here)
+
+    if page == ADMIN_PANEL_PAGE:
+        st.sidebar.info("Открыта секретная страница администратора.")
 
     st.sidebar.divider()
     st.sidebar.markdown(
@@ -2759,7 +2900,7 @@ def main() -> None:
         page_participant()
     elif page == "Команда":
         page_team()
-    elif page == "Админка":
+    elif page == ADMIN_PANEL_PAGE:
         page_admin()
     else:
         page_cups()
