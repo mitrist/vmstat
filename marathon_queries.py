@@ -3661,6 +3661,7 @@ def query_interesting_facts_finish_rate(
 def query_interesting_facts_universal_participants(
     db_path: Path | str,
     year: int | None = None,
+    sport: str | None = None,
     min_starts: int = 1,
     limit: int = 10,
 ) -> list[dict[str, Any]]:
@@ -3670,6 +3671,10 @@ def query_interesting_facts_universal_participants(
     if year is not None:
         year_sql = " AND c.year = ?"
         params.append(int(year))
+    sport_sql = ""
+    if sport and str(sport).strip():
+        sport_sql = " AND c.sport = ?"
+        params.append(str(sport).strip())
     params.append(max(1, int(min_starts)))
     return q_all(
         db_path,
@@ -3683,7 +3688,7 @@ def query_interesting_facts_universal_participants(
         FROM results r
         INNER JOIN competitions c ON c.id = r.competition_id
         LEFT JOIN profiles p ON p.id = r.profile_id
-        WHERE r.profile_id IS NOT NULL {year_sql}
+        WHERE r.profile_id IS NOT NULL {year_sql}{sport_sql}
         GROUP BY r.profile_id, participant
         HAVING COUNT(*) >= ?
         ORDER BY sports_count DESC, starts DESC, participant
@@ -3757,13 +3762,18 @@ def query_interesting_facts_distance_frequency(
 def query_interesting_facts_km_by_sport(
     db_path: Path | str,
     year: int | None = None,
+    sport: str | None = None,
 ) -> list[dict[str, Any]]:
     """Суммарный километраж по видам спорта."""
     params: list[Any] = []
-    year_sql = ""
+    where_parts: list[str] = []
     if year is not None:
-        year_sql = "WHERE c.year = ?"
+        where_parts.append("c.year = ?")
         params.append(int(year))
+    if sport and str(sport).strip():
+        where_parts.append("c.sport = ?")
+        params.append(str(sport).strip())
+    where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
     return q_all(
         db_path,
         f"""
@@ -3775,7 +3785,7 @@ def query_interesting_facts_km_by_sport(
         FROM competitions c
         LEFT JOIN results r ON r.competition_id = c.id
         LEFT JOIN distances d ON d.id = r.distance_id
-        {year_sql}
+        {where_sql}
         GROUP BY COALESCE(NULLIF(TRIM(c.sport), ''), 'unknown')
         ORDER BY km_total DESC, starts DESC, COALESCE(NULLIF(TRIM(c.sport), ''), 'unknown')
         """,

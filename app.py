@@ -404,7 +404,7 @@ def inject_vm_styles() -> None:
         .stAlert {{
             border-radius: 2px;
         }}
-        /* Участник: выбранный год в st.pills — синяя плашка, остальные годы — синий текст */
+        /* Фильтры-плашки: выбранная плашка синяя, остальные с синим текстом */
         div[data-testid="stPills"] [data-testid="stBaseButton-primary"] {{
             background-color: {VM_BLUE} !important;
             border-color: {VM_BLUE} !important;
@@ -419,6 +419,15 @@ def inject_vm_styles() -> None:
         div[data-testid="stPills"] [data-testid="stBaseButton-secondary"] p {{
             color: {VM_BLUE} !important;
             font-weight: 500;
+        }}
+        /* Segmented control (тоже формат плашек) */
+        div[data-testid="stSegmentedControl"] [data-baseweb="button-group"] button[aria-pressed="true"] {{
+            background-color: {VM_BLUE} !important;
+            border-color: {VM_BLUE} !important;
+            color: #ffffff !important;
+        }}
+        div[data-testid="stSegmentedControl"] [data-baseweb="button-group"] button[aria-pressed="false"] {{
+            color: {VM_BLUE} !important;
         }}
         /* Вкладки в стиле Chrome (st.tabs): полоска, активная с белым фоном) */
         div[data-testid="stTabs"] {{
@@ -1114,9 +1123,17 @@ def page_interesting_facts() -> None:
     if not require_db(path):
         return
 
+    sports_all = mq.query_distinct_sports(path)
+    sport_pick = st.pills(
+        "Вид спорта",
+        options=["Все"] + sports_all,
+        selection_mode="single",
+        default="Все",
+        key="facts_sport_filter_pills",
+    )
     min_starts = 1
     year_val = None
-    sport_val = None
+    sport_val = None if sport_pick == "Все" else str(sport_pick)
 
     loyal = mq.query_interesting_facts_loyal_participants(
         path, year=year_val, sport=sport_val, min_starts=int(min_starts), limit=100
@@ -1128,7 +1145,7 @@ def page_interesting_facts() -> None:
         path, year=year_val, sport=sport_val, min_starts=int(min_starts), limit=100
     )
     universals = mq.query_interesting_facts_universal_participants(
-        path, year=year_val, min_starts=int(min_starts), limit=100
+        path, year=year_val, sport=sport_val, min_starts=int(min_starts), limit=100
     )
     distances = mq.query_interesting_facts_distance_frequency(path, year=year_val, sport=sport_val, limit=100)
     teams = mq.query_interesting_facts_team_longevity(
@@ -1142,7 +1159,7 @@ def page_interesting_facts() -> None:
         st.caption("Как считается: лидер по активным годам, затем по числу стартов.")
         metric_plaque(
             "Самый преданный участник",
-            f"{top.get('participant', '—')} · {int(top.get('active_years') or 0)} лет",
+            f"{top.get('participant', '—')} · {int(top.get('active_years') or 0)} лет участия в кубках Вологда Марафон",
         )
     else:
         st.caption("Нет данных для выбранных фильтров.")
