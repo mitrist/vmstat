@@ -843,3 +843,23 @@ def test_competitions_admin_queries_and_save(tmp_path: Path) -> None:
     row2 = mq.query_competitions_admin_rows(db, year=None, limit=10)
     assert row2[0]["title"] == "New Title"
     assert int(row2[0]["is_published"]) == 0
+
+
+def test_profile_event_series_rows_filters(sample_db: Path) -> None:
+    rows = mq.query_profile_event_series_rows(sample_db, 100, years=[2024], sports=["run"])
+    assert len(rows) >= 1
+    assert rows[0]["Год"] == 2024
+    assert rows[0]["вид"] == "run"
+    assert "Событие" in rows[0]
+    assert "Дистанция" in rows[0]
+    assert "_series_short" in rows[0]
+
+    rows_filtered = mq.query_profile_event_series_rows(
+        sample_db,
+        100,
+        years=None,
+        sports=None,
+        series_shorts=["Spring Half"],
+    )
+    assert len(rows_filtered) >= 1
+    assert all(r.get("_series_short") == "Spring Half" for r in rows_filtered)

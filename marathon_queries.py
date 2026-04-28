@@ -2652,6 +2652,65 @@ def query_profile_events_table(
     )
 
 
+def query_profile_event_series_rows(
+    db_path: Path | str,
+    pid: int,
+    years: list[int] | None = None,
+    sports: list[str] | None = None,
+    series_shorts: list[str] | None = None,
+    include_dnf: bool = True,
+    limit: int = 3000,
+) -> list[dict[str, Any]]:
+    """Строки стартов участника для вкладки «Серия событий»."""
+    series_expr = (
+        "COALESCE(NULLIF(TRIM(c.title_short), ''), TRIM(c.title))"
+        if _table_has_column(db_path, "competitions", "title_short")
+        else "TRIM(c.title)"
+    )
+    where: list[str] = ["r.profile_id = ?"]
+    params: list[Any] = [pid]
+    if years:
+        where.append("c.year IN (" + ",".join("?" * len(years)) + ")")
+        params.extend(years)
+    if sports:
+        where.append("c.sport IN (" + ",".join("?" * len(sports)) + ")")
+        params.extend(sports)
+    if series_shorts:
+        where.append(series_expr + " IN (" + ",".join("?" * len(series_shorts)) + ")")
+        params.extend(series_shorts)
+    if not include_dnf:
+        where.append("COALESCE(r.dnf, 0) = 0")
+    wsql = " AND ".join(where)
+    rows = q_all(
+        db_path,
+        f"""
+        SELECT
+            c.year AS Год,
+            c.title AS Событие,
+            COALESCE(c.sport, '') AS вид,
+            COALESCE(d.name, '') AS Дистанция,
+            COALESCE(r.finish_time, '') AS время,
+            r.place_abs AS место_абс,
+            r.place_gender AS место_пол,
+            COALESCE(r.team, '') AS команда,
+            CASE WHEN COALESCE(r.dnf, 0) = 0 THEN 'finish' ELSE 'dnf' END AS статус,
+            {series_expr} AS _series_short
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        LEFT JOIN distances d ON d.id = r.distance_id
+        WHERE {wsql}
+        ORDER BY c.date DESC, c.id DESC, r.id DESC
+        LIMIT {int(limit)}
+        """,
+        tuple(params),
+    )
+    rules = load_distance_alias_rules()
+    for r in rows:
+        _, d_label = normalize_distance_by_alias_rules(r.get("Дистанция"), rules)
+        r["Дистанция"] = d_label
+    return rows
+
+
 def query_profile_personal_bests(
     db_path: Path | str,
     pid: int,

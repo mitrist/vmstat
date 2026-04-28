@@ -1375,22 +1375,47 @@ def page_event() -> None:
     if not years_for_detail:
         st.caption("Нет годов для детализации.")
         return
-    year = st.selectbox("Год (детали)", years_for_detail, index=0, key="ev_year_detail")
-    comps = mq.query_competitions_for_year(path, int(year))
-    if sports_filter:
-        sports_set = {str(x) for x in sports_filter}
-        comps = [c for c in comps if str(c.get("вид") or "") in sports_set]
+
+    comps: list[dict[str, Any]] = []
+    for yy in years_for_detail:
+        rows = mq.query_competitions_for_year(path, int(yy))
+        if sports_filter:
+            sports_set = {str(x) for x in sports_filter}
+            rows = [c for c in rows if str(c.get("вид") or "") in sports_set]
+        comps.extend(rows)
     if not comps:
         st.info("Нет событий для выбранных фильтров.")
         return
-    labels = [f"{c.get('id')} — {c.get('событие', '')[:70]}" for c in comps]
-    idx = st.selectbox(
-        "Соревнование (детали)",
-        range(len(labels)),
-        format_func=lambda i: labels[i],
-        key="ev_competition_detail",
+
+    # Плашки выбора: одна плашка = одно событие.
+    comp_map: dict[str, int] = {}
+    comp_labels: list[str] = []
+    for c in comps:
+        cid = int(c.get("id") or 0)
+        if cid <= 0:
+            continue
+        title = str(c.get("событие") or "").strip() or f"id {cid}"
+        year_val = str(c.get("дата") or "")[:4]
+        label = f"{title} ({year_val})" if year_val else title
+        # Гарантия уникальности label для pills.
+        if label in comp_map:
+            label = f"{label} · #{cid}"
+        comp_map[label] = cid
+        comp_labels.append(label)
+    if not comp_labels:
+        st.info("Нет событий для выбранных фильтров.")
+        return
+
+    picked_comp = st.pills(
+        "Событие (детали)",
+        options=comp_labels,
+        selection_mode="single",
+        default=comp_labels[0],
+        key="ev_competition_detail_pills",
+        label_visibility="collapsed",
     )
-    comp_id = int(comps[idx]["id"])
+    picked_label = str(picked_comp or comp_labels[0])
+    comp_id = int(comp_map[picked_label])
 
     st.markdown("##### Сводка")
     st.dataframe(
@@ -2159,7 +2184,7 @@ def show_participant_dashboard(path: Path, pid: int) -> None:
                 st.altair_chart((fig_sport + labels).properties(height=280), use_container_width=True)
 
     _section_anchor("participant-tabs")
-    tabs = ["События", "Рекорды", "Кубки", "Команды"]
+    tabs = ["События", "Рекорды", "Кубки", "Команды", "Серия событий"]
     if _is_admin_user():
         tabs.append("Качество данных")
     tt = st.tabs(tabs)
@@ -2167,7 +2192,8 @@ def show_participant_dashboard(path: Path, pid: int) -> None:
     tab_rec = tt[1]
     tab_cup = tt[2]
     tab_team = tt[3]
-    tab_quality = tt[4] if len(tt) > 4 else None
+    tab_series = tt[4]
+    tab_quality = tt[5] if len(tt) > 5 else None
 
     with tab_ev:
         all_rows = mq.query_profile_events_table(
@@ -2272,6 +2298,69 @@ def show_participant_dashboard(path: Path, pid: int) -> None:
             st.caption("Нет финишей с непустой командой.")
         else:
             st.dataframe(team_df, use_container_width=True, hide_index=True)
+
+    with tab_series:
+        series_rows = mq.query_profile_event_series_rows(
+            path,
+            pid,
+            years=years_for_query,
+            sports=sports_for_query,
+            include_dnf=True,
+            limit=5000,
+        )
+        series_df = pd.DataFrame(series_rows)
+        if series_df.empty:
+            st.caption("Нет данных для таблицы «Серии событий» по выбранным фильтрам.")
+        else:
+            series_opts = sorted(
+                {
+                    str(x).strip()
+                    for x in series_df.get("_series_short", pd.Series(dtype="object")).tolist()
+                    if str(x).strip()
+                }
+            )
+            sport_opts_series = sorted(
+                {
+                    str(x).strip()
+                    for x in series_df.get("вид", pd.Series(dtype="object")).tolist()
+                    if str(x).strip() and str(x).strip().casefold() != "service"
+                }
+            )
+            fs1, fs2 = st.columns(2)
+            with fs1:
+                pick_series = st.selectbox(
+                    "Серия событий",
+                    options=["Все"] + series_opts,
+                    index=0,
+                    key=f"part_series_short_{pid}",
+                )
+            with fs2:
+                pick_sport_series = st.selectbox(
+                    "Вид спорта",
+                    options=["Все"] + sport_opts_series,
+                    index=0,
+                    key=f"part_series_sport_{pid}",
+                )
+            show_df = series_df.copy()
+            if pick_series != "Все":
+                show_df = show_df[show_df["_series_short"] == pick_series]
+            if pick_sport_series != "Все":
+                show_df = show_df[show_df["вид"] == pick_sport_series]
+            show_df = show_df.drop(columns=["_series_short"], errors="ignore")
+            show_cols = [
+                "Год",
+                "Событие",
+                "вид",
+                "Дистанция",
+                "время",
+                "место_абс",
+                "место_пол",
+                "команда",
+                "статус",
+            ]
+            show_cols = [c for c in show_cols if c in show_df.columns]
+            st.markdown("##### Серии событий")
+            st.dataframe(show_df[show_cols], use_container_width=True, hide_index=True)
     if tab_quality is not None:
         with tab_quality:
             if not _is_admin_user():
