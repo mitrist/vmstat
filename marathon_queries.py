@@ -2909,14 +2909,15 @@ def query_cups_for_obsh_header_filter(
     return q_all(
         db_path,
         f"""
-        SELECT DISTINCT cu.id, cu.title, cu.year
+        SELECT
+            cu.id,
+            cu.title,
+            COALESCE(cu.year, MAX(c.year)) AS year
         FROM cups cu
-        WHERE cu.id IN (
-            SELECT cc.cup_id
-            FROM cup_competitions cc
-            JOIN competitions c ON c.id = cc.competition_id
-            WHERE {inner}
-        )
+        JOIN cup_competitions cc ON cc.cup_id = cu.id
+        JOIN competitions c ON c.id = cc.competition_id
+        WHERE {inner}
+        GROUP BY cu.id, cu.title, cu.year
         ORDER BY cu.year DESC, cu.title
         """,
         tuple(params),

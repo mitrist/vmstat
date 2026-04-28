@@ -13,6 +13,7 @@ MVP-дашборд marathon.db (Streamlit).
 from __future__ import annotations
 
 import datetime
+import json
 from typing import Any
 import html
 import os
@@ -34,6 +35,8 @@ APP_DIR = Path(__file__).resolve().parent
 SIDEBAR_LOGO = APP_DIR / "assets" / "vologdamarafon.png"
 FAVICON_LOCAL = APP_DIR / "favicon-32x32.png"
 FAVICON_ASSET = APP_DIR / "assets" / "vologdamarafon.png"
+REGION_CENTERS_FILE = APP_DIR / "config" / "region_centers.json"
+RUSSIA_REGIONS_GEOJSON_FILE = APP_DIR / "config" / "russia_regions.geojson"
 FAVICON_ATTACHED = Path(
     r"C:\Users\Pavlov DA\.cursor\projects\c-Projects-vm-stat\assets\c__Projects_vm_stat_favicon-32x32.png"
 )
@@ -168,12 +171,132 @@ ISO3_TO_CENTER: dict[str, tuple[float, float]] = {
     "CAN": (56.1304, -106.3468),
 }
 
+_RUSSIA_REGION_CENTER_CACHE: dict[str, tuple[float, float]] | None = None
+_RUSSIA_REGION_ALIAS_TO_CANONICAL_CACHE: dict[str, str] | None = None
+_RUSSIA_REGIONS_GEOJSON_CACHE: dict[str, Any] | None = None
+
 
 def _country_to_iso3(country: str | None) -> str | None:
     if not country:
         return None
     key = " ".join(str(country).strip().casefold().replace("ё", "е").split())
     return COUNTRY_TO_ISO3.get(key)
+
+
+def _norm_geo_token(value: str | None) -> str:
+    if not value:
+        return ""
+    return " ".join(str(value).strip().casefold().replace("ё", "е").split())
+
+
+def _load_region_centers_map() -> dict[str, tuple[float, float]]:
+    global _RUSSIA_REGION_CENTER_CACHE
+    if _RUSSIA_REGION_CENTER_CACHE is not None:
+        return _RUSSIA_REGION_CENTER_CACHE
+
+    out: dict[str, tuple[float, float]] = {}
+    try:
+        payload = json.loads(REGION_CENTERS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        _RUSSIA_REGION_CENTER_CACHE = out
+        return out
+    rows = payload.get("regions") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        _RUSSIA_REGION_CENTER_CACHE = out
+        return out
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = _norm_geo_token(str(row.get("name") or ""))
+        lat = row.get("lat")
+        lon = row.get("lon")
+        try:
+            if not name:
+                continue
+            center = (float(lat), float(lon))
+        except (TypeError, ValueError):
+            continue
+        out[name] = center
+        aliases = row.get("aliases")
+        if isinstance(aliases, list):
+            for a in aliases:
+                ak = _norm_geo_token(str(a or ""))
+                if ak:
+                    out[ak] = center
+
+    _RUSSIA_REGION_CENTER_CACHE = out
+    return out
+
+
+def _load_region_alias_to_canonical_map() -> dict[str, str]:
+    global _RUSSIA_REGION_ALIAS_TO_CANONICAL_CACHE
+    if _RUSSIA_REGION_ALIAS_TO_CANONICAL_CACHE is not None:
+        return _RUSSIA_REGION_ALIAS_TO_CANONICAL_CACHE
+
+    out: dict[str, str] = {}
+    try:
+        payload = json.loads(REGION_CENTERS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        _RUSSIA_REGION_ALIAS_TO_CANONICAL_CACHE = out
+        return out
+    rows = payload.get("regions") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        _RUSSIA_REGION_ALIAS_TO_CANONICAL_CACHE = out
+        return out
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        canonical = _norm_geo_token(str(row.get("name") or ""))
+        if not canonical:
+            continue
+        out[canonical] = canonical
+        aliases = row.get("aliases")
+        if isinstance(aliases, list):
+            for a in aliases:
+                ak = _norm_geo_token(str(a or ""))
+                if ak:
+                    out[ak] = canonical
+    _RUSSIA_REGION_ALIAS_TO_CANONICAL_CACHE = out
+    return out
+
+
+def _region_to_canonical(region: str | None) -> str | None:
+    key = _norm_geo_token(region)
+    if not key:
+        return None
+    return _load_region_alias_to_canonical_map().get(key)
+
+
+def _load_russia_regions_geojson_prepared() -> dict[str, Any] | None:
+    global _RUSSIA_REGIONS_GEOJSON_CACHE
+    if _RUSSIA_REGIONS_GEOJSON_CACHE is not None:
+        return _RUSSIA_REGIONS_GEOJSON_CACHE
+    try:
+        geo = json.loads(RUSSIA_REGIONS_GEOJSON_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    feats = geo.get("features")
+    if not isinstance(feats, list):
+        return None
+    for f in feats:
+        if not isinstance(f, dict):
+            continue
+        props = f.get("properties")
+        if not isinstance(props, dict):
+            props = {}
+            f["properties"] = props
+        props["norm_name"] = _norm_geo_token(props.get("name"))
+    _RUSSIA_REGIONS_GEOJSON_CACHE = geo
+    return geo
+
+
+def _region_to_center(region: str | None) -> tuple[float, float] | None:
+    key = _norm_geo_token(region)
+    if not key:
+        return None
+    return _load_region_centers_map().get(key)
 
 
 def _st_plotly_chart_supports_on_select() -> bool:
@@ -988,7 +1111,16 @@ def page_general_statistics() -> None:
         sf = None
 
     cups_rows = mq.query_cups_for_obsh_header_filter(path, yf, sf)
-    cup_labels = {int(r["id"]): f"{r.get('title', '')} ({r.get('year', '—')})" for r in cups_rows}
+    cup_labels: dict[int, str] = {}
+    for r in cups_rows:
+        cid = int(r["id"])
+        title = str(r.get("title") or "").strip() or f"#{cid}"
+        yv = r.get("year")
+        try:
+            ytxt = str(int(yv)) if yv is not None else ""
+        except (TypeError, ValueError):
+            ytxt = ""
+        cup_labels[cid] = f"{title} ({ytxt})" if ytxt else title
     cup_ids_opts = list(cup_labels.keys())
     st.markdown(
         f'<p style="color:{VM_TEXT};font-weight:600;margin:0 0 6px 0;">Кубок</p>'
@@ -1032,11 +1164,17 @@ def page_general_statistics() -> None:
         if dfe.empty:
             st.caption("Нет данных для гистограммы событий по годам.")
         else:
-            dfe2 = dfe.copy()
-            dfe2["Год"] = dfe2["year"].astype(str)
+            dfe2 = dfe.copy().sort_values("year")
+            dfe2["Год"] = dfe2["year"].astype(int).astype(str)
             dfe2["Событий"] = pd.to_numeric(dfe2["events"], errors="coerce").fillna(0).astype(int)
+            dfe2["Тренд"] = (
+                pd.to_numeric(dfe2["Событий"], errors="coerce")
+                .rolling(window=3, min_periods=1)
+                .mean()
+                .round(2)
+            )
             st.caption("Количество событий по годам")
-            chart = (
+            chart_bar = (
                 alt.Chart(dfe2)
                 .mark_bar()
                 .encode(
@@ -1048,19 +1186,40 @@ def page_general_statistics() -> None:
                     ],
                 )
             )
-            labels = chart.mark_text(dy=-8).encode(text="Событий:Q")
-            st.altair_chart((chart + labels).properties(height=280), use_container_width=True)
+            chart_trend = (
+                alt.Chart(dfe2)
+                .mark_line(color="#1f4e79", strokeWidth=2.5, point=True)
+                .encode(
+                    x=alt.X("Год:N", title="Год"),
+                    y=alt.Y("Тренд:Q", title="Событий"),
+                    tooltip=[
+                        alt.Tooltip("Год:N", title="Год"),
+                        alt.Tooltip("Тренд:Q", title="Тренд (MA-3)"),
+                    ],
+                )
+            )
+            labels = chart_bar.mark_text(dy=-8).encode(text="Событий:Q")
+            st.altair_chart(
+                (chart_bar + chart_trend + labels).properties(height=360),
+                use_container_width=True,
+            )
 
     with g2:
         dfp = pd.DataFrame(mq.query_chart_unique_participants_by_year(path, yf, sf, cf))
         if dfp.empty:
             st.caption("Нет данных для гистограммы участников по годам.")
         else:
-            dfp2 = dfp.copy()
-            dfp2["Год"] = dfp2["year"].astype(str)
+            dfp2 = dfp.copy().sort_values("year")
+            dfp2["Год"] = dfp2["year"].astype(int).astype(str)
             dfp2["Участников"] = pd.to_numeric(dfp2["participants"], errors="coerce").fillna(0).astype(int)
+            dfp2["Тренд"] = (
+                pd.to_numeric(dfp2["Участников"], errors="coerce")
+                .rolling(window=3, min_periods=1)
+                .mean()
+                .round(2)
+            )
             st.caption("Уникальных участников по годам")
-            chart = (
+            chart_bar = (
                 alt.Chart(dfp2)
                 .mark_bar()
                 .encode(
@@ -1072,8 +1231,23 @@ def page_general_statistics() -> None:
                     ],
                 )
             )
-            labels = chart.mark_text(dy=-8).encode(text="Участников:Q")
-            st.altair_chart((chart + labels).properties(height=280), use_container_width=True)
+            chart_trend = (
+                alt.Chart(dfp2)
+                .mark_line(color="#1f4e79", strokeWidth=2.5, point=True)
+                .encode(
+                    x=alt.X("Год:N", title="Год"),
+                    y=alt.Y("Тренд:Q", title="Участников"),
+                    tooltip=[
+                        alt.Tooltip("Год:N", title="Год"),
+                        alt.Tooltip("Тренд:Q", title="Тренд (MA-3)"),
+                    ],
+                )
+            )
+            labels = chart_bar.mark_text(dy=-8).encode(text="Участников:Q")
+            st.altair_chart(
+                (chart_bar + chart_trend + labels).properties(height=360),
+                use_container_width=True,
+            )
 
     _section_anchor("general-events")
     st.subheader("События")
@@ -1108,20 +1282,23 @@ def page_general_statistics() -> None:
         else:
             dfs2 = dfs.rename(columns={"sport": "Вид спорта", "n": "События"})
             st.caption("События по видам спорта")
-            chart = (
+            pie_sport = (
                 alt.Chart(dfs2)
-                .mark_bar()
+                .transform_joinaggregate(total_events="sum(События)")
+                .transform_calculate(pct="datum.События / datum.total_events")
+                .mark_arc()
                 .encode(
-                    x=alt.X("Вид спорта:N", title="Вид спорта"),
-                    y=alt.Y("События:Q", title="События"),
+                    theta=alt.Theta("События:Q", title="События"),
+                    color=alt.Color("Вид спорта:N", title="Вид спорта"),
                     tooltip=[
                         alt.Tooltip("Вид спорта:N", title="Вид спорта"),
                         alt.Tooltip("События:Q", title="События"),
+                        alt.Tooltip("pct:Q", title="Доля", format=".1%"),
                     ],
                 )
             )
-            labels = chart.mark_text(dy=-8).encode(text="События:Q")
-            st.altair_chart((chart + labels).properties(height=280), use_container_width=True)
+            labels = pie_sport.mark_text(radius=128).encode(text=alt.Text("pct:Q", format=".1%"))
+            st.altair_chart((pie_sport + labels).properties(height=360), use_container_width=True)
 
     with p2:
         dfg = pd.DataFrame(mq.query_chart_participants_by_gender(path, yf, sf, cf))
@@ -1134,6 +1311,8 @@ def page_general_statistics() -> None:
             pie_gender = dfg.rename(columns={"gender_label": "Пол", "n": "Участников"})[["Пол", "Участников"]]
             c_gender = (
                 alt.Chart(pie_gender)
+                .transform_joinaggregate(total_participants="sum(Участников)")
+                .transform_calculate(pct="datum.Участников / datum.total_participants")
                 .mark_arc()
                 .encode(
                     theta=alt.Theta("Участников:Q", title="Участников"),
@@ -1141,11 +1320,12 @@ def page_general_statistics() -> None:
                     tooltip=[
                         alt.Tooltip("Пол:N", title="Пол"),
                         alt.Tooltip("Участников:Q", title="Участников"),
+                        alt.Tooltip("pct:Q", title="Доля", format=".1%"),
                     ],
                 )
             )
-            c_text = c_gender.mark_text(radius=120).encode(text=alt.Text("Участников:Q", format=".0f"))
-            st.altair_chart((c_gender + c_text).properties(height=280), use_container_width=True)
+            c_text = c_gender.mark_text(radius=128).encode(text=alt.Text("pct:Q", format=".1%"))
+            st.altair_chart((c_gender + c_text).properties(height=360), use_container_width=True)
 
 
 def page_interesting_facts() -> None:
@@ -1250,34 +1430,30 @@ def page_interesting_facts() -> None:
     _section_anchor("facts-geo")
     st.subheader("География")
     city_rows = geo.get("cities") or []
-    country_rows = pd.DataFrame(geo.get("countries") or [])
-    if country_rows.empty:
-        st.caption("Нет данных по странам для построения карты.")
+    region_rows = pd.DataFrame(geo.get("regions") or [])
+    st.caption("Карта России по регионам: круги показывают регионы, откуда были участники.")
+    if region_rows.empty:
+        st.caption("Нет данных по регионам для построения карты России.")
     else:
-        country_rows = country_rows[country_rows["country"] != "—"].copy()
-        if country_rows.empty:
-            st.caption("Нет валидных названий стран для карты.")
+        region_rows = region_rows[region_rows["region"] != "—"].copy()
+        if region_rows.empty:
+            st.caption("Нет валидных названий регионов для карты России.")
         else:
-            country_rows["iso3"] = country_rows["country"].map(_country_to_iso3)
-            country_rows = country_rows[country_rows["iso3"].notna()].copy()
-            country_rows = country_rows.drop_duplicates(subset=["iso3"], keep="first")
-            st.caption("Карта по странам: круг означает, что из страны были участники.")
-            if country_rows.empty:
-                st.caption("Страны есть, но для них пока нет ISO-кодов в словаре отображения.")
+            region_rows["center"] = region_rows["region"].map(_region_to_center)
+            region_rows["lat"] = region_rows["center"].map(lambda x: x[0] if isinstance(x, tuple) else None)
+            region_rows["lon"] = region_rows["center"].map(lambda x: x[1] if isinstance(x, tuple) else None)
+            ru_map_df = region_rows.dropna(subset=["lat", "lon"]).copy()
+            if ru_map_df.empty:
+                st.caption("Не удалось сопоставить регионы с координатами. Нужно расширить словарь регионов.")
             else:
-                country_rows = country_rows.sort_values("participants", ascending=False)
-                country_rows["lat"] = country_rows["iso3"].map(
-                    lambda k: ISO3_TO_CENTER.get(str(k), (None, None))[0]
+                ru_map_df = ru_map_df.rename(columns={"participants": "size"})
+                st.map(ru_map_df[["lat", "lon", "size"]], size="size", use_container_width=True)
+            missed_regions = region_rows[region_rows["center"].isna()]
+            if not missed_regions.empty:
+                st.caption(
+                    f"Без координат пока: {len(missed_regions)} регион(ов). "
+                    "Можно расширить словарь для полного покрытия."
                 )
-                country_rows["lon"] = country_rows["iso3"].map(
-                    lambda k: ISO3_TO_CENTER.get(str(k), (None, None))[1]
-                )
-                map_df = country_rows.dropna(subset=["lat", "lon"]).copy()
-                if map_df.empty:
-                    st.caption("Нет координат стран для карты (нужно расширить словарь ISO3_TO_CENTER).")
-                else:
-                    map_df = map_df.rename(columns={"participants": "size"})
-                    st.map(map_df[["lat", "lon", "size"]], size="size", use_container_width=True)
 
     gr1, gr2 = st.columns(2)
     with gr1:
@@ -2218,6 +2394,8 @@ def show_participant_dashboard(path: Path, pid: int) -> None:
                 )
                 fig_sport = (
                     alt.Chart(pie_df)
+                    .transform_joinaggregate(total_starts="sum(стартов)")
+                    .transform_calculate(pct="datum.стартов / datum.total_starts")
                     .mark_arc()
                     .encode(
                         theta=alt.Theta("стартов:Q", title="Стартов"),
@@ -2225,10 +2403,11 @@ def show_participant_dashboard(path: Path, pid: int) -> None:
                         tooltip=[
                             alt.Tooltip("вид:N", title="Вид спорта"),
                             alt.Tooltip("стартов:Q", title="Стартов"),
+                            alt.Tooltip("pct:Q", title="Доля", format=".1%"),
                         ],
                     )
                 )
-                labels = fig_sport.mark_text(radius=120).encode(text="стартов:Q")
+                labels = fig_sport.mark_text(radius=128).encode(text=alt.Text("pct:Q", format=".1%"))
                 st.caption("Количество стартов по видам спорта")
                 st.altair_chart((fig_sport + labels).properties(height=280), use_container_width=True)
 
