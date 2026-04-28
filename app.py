@@ -114,6 +114,65 @@ YANDEX_METRICA_SNIPPET = """
 <!-- /Yandex.Metrika counter -->
 """.strip()
 
+YANDEX_METRICA_PARENT_INJECTOR = """
+<script>
+(function () {
+  var COUNTER_ID = 108802154;
+  var SCRIPT_SRC = "https://mc.yandex.ru/metrika/tag.js?id=" + COUNTER_ID;
+  var d = (window.parent && window.parent.document) ? window.parent.document : document;
+  var w = (window.parent && window.parent.window) ? window.parent.window : window;
+  if (!d || !w) return;
+  if (w.__vmMetricaInjected) return;
+  w.__vmMetricaInjected = true;
+
+  if (!w.ym) {
+    w.ym = function () { (w.ym.a = w.ym.a || []).push(arguments); };
+    w.ym.l = 1 * new Date();
+  }
+
+  var scripts = d.getElementsByTagName("script");
+  for (var i = 0; i < scripts.length; i++) {
+    if (scripts[i].src === SCRIPT_SRC) {
+      w.ym(COUNTER_ID, "init", {
+        ssr: true,
+        webvisor: true,
+        clickmap: true,
+        ecommerce: "dataLayer",
+        referrer: d.referrer,
+        url: w.location.href,
+        accurateTrackBounce: true,
+        trackLinks: true
+      });
+      return;
+    }
+  }
+
+  var s = d.createElement("script");
+  s.async = true;
+  s.src = SCRIPT_SRC;
+  var first = scripts[0];
+  if (first && first.parentNode) {
+    first.parentNode.insertBefore(s, first);
+  } else if (d.head) {
+    d.head.appendChild(s);
+  } else if (d.body) {
+    d.body.appendChild(s);
+  }
+
+  w.ym(COUNTER_ID, "init", {
+    ssr: true,
+    webvisor: true,
+    clickmap: true,
+    ecommerce: "dataLayer",
+    referrer: d.referrer,
+    url: w.location.href,
+    accurateTrackBounce: true,
+    trackLinks: true
+  });
+})();
+</script>
+""".strip()
+
 COUNTRY_TO_ISO3: dict[str, str] = {
     "россия": "RUS",
     "российская федерация": "RUS",
@@ -415,12 +474,13 @@ def page_icon_path() -> str | None:
 def inject_yandex_metrica() -> None:
     """
     Вставляет код Метрики максимально рано в рендере страницы.
-    Для новых версий Streamlit используем st.html; иначе fallback через components.html.
+    Добавляет скрипт в parent.document (верхний DOM), чтобы счётчик корректно
+    определялся внешними валидаторами.
     """
+    components.html(YANDEX_METRICA_PARENT_INJECTOR, height=0)
+    # Fallback для окружений, где доступ к parent.document ограничен.
     if hasattr(st, "html"):
         st.html(YANDEX_METRICA_SNIPPET)
-    else:
-        components.html(YANDEX_METRICA_SNIPPET, height=0)
 
 
 def inject_vm_styles() -> None:
