@@ -1853,6 +1853,158 @@ def query_event_section_records_hierarchy(
     return out
 
 
+def query_vm_records_champions_cards(
+    db_path: Path | str,
+    years: list[int] | None,
+    sport: str | None,
+) -> dict[str, dict[str, Any]]:
+    """
+    По той же логике, что «Рекорды ВМ»: серия событий + нормализованная дистанция + пол —
+    считаем действующего рекордсмена (лучшее время в группе) и агрегируем:
+    количество «слотов» рекорда на участника, отдельно для мужчин и женщин.
+
+    Возвращает словарь:
+      males: {'profile_id', 'participant', 'city', 'records'} | пустые значения если никого
+      females: аналогично.
+    Спорт задаётся отдельно (обычно run/ski/bike/trail_run), чтобы считать карточки по видам.
+    """
+    blank = {"profile_id": None, "participant": "", "city": "", "records": 0}
+    sp = str(sport or "").strip().lower()
+    if not sp:
+        return {"males": dict(blank), "females": dict(blank)}
+    sport_filter: list[str] | None = [sp]
+    w, plist = build_competition_filter_sql(years, sport_filter, None)
+    series_expr = (
+        "COALESCE(NULLIF(TRIM(c.title_short), ''), TRIM(c.title))"
+        if _table_has_column(db_path, "competitions", "title_short")
+        else "TRIM(c.title)"
+    )
+    base_rows = q_all(
+        db_path,
+        f"""
+        WITH comp_pool AS (
+            SELECT
+                c.id,
+                c.year,
+                c.title,
+                c.sport,
+                {series_expr} AS title_series
+            FROM competitions c
+            WHERE {w}
+        )
+        SELECT
+            cp.title_series AS event_series,
+            COALESCE(NULLIF(TRIM(d.name), ''), '—') AS distance_name,
+            LOWER(TRIM(COALESCE(p.gender, ''))) AS gender_code,
+            cp.year AS event_year,
+            cp.title AS event_title,
+            r.profile_id AS profile_id,
+            TRIM(COALESCE(p.last_name, '')) AS last_name,
+            TRIM(COALESCE(p.first_name, '')) AS first_name,
+            COALESCE(NULLIF(TRIM(p.city), ''), '—') AS city_raw,
+            COALESCE(NULLIF(TRIM(r.finish_time), ''), '—') AS finish_time,
+            r.finish_time_sec AS finish_time_sec
+        FROM results r
+        INNER JOIN comp_pool cp ON cp.id = r.competition_id
+        INNER JOIN distances d ON d.id = r.distance_id
+        LEFT JOIN profiles p ON p.id = r.profile_id
+        WHERE COALESCE(r.dnf, 0) = 0
+          AND r.finish_time_sec IS NOT NULL
+          AND r.profile_id IS NOT NULL
+          AND LOWER(TRIM(COALESCE(p.gender, ''))) IN ('m', 'f')
+          AND TRIM(COALESCE(cp.title_series, '')) != ''
+        """,
+        tuple(plist),
+    )
+    rules = load_distance_alias_rules()
+    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for row in base_rows:
+        event_series = str(row.get("event_series") or "").strip()
+        if not event_series:
+            continue
+        gender_code = str(row.get("gender_code") or "").strip().lower()
+        if gender_code not in {"m", "f"}:
+            continue
+        d_key, d_label = normalize_distance_by_alias_rules(row.get("distance_name"), rules)
+        item = dict(row)
+        item["distance_label"] = d_label
+        key = (event_series, d_key, gender_code)
+        grouped.setdefault(key, []).append(item)
+
+    def _participant_label(row: dict[str, Any]) -> str:
+        ln = str(row.get("last_name") or "").strip()
+        fn = str(row.get("first_name") or "").strip()
+        lab = (ln + " " + fn).strip()
+        return lab if lab else "—"
+
+    def _winner_for_bucket(items: list[dict[str, Any]]) -> tuple[int | None, str]:
+        items_sorted = sorted(
+            items,
+            key=lambda r: (
+                float(r.get("finish_time_sec") or 0),
+                int(r.get("event_year") or 0),
+                str(r.get("event_title") or ""),
+                int(r.get("profile_id") or 0),
+            ),
+        )
+        wrow = items_sorted[0]
+        pid_raw = wrow.get("profile_id")
+        try:
+            pid = int(pid_raw) if pid_raw is not None else None
+        except (TypeError, ValueError):
+            pid = None
+        raw_city = str(wrow.get("city_raw") or "").strip()
+        city_out = raw_city if raw_city else "—"
+        return pid, city_out
+
+    male_counts: dict[int, tuple[int, str]] = {}
+    female_counts: dict[int, tuple[int, str]] = {}
+    pid_to_label: dict[int, str] = {}
+
+    for (_es, _dk, gc), items in grouped.items():
+        pid, city = _winner_for_bucket(items)
+        if pid is None or pid <= 0:
+            continue
+        wrow_best = sorted(
+            items,
+            key=lambda r: (
+                float(r.get("finish_time_sec") or 0),
+                int(r.get("event_year") or 0),
+                str(r.get("event_title") or ""),
+            ),
+        )[0]
+        pid_to_label[pid] = _participant_label(wrow_best)
+        tgt = male_counts if gc == "m" else female_counts
+        cur_cnt, cur_city = tgt.get(pid, (0, city))
+        tgt[pid] = (cur_cnt + 1, city)
+
+    def _best_from(counts: dict[int, tuple[int, str]]) -> dict[str, Any]:
+        if not counts:
+            return dict(blank)
+        best_pid: int | None = None
+        best_n = -1
+        for pid_val, (n_rec, _c) in counts.items():
+            if n_rec > best_n or (
+                n_rec == best_n
+                and (
+                    best_pid is None or pid_val < best_pid
+                )
+            ):
+                best_n = n_rec
+                best_pid = pid_val
+        if best_pid is None or best_n <= 0:
+            return dict(blank)
+        _city = counts.get(best_pid, (best_n, "—"))[1]
+        return {
+            "profile_id": best_pid,
+            "participant": pid_to_label.get(best_pid, ""),
+            "city": _city,
+            "records": best_n,
+        }
+
+    return {"males": _best_from(male_counts), "females": _best_from(female_counts)}
+
+
 # ── Кубки ─────────────────────────────────────────────────────────────────
 
 

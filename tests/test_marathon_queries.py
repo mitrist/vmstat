@@ -919,3 +919,97 @@ def test_interesting_facts_geography_city_aliases(sample_db: Path, tmp_path: Pat
     geo = mq.query_interesting_facts_geography(sample_db, year=2024, sport="run", limit=20)
     city_names = [str(r.get("city")) for r in geo.get("cities", [])]
     assert "Вологда" in city_names
+
+
+def test_vm_records_champions_cards_counts_by_series_distance_gender(tmp_path: Path) -> None:
+    """Чемпионские карточки: тот же ключ, что hierarchy (серия×дистанция×пол)."""
+    db = tmp_path / "rec_champ.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE TABLE competitions (
+            id INTEGER NOT NULL PRIMARY KEY,
+            title TEXT,
+            title_short TEXT,
+            date TEXT,
+            year INTEGER,
+            sport TEXT
+        );
+        CREATE TABLE distances (
+            id INTEGER NOT NULL PRIMARY KEY,
+            competition_id INTEGER,
+            name TEXT,
+            distance_km REAL,
+            is_relay INTEGER DEFAULT 0
+        );
+        CREATE TABLE profiles (
+            id INTEGER NOT NULL PRIMARY KEY,
+            first_name TEXT,
+            last_name TEXT,
+            second_name TEXT,
+            gender TEXT,
+            age INTEGER,
+            birth_year INTEGER,
+            city TEXT,
+            city_id INTEGER,
+            region TEXT,
+            region_id INTEGER,
+            country TEXT,
+            club TEXT,
+            stat_competitions INTEGER,
+            stat_km INTEGER,
+            stat_marathons INTEGER,
+            stat_first INTEGER,
+            stat_second INTEGER,
+            stat_third INTEGER,
+            raw TEXT
+        );
+        CREATE TABLE results (
+            id INTEGER NOT NULL PRIMARY KEY,
+            competition_id INTEGER,
+            distance_id INTEGER,
+            profile_id INTEGER,
+            dnf INTEGER DEFAULT 0,
+            finish_time_sec REAL,
+            team TEXT,
+            place_abs INTEGER,
+            place_gender INTEGER,
+            place_group INTEGER,
+            group_name TEXT,
+            finish_time TEXT,
+            raw TEXT
+        );
+        INSERT INTO competitions VALUES (
+            1, 'Winter Series Full', 'Winter Series',
+            '2024-02-01', 2024, 'ski'
+        );
+        INSERT INTO distances VALUES (101, 1, '10 km freestyle', 10.0, 0);
+        INSERT INTO distances VALUES (102, 1, '30 km classic', 30.0, 0);
+        INSERT INTO profiles VALUES (
+            1, 'A', 'One', '', 'm', 30, 1994,
+            'CityA', NULL, NULL, NULL, NULL, '',
+            0, 0, 0, 0, 0, 0, '{}'
+        );
+        INSERT INTO profiles VALUES (
+            2, 'B', 'Two', '', 'm', 28, 1996,
+            'CityB', NULL, NULL, NULL, NULL, '',
+            0, 0, 0, 0, 0, 0, '{}'
+        );
+        INSERT INTO results VALUES (
+            1, 1, 101, 1, 0, 2400.0, '', 1, 1, 1, 'OPEN', '00:40:00', '{}'
+        );
+        INSERT INTO results VALUES (
+            2, 1, 102, 2, 0, 7800.0, '', 1, 1, 1, 'OPEN', '02:10:00', '{}'
+        );
+        INSERT INTO results VALUES (
+            3, 1, 102, 1, 0, 7000.0, '', 2, 2, 2, 'OPEN', '02:40:00', '{}'
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+    out = mq.query_vm_records_champions_cards(db, years=None, sport="ski")
+    m = out["males"]
+    assert m["profile_id"] == 1
+    assert int(m["records"]) == 2
+    assert "One" in m["participant"] and "A" in m["participant"]

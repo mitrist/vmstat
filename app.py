@@ -53,12 +53,21 @@ VM_BLUE = "#93BDDD"
 # Подзаголовок к гистограммам на «Общая статистика» (курсив под названием)
 OBSH_BAR_TITLE_NOTE = "Линия тренда - скользящее среднее за 3 года"
 
+RECORDS_VM_CARD_SPORTS: tuple[tuple[str, str], ...] = (
+    ("run", "Бег"),
+    ("ski", "Лыжи"),
+    ("bike", "Вело"),
+    ("trail_run", "Трэйл"),
+)
+
 PAGE_ALIASES: dict[str, str] = {
     "Общая статистика": "general",
     "Интересные факты": "facts",
-    "Событие": "event",
-    "Участник": "participant",
-    "Команда": "team",
+    "География ВМ": "geo",
+    "События": "event",
+    "Рекорды ВМ": "records",
+    "Участники": "participant",
+    "Команды": "team",
     "Кубки": "cups",
 }
 
@@ -72,19 +81,25 @@ SECTION_SUBMENUS: dict[str, list[tuple[str, str]]] = {
         ("facts-day", "Факт дня"),
         ("facts-collection", "Подборка фактов"),
         ("facts-charts", "Графики"),
-        ("facts-geo", "География"),
     ],
-    "Событие": [
+    "География ВМ": [
+        ("geo-map", "Карта"),
+        ("geo-tables", "Таблицы"),
+    ],
+    "События": [
         ("event-list", "События"),
         ("event-records", "Рекорды"),
         ("event-detail", "Детали события"),
     ],
-    "Участник": [
+    "Рекорды ВМ": [
+        ("records-vm", "Рекорды ВМ"),
+    ],
+    "Участники": [
         ("participant-search", "Поиск"),
         ("participant-kpi", "KPI"),
         ("participant-tabs", "Вкладки"),
     ],
-    "Команда": [
+    "Команды": [
         ("team-kpi", "KPI"),
         ("team-tabs", "Вкладки"),
     ],
@@ -981,12 +996,14 @@ def _scroll_to_section_once(current_page: str) -> None:
 
 
 def render_sidebar_text_nav(pages: tuple[str, ...], current: str) -> None:
-    """Основное меню + раскрываемые подпункты перехода к блокам страницы."""
+    """Рендерит только основные пункты меню в сайдбаре."""
     icons = {
         "Общая статистика": "📊",
-        "Событие": "🏁",
-        "Участник": "👤",
-        "Команда": "🛡️",
+        "География ВМ": "🗺️",
+        "События": "🏁",
+        "Рекорды ВМ": "🥇",
+        "Участники": "👤",
+        "Команды": "🛡️",
         "Кубки": "🏆",
         "Интересные факты": "✨",
     }
@@ -1000,19 +1017,6 @@ def render_sidebar_text_nav(pages: tuple[str, ...], current: str) -> None:
             parts.append(f'<p class="vm-sidebar-here">{esc}</p>')
         else:
             parts.append(f'<p><a href="{base_link}" target="_self">{esc}</a></p>')
-        sub = SECTION_SUBMENUS.get(title) or []
-        if sub:
-            parts.append(
-                f'<details {"open" if title == current else ""} style="margin:-4px 0 6px 18px;">'
-                f'<summary style="font-size:0.82rem;color:{VM_MUTED};cursor:pointer;">Разделы</summary>'
-            )
-            for sec_id, sec_label in sub:
-                parts.append(
-                    f'<p style="margin:2px 0 2px 10px;">'
-                    f'<a href="{base_link}&section={html.escape(sec_id)}" target="_self">{html.escape(sec_label)}</a>'
-                    f"</p>"
-                )
-            parts.append("</details>")
     parts.append("</div>")
     st.sidebar.markdown("".join(parts), unsafe_allow_html=True)
 
@@ -1487,46 +1491,122 @@ def page_interesting_facts() -> None:
         t = c.mark_text(align="left", baseline="middle", dx=4).encode(text="Участников:Q")
         st.altair_chart((c + t).properties(height=500), use_container_width=True)
 
-    _section_anchor("facts-geo")
-    st.subheader("География")
-    city_rows = geo.get("cities") or []
-    region_rows = pd.DataFrame(geo.get("regions") or [])
-    st.caption("Карта России по регионам: круги показывают регионы, откуда были участники.")
-    if region_rows.empty:
-        st.caption("Нет данных по регионам для построения карты России.")
-    else:
-        region_rows = region_rows[region_rows["region"] != "—"].copy()
-        if region_rows.empty:
-            st.caption("Нет валидных названий регионов для карты России.")
-        else:
-            region_rows["center"] = region_rows["region"].map(_region_to_center)
-            region_rows["lat"] = region_rows["center"].map(lambda x: x[0] if isinstance(x, tuple) else None)
-            region_rows["lon"] = region_rows["center"].map(lambda x: x[1] if isinstance(x, tuple) else None)
-            ru_map_df = region_rows.dropna(subset=["lat", "lon"]).copy()
-            if ru_map_df.empty:
-                st.caption("Не удалось сопоставить регионы с координатами. Нужно расширить словарь регионов.")
-            else:
-                ru_map_df = ru_map_df.rename(columns={"participants": "size"})
-                st.map(ru_map_df[["lat", "lon", "size"]], size="size", use_container_width=True)
-            missed_regions = region_rows[region_rows["center"].isna()]
-            if not missed_regions.empty:
-                st.caption(
-                    f"Без координат пока: {len(missed_regions)} регион(ов). "
-                    "Можно расширить словарь для полного покрытия."
-                )
+def page_vm_geography() -> None:
+    st.header("География ВМ")
+    st.info("Страница в разработке")
 
-    gr1, gr2 = st.columns(2)
-    with gr1:
-        st.markdown("**Города**")
-        st.dataframe(pd.DataFrame(city_rows), use_container_width=True, hide_index=True)
-    with gr2:
-        st.markdown("**Регионы**")
-        st.dataframe(pd.DataFrame(geo.get("regions") or []), use_container_width=True, hide_index=True)
+
+def page_vm_records() -> None:
+    _section_anchor("records-vm")
+    st.header("Рекорды ВМ")
+    path = db_path()
+    if not require_db(path):
+        return
+
+    years_all = mq.query_distinct_years(path)
+    sports_all = mq.query_distinct_sports(path)
+
+    st.markdown(
+        f'<p style="color:{VM_TEXT};font-weight:600;margin:0 0 6px 0;">Год</p>'
+        f'<p style="color:{VM_MUTED};font-size:0.85rem;margin:0 0 6px 0;">'
+        f"Ничего не выбрано — учитываются все годы.</p>",
+        unsafe_allow_html=True,
+    )
+    if years_all:
+        sy = st.pills(
+            "Год",
+            options=years_all,
+            selection_mode="multi",
+            default=[],
+            key="records_vm_pills_years",
+            label_visibility="collapsed",
+        )
+        years_filter = list(sy) if sy else None
+    else:
+        years_filter = None
+
+    st.markdown(
+        f'<p style="color:{VM_TEXT};font-weight:600;margin:0 0 6px 0;">Вид спорта</p>'
+        f'<p style="color:{VM_MUTED};font-size:0.85rem;margin:0 0 6px 0;">'
+        f"Ничего не выбрано — учитываются все виды спорта.</p>",
+        unsafe_allow_html=True,
+    )
+    if sports_all:
+        ss = st.pills(
+            "Вид спорта",
+            options=sports_all,
+            selection_mode="multi",
+            default=[],
+            key="records_vm_pills_sports",
+            label_visibility="collapsed",
+        )
+        sports_filter = list(ss) if ss else None
+    else:
+        sports_filter = None
+
+    st.subheader("Лидеры по числу действующих рекордов")
+    for code, label in RECORDS_VM_CARD_SPORTS:
+        hdr = f"{label} ({code})"
+        st.markdown(f"##### {hdr}")
+        ch = mq.query_vm_records_champions_cards(path, years_filter, code)
+        col_m, col_f = st.columns(2)
+        male = ch.get("males") or {}
+        female = ch.get("females") or {}
+        with col_m:
+            st.markdown(f'<p style="color:{VM_MUTED};font-size:0.88rem;margin:0 0 6px 0;">Мужские рекорды</p>', unsafe_allow_html=True)
+            nm = html.escape(str(male.get("participant") or "").strip())
+            ct = html.escape(str(male.get("city") or "").strip())
+            rc = male.get("records")
+            try:
+                nrec = int(rc) if rc is not None else 0
+            except (TypeError, ValueError):
+                nrec = 0
+            if nm and nrec > 0:
+                st.markdown(
+                    f"<p style='margin:0 0 4px 0;'><strong>{nm}</strong></p>"
+                    f"<p style='margin:0 0 2px 0;color:{VM_MUTED};font-size:0.92rem;'>{ct}</p>"
+                    f"<p style='margin:0;'>Действующих рекордов: <strong>{nrec}</strong></p>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.caption("Нет данных для расчёта.")
+        with col_f:
+            st.markdown(f'<p style="color:{VM_MUTED};font-size:0.88rem;margin:0 0 6px 0;">Женские рекорды</p>', unsafe_allow_html=True)
+            nm = html.escape(str(female.get("participant") or "").strip())
+            ct = html.escape(str(female.get("city") or "").strip())
+            rc = female.get("records")
+            try:
+                nrec_f = int(rc) if rc is not None else 0
+            except (TypeError, ValueError):
+                nrec_f = 0
+            if nm and nrec_f > 0:
+                st.markdown(
+                    f"<p style='margin:0 0 4px 0;'><strong>{nm}</strong></p>"
+                    f"<p style='margin:0 0 2px 0;color:{VM_MUTED};font-size:0.92rem;'>{ct}</p>"
+                    f"<p style='margin:0;'>Действующих рекордов: <strong>{nrec_f}</strong></p>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.caption("Нет данных для расчёта.")
+
+    st.subheader("Рекорды ВМ")
+    rec_rows = mq.query_event_section_records_hierarchy(
+        path, years_filter, sports_filter, top_n=5
+    )
+    if not rec_rows:
+        st.caption("Нет данных для построения рекордов по выбранным фильтрам.")
+    else:
+        st.caption("Иерархия: **событие → дистанция → топ-5 мужчин и топ-5 женщин (по всем годам)**.")
+        frag = _event_records_hierarchy_html(rec_rows)
+        if hasattr(st, "html"):
+            st.html(frag)
+        else:
+            st.markdown(frag, unsafe_allow_html=True)
 
 
 def page_event() -> None:
     _section_anchor("event-list")
-    st.header("Событие")
+    st.header("События")
     path = db_path()
     if not require_db(path):
         return
@@ -2188,7 +2268,7 @@ def _team_scoring_hierarchy_html(
 
 def page_participant() -> None:
     _section_anchor("participant-search")
-    st.header("Участник")
+    st.header("Участники")
     path = db_path()
     if not require_db(path):
         return
@@ -2659,7 +2739,7 @@ def show_participant_dashboard(path: Path, pid: int) -> None:
 
 
 def page_team() -> None:
-    st.header("Команда")
+    st.header("Команды")
     st.caption(
         "Команда задаётся полем **team** в результатах соревнований. "
         "Страница показывает KPI, состав, события, срезы, географию, тренды и кубковые блоки."
@@ -3417,9 +3497,11 @@ def main() -> None:
     pages: list[str] = [
         "Общая статистика",
         "Интересные факты",
-        "Событие",
-        "Участник",
-        "Команда",
+        "География ВМ",
+        "События",
+        "Рекорды ВМ",
+        "Участники",
+        "Команды",
         "Кубки",
     ]
     PAGES: tuple[str, ...] = tuple(pages)
@@ -3458,11 +3540,15 @@ def main() -> None:
         page_general_statistics()
     elif page == "Интересные факты":
         page_interesting_facts()
-    elif page == "Событие":
+    elif page == "География ВМ":
+        page_vm_geography()
+    elif page == "События":
         page_event()
-    elif page == "Участник":
+    elif page == "Рекорды ВМ":
+        page_vm_records()
+    elif page == "Участники":
         page_participant()
-    elif page == "Команда":
+    elif page == "Команды":
         page_team()
     elif page == ADMIN_PANEL_PAGE:
         page_admin()
