@@ -1013,3 +1013,56 @@ def test_vm_records_champions_cards_counts_by_series_distance_gender(tmp_path: P
     assert m["profile_id"] == 1
     assert int(m["records"]) == 2
     assert "One" in m["participant"] and "A" in m["participant"]
+
+
+def test_query_event_series_title_short_ranking_only_repeats(tmp_path: Path) -> None:
+    db = tmp_path / "series_rank.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE TABLE competitions (
+            id INTEGER NOT NULL PRIMARY KEY,
+            title TEXT,
+            title_short TEXT,
+            date TEXT,
+            year INTEGER,
+            sport TEXT
+        );
+        CREATE TABLE competition_stats (
+            competition_id INTEGER PRIMARY KEY,
+            total_members INTEGER,
+            male INTEGER,
+            female INTEGER,
+            teams INTEGER,
+            regions INTEGER,
+            dnf INTEGER,
+            raw TEXT
+        );
+        INSERT INTO competitions VALUES (
+            1, 'Marathon Full 2024', 'City Marathon Series', '2024-06-01', 2024, 'run'
+        );
+        INSERT INTO competitions VALUES (
+            2, 'Marathon Full 2023', 'City Marathon Series', '2023-06-01', 2023, 'run'
+        );
+        INSERT INTO competitions VALUES (
+            3, 'One-off Race', 'Unique Once', '2024-07-01', 2024, 'run'
+        );
+        INSERT INTO competition_stats
+            (competition_id, total_members, male, female, teams, regions, dnf, raw)
+        VALUES (1, 100, 50, 50, 10, 5, 0, NULL);
+        INSERT INTO competition_stats
+            (competition_id, total_members, male, female, teams, regions, dnf, raw)
+        VALUES (2, 40, 20, 20, 6, 4, 0, NULL);
+        """
+    )
+    conn.commit()
+    conn.close()
+    rows = mq.query_event_series_title_short_ranking(db, years=None, sports=None)
+    titles = {(r["series_title"], int(r["editions"])) for r in rows}
+    assert ("City Marathon Series", 2) in titles
+    assert not any(str(r["series_title"]) == "Unique Once" for r in rows)
+    cms = next(r for r in rows if r["series_title"] == "City Marathon Series")
+    assert cms["years_csv"] == "2023, 2024"
+    assert cms["sports_csv"] == "run"
+    assert int(cms["participants_sum"]) == 140
+    assert int(cms["teams_sum"]) == 16

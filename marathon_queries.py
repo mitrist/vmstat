@@ -1657,6 +1657,95 @@ def query_event_section_cards(
     }
 
 
+def query_event_series_title_short_ranking(
+    db_path: Path | str,
+    years: list[int] | None,
+    sports: list[str] | None,
+) -> list[dict[str, Any]]:
+    """
+    Рейтинг серий по полю ``competitions.title_short``:
+    только серии с **более чем одной** строкой в выборке; те же фильтры года/вид спорта,
+    что раздел «События».
+
+    По каждой серии возвращает:
+      ``series_title``, ``editions`` (число событий),
+      ``years_csv`` (уникальные годы через запятую по возрастанию),
+      ``sports_csv`` (уникальные виды спорта через запятую),
+      ``participants_sum``, ``teams_sum`` — суммы по полям из ``competition_stats``.
+
+    Если колонки ``title_short`` в таблице нет — пустой список.
+    """
+    from collections import defaultdict
+
+    if not _table_has_column(db_path, "competitions", "title_short"):
+        return []
+    w, plist = build_competition_filter_sql(years, sports, None)
+    rows = q_all(
+        db_path,
+        f"""
+        SELECT TRIM(c.title_short) AS series_title,
+               c.year AS year,
+               c.sport AS sport,
+               COALESCE(cs.total_members, 0) AS total_members,
+               COALESCE(cs.teams, 0) AS teams
+        FROM competitions c
+        LEFT JOIN competition_stats cs ON cs.competition_id = c.id
+        WHERE {w}
+          AND TRIM(COALESCE(c.title_short, '')) != ''
+        """,
+        tuple(plist),
+    )
+    editions: dict[str, int] = defaultdict(int)
+    years_by: dict[str, set[int]] = defaultdict(set)
+    sports_by: dict[str, set[str]] = defaultdict(set)
+    mem_by: dict[str, int] = defaultdict(int)
+    teams_by: dict[str, int] = defaultdict(int)
+
+    for r in rows:
+        key = str(r.get("series_title") or "").strip()
+        if not key:
+            continue
+        editions[key] += 1
+        y = r.get("year")
+        if y is not None:
+            try:
+                years_by[key].add(int(y))
+            except (TypeError, ValueError):
+                pass
+        sp = str(r.get("sport") or "").strip()
+        if sp:
+            sports_by[key].add(sp)
+        try:
+            mem_by[key] += int(r.get("total_members") or 0)
+        except (TypeError, ValueError):
+            pass
+        try:
+            teams_by[key] += int(r.get("teams") or 0)
+        except (TypeError, ValueError):
+            pass
+
+    out: list[dict[str, Any]] = []
+    for key, n in editions.items():
+        if n <= 1:
+            continue
+        ys = sorted(years_by[key])
+        years_csv = ", ".join(str(x) for x in ys)
+        sps = sorted(sports_by[key])
+        sports_csv = ", ".join(sps) if sps else "—"
+        out.append(
+            {
+                "series_title": key,
+                "editions": n,
+                "years_csv": years_csv,
+                "sports_csv": sports_csv,
+                "participants_sum": mem_by[key],
+                "teams_sum": teams_by[key],
+            }
+        )
+    out.sort(key=lambda x: (-int(x.get("editions") or 0), str(x.get("series_title") or "").casefold()))
+    return out
+
+
 def query_event_section_events_table(
     db_path: Path | str,
     years: list[int] | None,

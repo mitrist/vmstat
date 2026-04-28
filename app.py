@@ -88,7 +88,7 @@ SECTION_SUBMENUS: dict[str, list[tuple[str, str]]] = {
     ],
     "События": [
         ("event-list", "События"),
-        ("event-records", "Рекорды"),
+        ("event-series", "Серии событий"),
         ("event-detail", "Детали события"),
     ],
     "Рекорды ВМ": [
@@ -1605,7 +1605,6 @@ def page_vm_records() -> None:
 
 
 def page_event() -> None:
-    _section_anchor("event-list")
     st.header("События")
     path = db_path()
     if not require_db(path):
@@ -1665,27 +1664,43 @@ def page_event() -> None:
     with c5:
         metric_plaque("Стран (уник.)", cards.get("countries_distinct", 0))
 
+    _section_anchor("event-series")
+    st.subheader("Серии событий")
+    series_rank = mq.query_event_series_title_short_ranking(path, years_filter, sports_filter)
+    if not series_rank:
+        st.caption(
+            "Нет серий с повторными выпусками по **title_short** в текущих фильтрах, "
+            "либо в таблице **competitions** нет колонки **title_short**."
+        )
+    else:
+        sdf = pd.DataFrame(series_rank)[
+            [
+                "series_title",
+                "editions",
+                "years_csv",
+                "sports_csv",
+                "participants_sum",
+                "teams_sum",
+            ]
+        ].rename(
+            columns={
+                "series_title": "Серия",
+                "editions": "Проведено раз",
+                "years_csv": "Года проведения",
+                "sports_csv": "Вид спорта",
+                "participants_sum": "Количество участников",
+                "teams_sum": "Количество команд",
+            }
+        )
+        st.dataframe(sdf, use_container_width=True, hide_index=True)
+
+    _section_anchor("event-list")
     st.subheader("События")
     event_rows = mq.query_event_section_events_table(path, years_filter, sports_filter)
     if not event_rows:
         st.caption("Нет строк для выбранных фильтров.")
     else:
         st.dataframe(pd.DataFrame(event_rows), use_container_width=True, hide_index=True)
-
-    _section_anchor("event-records")
-    st.subheader("Рекорды события")
-    rec_rows = mq.query_event_section_records_hierarchy(
-        path, years_filter, sports_filter, top_n=5
-    )
-    if not rec_rows:
-        st.caption("Нет данных для построения рекордов по выбранным фильтрам.")
-    else:
-        st.caption("Иерархия: **событие → дистанция → топ-5 мужчин и топ-5 женщин (по всем годам)**.")
-        frag = _event_records_hierarchy_html(rec_rows)
-        if hasattr(st, "html"):
-            st.html(frag)
-        else:
-            st.markdown(frag, unsafe_allow_html=True)
 
     _section_anchor("event-detail")
     st.subheader("Детали выбранного события")
