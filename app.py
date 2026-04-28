@@ -1990,57 +1990,116 @@ def show_participant_dashboard(path: Path, pid: int) -> None:
     default_y = cy if cy in year_opts else year_opts[0]
 
     sk = f"participant_year_filter_{pid}"
-    if sk not in st.session_state or st.session_state[sk] not in year_opts:
-        st.session_state[sk] = default_y
+    current_years = st.session_state.get(sk)
+    if not isinstance(current_years, list):
+        current_years = [default_y]
+    current_years = [int(y) for y in current_years if int(y) in year_opts]
+    st.session_state[sk] = current_years
 
+    picked_years = st.multiselect(
+        "Год",
+        options=year_opts,
+        default=st.session_state[sk],
+        key=f"{sk}_multiselect",
+        help="Можно выбрать несколько лет (Ctrl) или оставить пусто — тогда используются все годы.",
+    )
+    years_for_query: list[int] | None = [int(y) for y in picked_years] if picked_years else None
+
+    # Общий фильтр по видам спорта в разделе «Участник» (исключая service).
+    all_events_for_sports = mq.query_profile_events_table(path, pid, years=None, include_dnf=True, limit=5000)
+    sport_opts = sorted(
+        {
+            str(r.get("вид") or "").strip()
+            for r in all_events_for_sports
+            if str(r.get("вид") or "").strip()
+            and str(r.get("вид") or "").strip().casefold() != "service"
+        }
+    )
+    sport_pill_opts = ["Все"] + sport_opts
+    sport_key = f"participant_sport_filter_{pid}"
+    if sport_key not in st.session_state or st.session_state[sport_key] not in sport_pill_opts:
+        st.session_state[sport_key] = "Все"
     st.markdown(
-        f'<p style="color:{VM_TEXT};font-weight:600;margin:16px 0 6px 0;">Год</p>'
-        f'<p style="color:{VM_MUTED};font-size:0.85rem;margin:0 0 8px 0;">'
-        f"Фильтрует KPI и вкладки профиля участника.</p>",
+        f'<p style="color:{VM_TEXT};font-weight:600;margin:14px 0 6px 0;">Вид спорта</p>',
         unsafe_allow_html=True,
     )
     st.pills(
-        "Год",
-        options=year_opts,
+        "Вид спорта",
+        options=sport_pill_opts,
         selection_mode="single",
-        key=sk,
+        key=sport_key,
         label_visibility="collapsed",
     )
-    y_filter = int(st.session_state[sk])
+    sport_pick = str(st.session_state.get(sport_key, "Все"))
+    sports_for_query: list[str] | None = sport_opts if sport_pick == "Все" else [sport_pick]
 
-    kpi_all = mq.query_profile_kpi_all_time(path, pid)
-    kpi_year = mq.query_profile_kpi_year(path, pid, y_filter)
-    active_years_count = len(set(db_years) | set(raw_years))
-    stat_km_profile = _stat_int(p.get("stat_km"))
-    stat_first_profile = _stat_int(p.get("stat_first"))
-    stat_second_profile = _stat_int(p.get("stat_second"))
-    stat_third_profile = _stat_int(p.get("stat_third"))
+    def _filter_participant_df_by_sport(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty or "вид" not in df.columns:
+            return df
+        ds = df.copy()
+        ds["вид"] = ds["вид"].fillna("").astype(str).str.strip()
+        ds = ds[ds["вид"].str.casefold() != "service"]
+        if sports_for_query:
+            ds = ds[ds["вид"].isin(sports_for_query)]
+        return ds
+
+    kpi_rows = mq.query_profile_events_table(
+        path,
+        pid,
+        years=years_for_query,
+        sports=sports_for_query,
+        include_dnf=True,
+        limit=5000,
+    )
+    kpi_df = _filter_participant_df_by_sport(pd.DataFrame(kpi_rows))
+    active_years_count = (
+        int(kpi_df["год"].nunique()) if (not kpi_df.empty and "год" in kpi_df.columns) else 0
+    )
+    starts_total = int(len(kpi_df))
+    finishes_total = (
+        int((kpi_df.get("статус", pd.Series(dtype="object")) == "finish").sum()) if not kpi_df.empty else 0
+    )
+    dnf_total = (
+        int((kpi_df.get("статус", pd.Series(dtype="object")) == "dnf").sum()) if not kpi_df.empty else 0
+    )
+    events_distinct = int(kpi_df["событие"].nunique()) if (not kpi_df.empty and "событие" in kpi_df.columns) else 0
+    distances_distinct = (
+        int(kpi_df.loc[kpi_df["статус"] == "finish", "дистанция"].replace("", pd.NA).dropna().nunique())
+        if (not kpi_df.empty and {"статус", "дистанция"}.issubset(kpi_df.columns))
+        else 0
+    )
+    km_total = (
+        float(pd.to_numeric(kpi_df.loc[kpi_df["статус"] == "finish", "км"], errors="coerce").fillna(0).sum())
+        if (not kpi_df.empty and {"статус", "км"}.issubset(kpi_df.columns))
+        else 0.0
+    )
+    stat_first_profile = (
+        int((pd.to_numeric(kpi_df.get("место_абс"), errors="coerce") == 1).sum()) if not kpi_df.empty else 0
+    )
+    stat_second_profile = (
+        int((pd.to_numeric(kpi_df.get("место_абс"), errors="coerce") == 2).sum()) if not kpi_df.empty else 0
+    )
+    stat_third_profile = (
+        int((pd.to_numeric(kpi_df.get("место_абс"), errors="coerce") == 3).sum()) if not kpi_df.empty else 0
+    )
     _section_anchor("participant-kpi")
     st.markdown("##### KPI участника")
-    mode = st.segmented_control(
-        "Режим KPI",
-        options=["Все годы", "Год"],
-        selection_mode="single",
-        default="Все годы",
-        key=f"part_kpi_mode_{pid}",
-    )
-    kv = kpi_all if mode == "Все годы" else kpi_year
     k1, k2, k3, k4, k5 = st.columns(5, gap="small")
     with k1:
-        metric_plaque("Старты", _stat_int(kv.get("starts_total")))
+        metric_plaque("Старты", starts_total)
     with k2:
-        metric_plaque("Финиши", _stat_int(kv.get("finishes_total")))
+        metric_plaque("Финиши", finishes_total)
     with k3:
         metric_plaque("Активных лет", active_years_count)
     with k4:
-        metric_plaque("Км", stat_km_profile)
+        metric_plaque("Км", int(round(km_total)))
     with k5:
-        metric_plaque("DNF", _stat_int(kv.get("dnf_total")))
+        metric_plaque("DNF", dnf_total)
     k6, k7, k8, k9, k10 = st.columns(5, gap="small")
     with k6:
-        metric_plaque("Событий", _stat_int(kv.get("events_distinct")))
+        metric_plaque("Событий", events_distinct)
     with k7:
-        metric_plaque("Дистанций (уник.)", _stat_int(kv.get("distances_distinct")))
+        metric_plaque("Дистанций (уник.)", distances_distinct)
     with k8:
         metric_plaque("Первых мест", stat_first_profile)
     with k9:
@@ -2067,8 +2126,11 @@ def show_participant_dashboard(path: Path, pid: int) -> None:
             f_st.update_layout(plot_bgcolor="white", paper_bgcolor="white", font=dict(color=VM_TEXT), xaxis_type="category")
             st.plotly_chart(f_st, use_container_width=True)
         with g2:
-            sport_rows = mq.query_profile_events_table(path, pid, years=None, include_dnf=True, limit=5000)
+            sport_rows = mq.query_profile_events_table(
+                path, pid, years=None, sports=sports_for_query, include_dnf=True, limit=5000
+            )
             sport_df = pd.DataFrame(sport_rows)
+            sport_df = _filter_participant_df_by_sport(sport_df)
             if sport_df.empty:
                 st.caption("Нет данных по видам спорта.")
             else:
@@ -2107,18 +2169,18 @@ def show_participant_dashboard(path: Path, pid: int) -> None:
     tab_quality = tt[4] if len(tt) > 4 else None
 
     with tab_ev:
-        all_rows = mq.query_profile_events_table(path, pid, years=None, include_dnf=True)
+        all_rows = mq.query_profile_events_table(
+            path,
+            pid,
+            years=None,
+            sports=sports_for_query,
+            include_dnf=True,
+        )
         all_df = pd.DataFrame(all_rows)
+        all_df = _filter_participant_df_by_sport(all_df)
         if all_df.empty:
             st.caption("Нет стартов по участнику.")
             return
-        sports_opts = sorted(
-            {
-                str(x).strip()
-                for x in all_df.get("вид", pd.Series(dtype="object")).tolist()
-                if str(x).strip()
-            }
-        )
         dist_opts = sorted(
             {
                 str(x).strip()
@@ -2128,7 +2190,7 @@ def show_participant_dashboard(path: Path, pid: int) -> None:
         )
         f1, f2, f3 = st.columns(3)
         with f1:
-            sp = st.multiselect("Вид спорта", options=sports_opts, default=[], key=f"part_sports_{pid}")
+            st.caption(f"Фильтр вида спорта: **{sport_pick}**")
         with f2:
             dd = st.multiselect("Дистанция", options=dist_opts, default=[], key=f"part_dists_{pid}")
         with f3:
@@ -2137,42 +2199,53 @@ def show_participant_dashboard(path: Path, pid: int) -> None:
             mq.query_profile_events_table(
                 path,
                 pid,
-                years=[y_filter],
-                sports=sp or None,
+                years=years_for_query,
+                sports=sports_for_query,
                 distance_labels=dd or None,
                 include_dnf=include_dnf,
             )
         )
+        ev_df = _filter_participant_df_by_sport(ev_df)
         if ev_df.empty:
-            st.caption(f"Нет стартов за **{y_filter}** с выбранными фильтрами.")
+            st.caption("Нет стартов с выбранными фильтрами.")
         else:
             st.dataframe(ev_df, use_container_width=True, hide_index=True)
 
     with tab_rec:
         pb_all = pd.DataFrame(mq.query_profile_personal_bests(path, pid, year=None))
-        pb_year = pd.DataFrame(mq.query_profile_personal_bests(path, pid, year=y_filter))
+        pb_year = pb_all.copy()
+        if years_for_query and "год" in pb_year.columns:
+            pb_year = pb_year[pb_year["год"].isin(years_for_query)]
+        pb_all = _filter_participant_df_by_sport(pb_all)
+        pb_year = _filter_participant_df_by_sport(pb_year)
         st.markdown("##### Личные рекорды (PB, все годы)")
         if pb_all.empty:
             st.caption("Нет корректных финишей для расчёта PB.")
         else:
             st.dataframe(pb_all, use_container_width=True, hide_index=True)
-        st.markdown(f"##### Лучшие результаты за {y_filter} (SB)")
+        st.markdown("##### Лучшие результаты по выбранным годам (SB)")
         if pb_year.empty:
-            st.caption(f"Нет корректных финишей за {y_filter}.")
+            st.caption("Нет корректных финишей по выбранным годам.")
         else:
             st.dataframe(pb_year, use_container_width=True, hide_index=True)
 
     with tab_cup:
-        cup_df = pd.DataFrame(mq.query_profile_cup_rows_for_year(path, pid, y_filter))
+        cup_rows: list[dict[str, Any]] = []
+        years_for_cups = years_for_query if years_for_query else year_opts
+        for yy in years_for_cups:
+            cup_rows.extend(mq.query_profile_cup_rows_for_year(path, pid, int(yy)))
+        cup_df = pd.DataFrame(cup_rows)
+        cup_df = _filter_participant_df_by_sport(cup_df)
         if cup_df.empty:
             st.caption(
-                f"Нет строк в **profile_cup_results** за **{y_filter}**. "
+                "Нет строк в **profile_cup_results** по выбранным годам. "
                 "При необходимости: `python fill_profile_cup_results.py`."
             )
         else:
             st.dataframe(cup_df, use_container_width=True, hide_index=True)
     with tab_team:
         team_df = pd.DataFrame(mq.query_profile_team_summary(path, pid))
+        team_df = _filter_participant_df_by_sport(team_df)
         if team_df.empty:
             st.caption("Нет финишей с непустой командой.")
         else:
