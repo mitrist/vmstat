@@ -1,0 +1,35 @@
+{
+  "updated_at_utc": "2026-04-28T00:00:00+00:00",
+  "rules": [
+    {
+      "alias": "спб",
+      "canonical_key": "sankt_peterburg",
+      "canonical_label": "Санкт-Петербург",
+      "active": true
+    },
+    {
+      "alias": "санкт петербург",
+      "canonical_key": "sankt_peterburg",
+      "canonical_label": "Санкт-Петербург",
+      "active": true
+    },
+    {
+      "alias": "питер",
+      "canonical_key": "sankt_peterburg",
+      "canonical_label": "Санкт-Петербург",
+      "active": true
+    },
+    {
+      "alias": "мск",
+      "canonical_key": "moskva",
+      "canonical_label": "Москва",
+      "active": true
+    },
+    {
+      "alias": "г москва",
+      "canonical_key": "moskva",
+      "canonical_label": "Москва",
+      "active": true
+    }
+  ]
+}

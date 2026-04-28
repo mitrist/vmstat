@@ -863,3 +863,59 @@ def test_profile_event_series_rows_filters(sample_db: Path) -> None:
     )
     assert len(rows_filtered) >= 1
     assert all(r.get("_series_short") == "Spring Half" for r in rows_filtered)
+
+
+def test_normalize_city_by_alias_rules_basic() -> None:
+    rules = [
+        {
+            "alias": "спб",
+            "canonical_key": "sankt_peterburg",
+            "canonical_label": "Санкт-Петербург",
+            "active": True,
+        }
+    ]
+    key, label = mq.normalize_city_by_alias_rules("СПБ", rules=rules)
+    assert key == "sankt_peterburg"
+    assert label == "Санкт-Петербург"
+
+
+def test_normalize_city_by_reference_csv(tmp_path: Path, monkeypatch) -> None:
+    city_ref = tmp_path / "city.csv"
+    city_ref.write_text(
+        "city,region,geo_lat,geo_lon,population,capital_marker,fias_id\n"
+        "Вологда,Вологодская,59.22,39.88,300000,2,fias-vologda\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CITY_REFERENCE_FILE", str(city_ref))
+    monkeypatch.setenv("CITY_ALIASES_FILE", str(tmp_path / "missing_aliases.json"))
+    key, label = mq.normalize_city_by_alias_rules("г Вологда", "Вологодская")
+    assert key.startswith("cityref::")
+    assert label == "Вологда"
+
+
+def test_interesting_facts_geography_city_aliases(sample_db: Path, tmp_path: Path, monkeypatch) -> None:
+    city_alias_file = tmp_path / "city_aliases.json"
+    city_alias_file.write_text(
+        """{
+  "rules": [
+    {"alias":"Vologda", "canonical_key":"vologda", "canonical_label":"Вологда", "active":true}
+  ]
+}""",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CITY_ALIASES_FILE", str(city_alias_file))
+
+    conn = sqlite3.connect(sample_db)
+    conn.executescript(
+        """
+        INSERT INTO profiles VALUES (110, 'A', 'B', '', 'm', 30, 1994, 'Vologda',
+            NULL, 'VO', 36, 'Россия', '', 0, 0, 0, 0, 0, 0, '{}');
+        INSERT INTO results VALUES (60, 1, 10, 110, 0, 3900.0, 'Team A', 10, 9, 5, 'M40', '01:05:00', '{}');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    geo = mq.query_interesting_facts_geography(sample_db, year=2024, sport="run", limit=20)
+    city_names = [str(r.get("city")) for r in geo.get("cities", [])]
+    assert "Вологда" in city_names

@@ -3196,6 +3196,52 @@ def page_admin() -> None:
             st.success("Справочник сохранён.")
             st.rerun()
 
+    _section_anchor("admin-city-aliases")
+    st.subheader("Справочник алиасов городов")
+    st.caption(
+        "Используется для нормализации написаний городов в географических блоках "
+        "(Интересные факты, Команда, Общая статистика)."
+    )
+    src_city = mq.city_aliases_file_path()
+    st.code(str(src_city), language=None)
+
+    city_rows = mq.load_city_alias_rules()
+    if not city_rows:
+        city_rows = mq.default_city_alias_rules()
+    df_city = pd.DataFrame(city_rows)
+    for col in ("alias", "canonical_key", "canonical_label", "active"):
+        if col not in df_city.columns:
+            df_city[col] = "" if col != "active" else True
+    df_city = df_city[["alias", "canonical_key", "canonical_label", "active"]]
+
+    edited_city = st.data_editor(
+        df_city,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="dynamic",
+        key="admin_city_aliases_editor",
+        column_config={
+            "alias": st.column_config.TextColumn("Alias (как в исходных данных)"),
+            "canonical_key": st.column_config.TextColumn("Канонический key"),
+            "canonical_label": st.column_config.TextColumn("Название города в UI"),
+            "active": st.column_config.CheckboxColumn("Активно"),
+        },
+    )
+    c1_city, c2_city = st.columns([1, 3])
+    with c1_city:
+        save_city_clicked = st.button("Сохранить справочник городов", key="admin_save_city_aliases")
+    with c2_city:
+        st.caption("Один alias не может указывать на разные canonical_key.")
+    if save_city_clicked:
+        rows = edited_city.to_dict(orient="records")
+        errs = mq.save_city_alias_rules(rows)
+        if errs:
+            for e in errs:
+                st.error(e)
+        else:
+            st.success("Справочник городов сохранён.")
+            st.rerun()
+
     _section_anchor("admin-competitions")
     st.subheader("Таблица competitions")
     st.caption(
@@ -3299,7 +3345,7 @@ def page_admin() -> None:
 def main() -> None:
     icon = page_icon_path()
     st.set_page_config(
-        page_title="ВологдаМарафон — аналитика",
+        page_title="VM-Stat",
         page_icon=icon if icon else None,
         layout="wide",
         initial_sidebar_state="expanded",
