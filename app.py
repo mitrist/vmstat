@@ -92,6 +92,22 @@ SECTION_SUBMENUS: dict[str, list[tuple[str, str]]] = {
 # Внутренний ключ сессии: панель администратора открывается только по секретному ?page=<slug>.
 ADMIN_PANEL_PAGE = "__vm_secret_admin__"
 
+YANDEX_METRICA_SNIPPET = """
+<!-- Yandex.Metrika counter -->
+<script type="text/javascript">
+    (function(m,e,t,r,i,k,a){
+        m[i]=m[i]||function(){(m[i].a=m[i].a||[]).push(arguments)};
+        m[i].l=1*new Date();
+        for (var j = 0; j < document.scripts.length; j++) {if (document.scripts[j].src === r) { return; }}
+        k=e.createElement(t),a=e.getElementsByTagName(t)[0],k.async=1,k.src=r,a.parentNode.insertBefore(k,a)
+    })(window, document,'script','https://mc.yandex.ru/metrika/tag.js?id=108802154', 'ym');
+
+    ym(108802154, 'init', {ssr:true, webvisor:true, clickmap:true, ecommerce:"dataLayer", referrer: document.referrer, url: location.href, accurateTrackBounce:true, trackLinks:true});
+</script>
+<noscript><div><img src="https://mc.yandex.ru/watch/108802154" style="position:absolute; left:-9999px;" alt="" /></div></noscript>
+<!-- /Yandex.Metrika counter -->
+""".strip()
+
 COUNTRY_TO_ISO3: dict[str, str] = {
     "россия": "RUS",
     "российская федерация": "RUS",
@@ -268,6 +284,17 @@ def page_icon_path() -> str | None:
         except OSError:
             continue
     return None
+
+
+def inject_yandex_metrica() -> None:
+    """
+    Вставляет код Метрики максимально рано в рендере страницы.
+    Для новых версий Streamlit используем st.html; иначе fallback через components.html.
+    """
+    if hasattr(st, "html"):
+        st.html(YANDEX_METRICA_SNIPPET)
+    else:
+        components.html(YANDEX_METRICA_SNIPPET, height=0)
 
 
 def inject_vm_styles() -> None:
@@ -2848,6 +2875,7 @@ def main() -> None:
         layout="wide",
         initial_sidebar_state="expanded",
     )
+    inject_yandex_metrica()
     inject_vm_styles()
 
     pages: list[str] = [
