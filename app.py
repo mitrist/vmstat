@@ -22,6 +22,7 @@ import altair as alt
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import plotly.io as pio
 import re
 import streamlit as st
 import streamlit.components.v1 as components
@@ -92,6 +93,7 @@ SECTION_SUBMENUS: dict[str, list[tuple[str, str]]] = {
 
 # Внутренний ключ сессии: панель администратора открывается только по секретному ?page=<slug>.
 ADMIN_PANEL_PAGE = "__vm_secret_admin__"
+CHART_STYLE_EXPERIMENT_KEY = "chart_style_experiment"
 
 YANDEX_METRICA_SNIPPET = """
 <!-- Yandex.Metrika counter -->
@@ -1480,6 +1482,53 @@ def _resolve_admin_route_slug() -> str | None:
     except Exception:
         return None
     return None
+
+
+def _chart_style_experiment_default() -> bool:
+    raw_env = str(os.environ.get("VMSTAT_CHART_STYLE_EXPERIMENT", "")).strip().lower()
+    if raw_env in {"1", "true", "yes", "on"}:
+        return True
+    if raw_env in {"0", "false", "no", "off"}:
+        return False
+    try:
+        adm: Any = st.secrets.get("admin", {}) if hasattr(st, "secrets") else {}
+        if isinstance(adm, dict):
+            raw = str(adm.get("chart_style_experiment", "")).strip().lower()
+            if raw in {"1", "true", "yes", "on"}:
+                return True
+            if raw in {"0", "false", "no", "off"}:
+                return False
+    except Exception:
+        pass
+    return False
+
+
+def _is_chart_style_experiment_enabled() -> bool:
+    if CHART_STYLE_EXPERIMENT_KEY not in st.session_state:
+        st.session_state[CHART_STYLE_EXPERIMENT_KEY] = _chart_style_experiment_default()
+    return bool(st.session_state.get(CHART_STYLE_EXPERIMENT_KEY, False))
+
+
+def _apply_plotly_style_flag() -> None:
+    if _is_chart_style_experiment_enabled():
+        pio.templates["vm_experiment"] = go.layout.Template(
+            layout=go.Layout(
+                font=dict(family="Inter, Segoe UI, sans-serif", color=VM_TEXT, size=13),
+                colorway=[VM_BLUE, "#1f4e79", "#69a7d6", "#4c78a8", "#7f8ea3"],
+                paper_bgcolor="#ffffff",
+                plot_bgcolor="#ffffff",
+                hoverlabel=dict(
+                    bgcolor="#ffffff",
+                    bordercolor="#d7e3ee",
+                    font=dict(color=VM_TEXT, size=12),
+                ),
+                xaxis=dict(showgrid=True, gridcolor="#edf2f7", zeroline=False),
+                yaxis=dict(showgrid=True, gridcolor="#edf2f7", zeroline=False),
+            )
+        )
+        pio.templates.default = "vm_experiment"
+    else:
+        pio.templates.default = "plotly_white"
 
 
 def _cup_detail_age_group_options(rows: list[dict]) -> list[str]:
@@ -2903,6 +2952,20 @@ def page_admin() -> None:
         unsafe_allow_html=True,
     )
 
+    st.subheader("Экспериментальные стили графиков")
+    st.caption("Включает альтернативное оформление Plotly-графиков на всём сайте для текущей сессии.")
+    cur_chart_flag = _is_chart_style_experiment_enabled()
+    new_chart_flag = st.toggle(
+        "Экспериментальный стиль графиков",
+        value=cur_chart_flag,
+        key="admin_chart_style_toggle",
+    )
+    if bool(new_chart_flag) != cur_chart_flag:
+        st.session_state[CHART_STYLE_EXPERIMENT_KEY] = bool(new_chart_flag)
+        _apply_plotly_style_flag()
+        st.success("Режим стилей графиков обновлён.")
+        st.rerun()
+
     _section_anchor("admin-aliases")
     st.subheader("Справочник алиасов дистанций")
     st.caption(
@@ -3059,6 +3122,7 @@ def main() -> None:
         layout="wide",
         initial_sidebar_state="expanded",
     )
+    _apply_plotly_style_flag()
     inject_yandex_metrica()
     inject_vm_styles()
 
