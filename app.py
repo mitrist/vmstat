@@ -2608,18 +2608,21 @@ def page_team() -> None:
     if not require_db(path):
         return
 
-    search = st.text_input(
-        "Поиск по названию",
-        placeholder="Начните вводить название…",
-        key="team_search",
-    )
-    names = mq.query_team_names_for_select(path, search or None, limit=500)
+    st.caption("Быстрый выбор: начните вводить название команды — подсказки появятся в этом же поле.")
+    names = mq.query_team_names_for_select(path, None, limit=5000)
     if not names:
         st.warning("В базе нет команд с непустым полем team в финишах (dnf=0).")
         return
 
-    team = st.selectbox("Выберите команду", options=names, index=0, key="team_pick")
+    team = st.selectbox(
+        "Команда",
+        options=names,
+        index=None,
+        placeholder="Начните вводить название команды...",
+        key="team_pick",
+    )
     if not team:
+        st.caption("Выберите команду в поле выше.")
         return
 
     base_stats = mq.query_team_stats(path, team)
