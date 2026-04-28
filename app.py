@@ -32,6 +32,7 @@ DEFAULT_DB = Path(os.environ.get("MARATHON_DB", str(mq.DEFAULT_DB)))
 APP_DIR = Path(__file__).resolve().parent
 SIDEBAR_LOGO = APP_DIR / "assets" / "vologdamarafon.png"
 FAVICON_LOCAL = APP_DIR / "favicon-32x32.png"
+FAVICON_ASSET = APP_DIR / "assets" / "vologdamarafon.png"
 FAVICON_ATTACHED = Path(
     r"C:\Users\Pavlov DA\.cursor\projects\c-Projects-vm-stat\assets\c__Projects_vm_stat_favicon-32x32.png"
 )
@@ -277,7 +278,7 @@ def db_path() -> Path:
 
 def page_icon_path() -> str | None:
     """Путь к favicon; сначала локальный файл проекта, затем файл из вложения."""
-    for p in (FAVICON_LOCAL, FAVICON_ATTACHED):
+    for p in (FAVICON_LOCAL, FAVICON_ASSET, FAVICON_ATTACHED):
         try:
             if p.is_file():
                 return str(p)
@@ -2218,6 +2219,27 @@ def show_participant_dashboard(path: Path, pid: int) -> None:
             pb_year = pb_year[pb_year["год"].isin(years_for_query)]
         pb_all = _filter_participant_df_by_sport(pb_all)
         pb_year = _filter_participant_df_by_sport(pb_year)
+        rec_sport_options = ["Все"]
+        if not pb_all.empty and "вид" in pb_all.columns:
+            rec_sports = sorted(
+                {
+                    str(x).strip()
+                    for x in pb_all["вид"].tolist()
+                    if str(x).strip() and str(x).strip().casefold() != "service"
+                }
+            )
+            rec_sport_options.extend(rec_sports)
+        rec_sport_pick = st.selectbox(
+            "Вид спорта",
+            options=rec_sport_options,
+            index=0,
+            key=f"part_rec_sport_{pid}",
+        )
+        if rec_sport_pick != "Все":
+            if "вид" in pb_all.columns:
+                pb_all = pb_all[pb_all["вид"] == rec_sport_pick]
+            if "вид" in pb_year.columns:
+                pb_year = pb_year[pb_year["вид"] == rec_sport_pick]
         st.markdown("##### Личные рекорды (PB, все годы)")
         if pb_all.empty:
             st.caption("Нет корректных финишей для расчёта PB.")

@@ -2671,6 +2671,7 @@ def query_profile_personal_bests(
             c.year AS year,
             c.date AS event_date,
             c.title AS event_title,
+            c.sport AS sport,
             COALESCE(d.name, '') AS distance_name,
             r.finish_time AS finish_time,
             r.finish_time_sec AS finish_time_sec,
@@ -2697,6 +2698,7 @@ def query_profile_personal_bests(
         if cur is None or sec_f < float(cur.get("время_сек") or 1e18):
             best_by_distance[d_key] = {
                 "дистанция": d_label,
+                "вид": str(r.get("sport") or "").strip(),
                 "время": r.get("finish_time"),
                 "время_сек": sec_f,
                 "год": r.get("year"),
