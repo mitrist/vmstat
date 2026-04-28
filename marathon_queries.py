@@ -10,7 +10,7 @@ import re
 import sqlite3
 import csv
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterator
@@ -3401,6 +3401,132 @@ def query_distinct_sports(db_path: Path | str) -> list[str]:
         """,
     )
     return [str(r["s"]) for r in rows if r.get("s") is not None]
+
+
+def parse_competition_date_value(value: Any) -> date | None:
+    """Парсинг даты из поля ``competitions.date`` (ISO, дд.мм.гггг и частично ISO-дата)."""
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    head10 = raw.replace("T", " ")[:10]
+    formats = ("%Y-%m-%d", "%d.%m.%Y", "%Y/%m/%d")
+    for fmt in formats:
+        try:
+            return datetime.strptime(head10, fmt).date()
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(head10.replace(" ", "T")).date()
+    except ValueError:
+        return None
+
+
+def query_competition_calendar_month_counts_year(
+    db_path: Path | str,
+    year: int,
+) -> list[int]:
+    """Число событий с валидной датой в каждом месяце ``year`` (индекс 0 = январь)."""
+    y = int(year)
+    rows = q_all(
+        db_path,
+        """
+        SELECT COALESCE(date, '') AS date
+        FROM competitions
+        WHERE date IS NOT NULL AND TRIM(CAST(date AS TEXT)) != ''
+        """,
+        (),
+    )
+    cnt = [0] * 12
+    for r in rows:
+        dtp = parse_competition_date_value(r.get("date"))
+        if dtp is None or dtp.year != y:
+            continue
+        m = max(1, min(12, int(dtp.month)))
+        cnt[m - 1] += 1
+    return cnt
+
+
+def query_competitions_calendar_month_events(
+    db_path: Path | str,
+    year: int,
+    month: int,
+    *,
+    today: date | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """
+    События месяца в ``competitions`` с успешным разбором ``date``: кортеж
+    (**прошедшие**, **предстоящие/сегодня**).
+
+    Прошедшие: ``date < cut`` (календарный день), иначе — в предстоящих.
+
+    Если колонки ``page_url`` нет — возвращает пустую строку.
+    """
+    cut = today if today is not None else date.today()
+    y = int(year)
+    m = max(1, min(12, int(month)))
+    page_sel = (
+        "COALESCE(TRIM(c.page_url), '') AS page_url"
+        if _table_has_column(db_path, "competitions", "page_url")
+        else "'' AS page_url"
+    )
+    rows = q_all(
+        db_path,
+        f"""
+        SELECT
+            c.id,
+            COALESCE(TRIM(c.title), '') AS title,
+            COALESCE(c.date, '') AS date,
+            COALESCE(TRIM(c.sport), '') AS sport,
+            {page_sel}
+        FROM competitions c
+        WHERE c.date IS NOT NULL AND TRIM(CAST(c.date AS TEXT)) != ''
+        """,
+        (),
+    )
+    past: list[dict[str, Any]] = []
+    upcoming: list[dict[str, Any]] = []
+    for r in rows:
+        dtp = parse_competition_date_value(r.get("date"))
+        if dtp is None or dtp.year != y or dtp.month != m:
+            continue
+        item = {
+            "id": int(r.get("id") or 0),
+            "title": str(r.get("title") or "").strip() or "—",
+            "sport": str(r.get("sport") or "").strip(),
+            "page_url": str(r.get("page_url") or "").strip(),
+            "day_of_month": dtp.day,
+            "event_date_iso": dtp.isoformat(),
+        }
+        if dtp < cut:
+            past.append(item)
+        else:
+            upcoming.append(item)
+    sort_key = lambda x: (
+        int(x.get("day_of_month") or 0),
+        str(x.get("title") or "").casefold(),
+        int(x.get("id") or 0),
+    )
+    past.sort(key=sort_key)
+    upcoming.sort(key=sort_key)
+    return past, upcoming
+
+
+def query_upcoming_competitions_calendar_month(
+    db_path: Path | str,
+    year: int,
+    month: int,
+    *,
+    today: date | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Совместимость: только **предстоящие/сегодня** как раньше (``date >= today`` для календарного дня).
+    """
+    _past, fut = query_competitions_calendar_month_events(
+        db_path, year, month, today=today
+    )
+    return fut
 
 
 def query_cups_for_filter(db_path: Path | str) -> list[dict[str, Any]]:

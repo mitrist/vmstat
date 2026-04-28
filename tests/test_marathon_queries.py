@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import tempfile
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -1066,3 +1067,37 @@ def test_query_event_series_title_short_ranking_only_repeats(tmp_path: Path) -> 
     assert cms["sports_csv"] == "run"
     assert int(cms["participants_sum"]) == 140
     assert int(cms["teams_sum"]) == 16
+
+
+def test_parse_competition_date_value_basic() -> None:
+    assert mq.parse_competition_date_value("2030-11-07") == date(2030, 11, 7)
+    assert mq.parse_competition_date_value("07.05.2031") == date(2031, 5, 7)
+    assert mq.parse_competition_date_value("") is None
+
+
+def test_query_upcoming_competitions_calendar_month_future_only(tmp_path: Path) -> None:
+    db = tmp_path / "upcoming.db"
+    conn = sqlite3.connect(db)
+    conn.executescript(
+        """
+        CREATE TABLE competitions (
+            id INTEGER NOT NULL PRIMARY KEY,
+            title TEXT,
+            date TEXT,
+            year INTEGER,
+            sport TEXT
+        );
+        INSERT INTO competitions VALUES (1, 'Future A', '2032-06-12', 2032, 'run');
+        INSERT INTO competitions VALUES (2, 'Future B', '2032-06-20', 2032, 'ski');
+        INSERT INTO competitions VALUES (3, 'Past', '2010-06-01', 2010, 'run');
+        """
+    )
+    conn.commit()
+    conn.close()
+    cut = date(2030, 1, 1)
+    rows = mq.query_upcoming_competitions_calendar_month(
+        db, 2032, 6, today=cut
+    )
+    titles = sorted(str(r.get("title") or "") for r in rows)
+    assert titles == ["Future A", "Future B"]
+    assert {(r["day_of_month"], str(r["sport"])) for r in rows} == {(12, "run"), (20, "ski")}

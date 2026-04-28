@@ -12,8 +12,10 @@ MVP-дашборд marathon.db (Streamlit).
 
 from __future__ import annotations
 
+import calendar
 import datetime
 import json
+from urllib.parse import urljoin
 from typing import Any
 import html
 import os
@@ -64,6 +66,7 @@ PAGE_ALIASES: dict[str, str] = {
     "Общая статистика": "general",
     "Интересные факты": "facts",
     "География ВМ": "geo",
+    "Календарь событий": "upcoming",
     "События": "event",
     "Рекорды ВМ": "records",
     "Участники": "participant",
@@ -90,6 +93,9 @@ SECTION_SUBMENUS: dict[str, list[tuple[str, str]]] = {
         ("event-list", "События"),
         ("event-series", "Серии событий"),
         ("event-detail", "Детали события"),
+    ],
+    "Календарь событий": [
+        ("upcoming-cal", "Календарь"),
     ],
     "Рекорды ВМ": [
         ("records-vm", "Рекорды ВМ"),
@@ -1000,6 +1006,7 @@ def render_sidebar_text_nav(pages: tuple[str, ...], current: str) -> None:
     icons = {
         "Общая статистика": "📊",
         "География ВМ": "🗺️",
+        "Календарь событий": "📅",
         "События": "🏁",
         "Рекорды ВМ": "🥇",
         "Участники": "👤",
@@ -1602,6 +1609,255 @@ def page_vm_records() -> None:
             st.html(frag)
         else:
             st.markdown(frag, unsafe_allow_html=True)
+
+
+_MONTH_NAMES_RU: tuple[str, ...] = (
+    "Январь",
+    "Февраль",
+    "Март",
+    "Апрель",
+    "Май",
+    "Июнь",
+    "Июль",
+    "Август",
+    "Сентябрь",
+    "Октябрь",
+    "Ноябрь",
+    "Декабрь",
+)
+
+
+def sport_calendar_icon(code: str) -> str:
+    c = str(code or "").strip().lower()
+    if c in {"run", "trail_run"}:
+        return "🏃"
+    if c == "bike":
+        return "🚴"
+    if c == "ski":
+        return "🎿"
+    return "📍"
+
+
+def _truncate_cal_title(title: str, max_len: int = 48) -> str:
+    t = (title or "").strip()
+    if len(t) <= max_len:
+        return t
+    return t[: max(0, max_len - 1)] + "…"
+
+
+def _shift_calendar_month(year: int, month: int, delta: int) -> tuple[int, int]:
+    """Сдвигает (год, месяц) на delta месяцев; месяцы 1–12."""
+    m = int(month) + int(delta)
+    y = int(year)
+    while m > 12:
+        m -= 12
+        y += 1
+    while m < 1:
+        m += 12
+        y -= 1
+    return y, m
+
+
+def upcoming_public_event_url(page_url: str | None) -> str | None:
+    """https://vologdamarafon.ru/ плюс относительный путь из колонки page_url."""
+    base = "https://vologdamarafon.ru/"
+    p = str(page_url or "").strip()
+    if not p:
+        return None
+    low = p.lower()
+    if low.startswith("http://") or low.startswith("https://"):
+        return p
+    path = p.lstrip("/")
+    return urljoin(base, path)
+
+
+def _calendar_event_line_html(ev: dict[str, Any]) -> str:
+    icon = sport_calendar_icon(str(ev.get("sport") or ""))
+    ttl = html.escape(_truncate_cal_title(str(ev.get("title") or "")))
+    dest = upcoming_public_event_url(ev.get("page_url"))
+    if dest:
+        ttl_block = (
+            f'<a class="vm-upcoming-ev-link" href="{html.escape(dest, quote=True)}" '
+            f'target="_blank" rel="noopener noreferrer">{ttl}</a>'
+        )
+    else:
+        ttl_block = f'<span class="vm-upcoming-ev-text">{ttl}</span>'
+    return f'<span class="vm-upcoming-ev">{icon} {ttl_block}</span>'
+
+
+def upcoming_calendar_table_html(
+    year: int,
+    month: int,
+    by_day_past: dict[int, list[dict[str, Any]]],
+    by_day_future: dict[int, list[dict[str, Any]]],
+) -> str:
+    """HTML-таблица календаря (неделя с понедельника): прошедшие (голубой) и будущие (зелёный)."""
+    wd = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    calendar.setfirstweekday(calendar.MONDAY)
+    weeks = calendar.monthcalendar(int(year), int(month))
+    th = "".join(f'<th scope="col">{html.escape(w)}</th>' for w in wd)
+    tbody_rows: list[str] = []
+    for wk in weeks:
+        cells: list[str] = []
+        for d in wk:
+            if d == 0:
+                cells.append(f'<td class="vm-cal-pad"></td>')
+                continue
+            di = int(d)
+            lines_past = [_calendar_event_line_html(ev) for ev in by_day_past.get(di, [])]
+            lines_future = [_calendar_event_line_html(ev) for ev in by_day_future.get(di, [])]
+            inner = "".join(lines_past + lines_future)
+            has_p = bool(lines_past)
+            has_u = bool(lines_future)
+            if has_p and has_u:
+                td_cls = "vm-cal-mixed"
+            elif has_p:
+                td_cls = "vm-cal-has-past"
+            elif has_u:
+                td_cls = "vm-cal-has-events"
+            else:
+                td_cls = ""
+            td_open = f'<td class="{td_cls}">' if td_cls else "<td>"
+            cells.append(f'{td_open}<div class="cal-day-num">{di}</div>{inner}</td>')
+        tbody_rows.append("<tr>" + "".join(cells) + "</tr>")
+    border = "#546e7a"
+    head_bg = "#37474f"
+    return f"""
+<style>
+.vm-upcoming-cal-wrap {{ width:100%; max-width:100%; box-sizing:border-box; }}
+.vm-upcoming-cal {{ width:100%; border-collapse:collapse; table-layout:fixed; font-size:13px; color:#263238; }}
+.vm-upcoming-cal th {{ padding:11px 6px; border:1px solid {border}; background:{head_bg}; color:#eceff1; font-weight:600; }}
+.vm-upcoming-cal td {{ border:1px solid #90a4ae; vertical-align:top; padding:12px; min-height:158px; word-wrap:break-word; background:#f5f5f5; }}
+.vm-upcoming-cal td.vm-cal-pad {{ background:#eceff1; border-color:#b0bec5; }}
+.vm-upcoming-cal td.vm-cal-has-past {{ background:#e3f2fd; border-color:#42a5f5; }}
+.vm-upcoming-cal td.vm-cal-has-events {{ background:#dcedc8; border-color:#7cb342; }}
+.vm-upcoming-cal td.vm-cal-mixed {{ background:linear-gradient(180deg,#e3f2fd 0%,#e3f2fd 48%, #dcedc8 52%, #dcedc8 100%); border-color:#558ed5; }}
+.vm-upcoming-cal .cal-day-num {{ font-weight:700; color:#263238; margin-bottom:6px; font-size:13px; }}
+.vm-upcoming-ev {{ display:block; margin-top:6px; font-size:12px; line-height:1.4; }}
+.vm-upcoming-ev-text {{ color:#37474f; }}
+.vm-upcoming-ev-link {{ color:#1565c0; font-weight:500; text-decoration:none; border-bottom:1px solid rgba(21,101,192,0.35); }}
+.vm-upcoming-ev-link:hover {{ color:#0d47a1; border-bottom-color:#0d47a1; }}
+</style>
+<div class="vm-upcoming-cal-wrap">
+<table class="vm-upcoming-cal" role="grid" aria-label="Календарь событий">
+<thead><tr>{th}</tr></thead>
+<tbody>{"".join(tbody_rows)}</tbody>
+</table>
+</div>
+""".strip()
+
+
+def page_upcoming_events() -> None:
+    _section_anchor("upcoming-cal")
+    st.header("Календарь событий")
+    path = db_path()
+    if not require_db(path):
+        return
+    today = datetime.date.today()
+    ss_y = "vm_upcoming_cal_y"
+    ss_m = "vm_upcoming_cal_m"
+    pill_key = "upcoming_month_pills"
+    if ss_y not in st.session_state:
+        st.session_state[ss_y] = today.year
+        st.session_state[ss_m] = today.month
+
+    cy = int(st.session_state[ss_y])
+    cm = max(1, min(12, int(st.session_state[ss_m])))
+    counts = mq.query_competition_calendar_month_counts_year(path, cy)
+    month_labels = [f"{_MONTH_NAMES_RU[i]} - {counts[i]}" for i in range(12)]
+
+    if pill_key in st.session_state and st.session_state[pill_key] not in month_labels:
+        st.session_state[pill_key] = month_labels[cm - 1]
+
+    st.markdown(
+        f'<p style="color:{VM_TEXT};font-weight:600;margin:0 0 6px 0;">Месяц</p>'
+        f'<p style="color:{VM_MUTED};font-size:0.85rem;margin:0 0 6px 0;">'
+        f'Год календаря: <strong>{cy}</strong>.</p>',
+        unsafe_allow_html=True,
+    )
+
+    col_l, col_mid, col_r = st.columns([0.7, 20, 0.7])
+    with col_l:
+        if st.button(
+            "<",
+            key="vm_up_cal_prev_month",
+            help="Предыдущий месяц",
+            use_container_width=True,
+        ):
+            ny, nm = _shift_calendar_month(cy, cm, -1)
+            nc = mq.query_competition_calendar_month_counts_year(path, ny)
+            st.session_state[ss_y] = ny
+            st.session_state[ss_m] = nm
+            st.session_state[pill_key] = f"{_MONTH_NAMES_RU[nm - 1]} - {nc[nm - 1]}"
+            st.rerun()
+
+    with col_r:
+        if st.button(
+            ">",
+            key="vm_up_cal_next_month",
+            help="Следующий месяц",
+            use_container_width=True,
+        ):
+            ny, nm = _shift_calendar_month(cy, cm, 1)
+            nc = mq.query_competition_calendar_month_counts_year(path, ny)
+            st.session_state[ss_y] = ny
+            st.session_state[ss_m] = nm
+            st.session_state[pill_key] = f"{_MONTH_NAMES_RU[nm - 1]} - {nc[nm - 1]}"
+            st.rerun()
+
+    with col_mid:
+        picked_month = st.pills(
+            "Месяц",
+            options=month_labels,
+            selection_mode="single",
+            default=month_labels[cm - 1],
+            key=pill_key,
+            label_visibility="collapsed",
+        )
+
+    if picked_month is not None:
+        try:
+            m_sel = month_labels.index(str(picked_month)) + 1
+        except ValueError:
+            m_sel = cm
+    else:
+        m_sel = cm
+
+    if m_sel != st.session_state[ss_m]:
+        st.session_state[ss_m] = m_sel
+
+    cy = int(st.session_state[ss_y])
+    m_sel = max(1, min(12, int(st.session_state[ss_m])))
+
+    past_rows, fut_rows = mq.query_competitions_calendar_month_events(
+        path, cy, m_sel, today=today
+    )
+    by_day_past: dict[int, list[dict[str, Any]]] = {}
+    by_day_future: dict[int, list[dict[str, Any]]] = {}
+    for r in past_rows:
+        d = int(r.get("day_of_month") or 0)
+        if d <= 0:
+            continue
+        by_day_past.setdefault(d, []).append(r)
+    for r in fut_rows:
+        d = int(r.get("day_of_month") or 0)
+        if d <= 0:
+            continue
+        by_day_future.setdefault(d, []).append(r)
+
+    st.caption(
+        "События из **competitions** с разобранной **date** в выбранном месяце: "
+        f"**{cy}** · {_MONTH_NAMES_RU[m_sel - 1]}. "
+        f"Сегодня ({today.isoformat()}): прошедшие — голубой фон ячейки, "
+        "предстоящие и сегодня — зелёный."
+    )
+    if not past_rows and not fut_rows:
+        st.info(
+            "В этом месяце нет событий с заполненной датой в базе "
+            "(проверьте поле **date** в **competitions**)."
+        )
+    frag = upcoming_calendar_table_html(cy, m_sel, by_day_past, by_day_future)
+    st.markdown(frag, unsafe_allow_html=True)
 
 
 def page_event() -> None:
@@ -3514,6 +3770,7 @@ def main() -> None:
         "Интересные факты",
         "География ВМ",
         "События",
+        "Календарь событий",
         "Рекорды ВМ",
         "Участники",
         "Команды",
@@ -3559,6 +3816,8 @@ def main() -> None:
         page_vm_geography()
     elif page == "События":
         page_event()
+    elif page == "Календарь событий":
+        page_upcoming_events()
     elif page == "Рекорды ВМ":
         page_vm_records()
     elif page == "Участники":
