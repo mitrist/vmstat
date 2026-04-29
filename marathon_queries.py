@@ -5580,28 +5580,27 @@ def query_interesting_facts_wins_leaders_by_sport(
     year: int | None = None,
     sport: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Лидеры по количеству побед в событиях (profiles.stat_first), по видам спорта и полу."""
+    """Лидеры по количеству побед в событиях (results.place_abs=1), по видам спорта и полу."""
     w, params = _build_interesting_facts_where(year, None)
     requested = _canonical_sport_code(sport) if sport and str(sport).strip() else ""
     rows = q_all(
         db_path,
         f"""
-        WITH base AS (
-            SELECT DISTINCT
-                TRIM(COALESCE(c.sport, '')) AS sport,
-                p.id AS profile_id,
-                LOWER(TRIM(COALESCE(p.gender, ''))) AS gender_code,
-                TRIM(COALESCE(p.last_name, '') || ' ' || COALESCE(p.first_name, '')) AS participant,
-                COALESCE(p.stat_first, 0) AS wins
-            FROM results r
-            INNER JOIN competitions c ON c.id = r.competition_id
-            INNER JOIN profiles p ON p.id = r.profile_id
-            WHERE r.profile_id IS NOT NULL
-              AND LOWER(TRIM(COALESCE(p.gender, ''))) IN ('m', 'f')
-              AND {w}
-        )
-        SELECT sport, gender_code, profile_id, participant, wins
-        FROM base
+        SELECT
+            TRIM(COALESCE(c.sport, '')) AS sport,
+            LOWER(TRIM(COALESCE(p.gender, ''))) AS gender_code,
+            r.profile_id AS profile_id,
+            TRIM(COALESCE(p.last_name, '') || ' ' || COALESCE(p.first_name, '')) AS participant,
+            COUNT(*) AS wins
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        LEFT JOIN profiles p ON p.id = r.profile_id
+        WHERE COALESCE(r.dnf, 0) = 0
+          AND r.profile_id IS NOT NULL
+          AND COALESCE(r.place_abs, 0) = 1
+          AND LOWER(TRIM(COALESCE(p.gender, ''))) IN ('m', 'f')
+          AND {w}
+        GROUP BY sport, gender_code, profile_id, participant
         """,
         tuple(params),
     )

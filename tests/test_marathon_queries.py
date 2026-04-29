@@ -462,6 +462,27 @@ def test_interesting_facts_record_and_wins_leaders_by_sport(sample_db: Path) -> 
     assert int(run_w["male_wins"]) >= 0
 
 
+def test_interesting_facts_wins_leaders_split_by_sport(sample_db: Path) -> None:
+    conn = sqlite3.connect(sample_db)
+    conn.executescript(
+        """
+        INSERT INTO competitions VALUES (3, 'Bike Race', '2024-07-01', 2024, 'bike');
+        INSERT INTO distances VALUES (12, 3, 'Bike 30', 30.0, 0);
+        INSERT INTO results VALUES (70, 3, 12, 101, 0, 3200.0, 'Team B', 1, 1, 1, 'M40', '00:53:20', '{}');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    wins = mq.query_interesting_facts_wins_leaders_by_sport(sample_db, year=None, sport=None)
+    run_w = next((r for r in wins if str(r.get("sport")) == "run"), None)
+    bike_w = next((r for r in wins if str(r.get("sport")) == "bike"), None)
+    assert run_w is not None
+    assert bike_w is not None
+    assert str(run_w.get("male_participant") or "").startswith("Testov")
+    assert str(bike_w.get("male_participant") or "").startswith("Secondov")
+
+
 def test_cups_for_obsh_header_filter(sample_db: Path) -> None:
     all_c = mq.query_cups_for_obsh_header_filter(sample_db, None, None)
     ids = {r["id"] for r in all_c}
