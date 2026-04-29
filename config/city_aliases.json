@@ -1,5 +1,5 @@
 {
-  "updated_at_utc": "2026-04-28T00:00:00+00:00",
+  "updated_at_utc": "2026-04-29T12:33:50.691635+00:00",
   "rules": [
     {
       "alias": "спб",
@@ -31,5 +31,39 @@
       "canonical_label": "Москва",
       "active": true
     }
-  ]
+  ],
+  "overlay_source_norm_region_csv": "C:\\Projects\\vm_stat\\city-master\\city-master\\norm_region.csv",
+  "region_rules": [
+    {
+      "region_alias": "г Москва",
+      "canonical_key": "moscow",
+      "canonical_label": "Москва",
+      "active": true
+    },
+    {
+      "region_alias": "г. Москва",
+      "canonical_key": "moscow",
+      "canonical_label": "Москва",
+      "active": true
+    },
+    {
+      "region_alias": "Москва",
+      "canonical_key": "moscow",
+      "canonical_label": "Москва",
+      "active": true
+    },
+    {
+      "region_alias": "Республика Татарстан (Татарстан)",
+      "canonical_key": "tatarstan",
+      "canonical_label": "Татарстан Республика",
+      "active": true
+    },
+    {
+      "region_alias": "Татарстан Республика",
+      "canonical_key": "tatarstan",
+      "canonical_label": "Татарстан Республика",
+      "active": true
+    }
+  ],
+  "overlay_source_norm_city_csv": "C:\\Projects\\vm_stat\\city-master\\city-master\\norm_city.csv"
 }

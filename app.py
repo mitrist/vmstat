@@ -3752,6 +3752,56 @@ def page_admin() -> None:
             st.success("Справочник городов сохранён (JSON-оверлей при необходимости).")
             st.rerun()
 
+    _section_anchor("admin-region-aliases")
+    st.subheader("Справочник алиасов регионов")
+    st.caption(
+        "Склеивает разные строки профилей (profiles.region): один канонический key и название для UI "
+        "(Интересные факты, география ВМ, команда)."
+    )
+    norm_reg = mq.norm_region_aliases_file_path()
+    st.markdown("Базовый каталог (**norm_region.csv**):", unsafe_allow_html=True)
+    st.code(str(norm_reg), language=None)
+    overlay_reg = mq.city_aliases_file_path()
+    st.markdown("Тот же JSON (**city_aliases.json**), ключ **region_rules** — оверлей к базе CSV.", unsafe_allow_html=True)
+    st.code(str(overlay_reg), language=None)
+
+    region_rows = mq.load_region_alias_rules()
+    if not region_rows:
+        region_rows = mq.default_region_alias_rules()
+    df_region = pd.DataFrame(region_rows)
+    for col in ("region_alias", "canonical_key", "canonical_label", "active"):
+        if col not in df_region.columns:
+            df_region[col] = "" if col != "active" else True
+    df_region = df_region[["region_alias", "canonical_key", "canonical_label", "active"]]
+
+    edited_region = st.data_editor(
+        df_region,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="dynamic",
+        key="admin_region_aliases_editor",
+        column_config={
+            "region_alias": st.column_config.TextColumn("region_alias (как в profiles.region)"),
+            "canonical_key": st.column_config.TextColumn("Канонический key"),
+            "canonical_label": st.column_config.TextColumn("Регион в UI"),
+            "active": st.column_config.CheckboxColumn("Активно"),
+        },
+    )
+    c1r, c2r = st.columns([1, 3])
+    with c1r:
+        save_region_clicked = st.button("Сохранить справочник регионов", key="admin_save_region_aliases")
+    with c2r:
+        st.caption("Один region_alias не может указывать на разные canonical_key / Регион в UI.")
+    if save_region_clicked:
+        rows_r = edited_region.to_dict(orient="records")
+        errs_r = mq.save_region_alias_rules(rows_r)
+        if errs_r:
+            for e in errs_r:
+                st.error(e)
+        else:
+            st.success("Справочник регионов сохранён (оверлей в city_aliases.json при необходимости).")
+            st.rerun()
+
     _section_anchor("admin-competitions")
     st.subheader("Таблица competitions")
     st.caption(

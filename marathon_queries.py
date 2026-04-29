@@ -29,6 +29,9 @@ DEFAULT_CITY_REFERENCE_FILE = (
 DEFAULT_NORM_CITY_ALIAS_FILE = (
     Path(__file__).resolve().parent / "city-master" / "city-master" / "norm_city.csv"
 )
+DEFAULT_NORM_REGION_ALIAS_FILE = (
+    Path(__file__).resolve().parent / "city-master" / "city-master" / "norm_region.csv"
+)
 DEFAULT_CITY_NORMALIZATION_CHUNK = 1000
 DEFAULT_STAGES_FILE = Path(__file__).resolve().parent / ".cursor" / "etapy.yaml"
 LEGACY_STAGES_FILE = Path(__file__).resolve().parent / ".cursor" / "etapi.md"
@@ -284,6 +287,14 @@ def norm_city_aliases_file_path() -> Path:
     return DEFAULT_NORM_CITY_ALIAS_FILE
 
 
+def norm_region_aliases_file_path() -> Path:
+    """Нормализованный справочник регионов (norm_region.csv рядом с norm_city.csv)."""
+    raw = os.environ.get("NORM_REGION_ALIAS_FILE", "").strip()
+    if raw:
+        return Path(raw)
+    return DEFAULT_NORM_REGION_ALIAS_FILE
+
+
 def _norm_csv_header_cell(h: str | None) -> str:
     return (h or "").replace("\ufeff", "").strip().casefold()
 
@@ -350,16 +361,22 @@ def _load_norm_city_csv_rules() -> list[dict[str, Any]]:
     return [seen[k] for k in order]
 
 
-def _load_json_city_alias_rules_only() -> list[dict[str, Any]]:
-    """Только JSON-оверлей (без объединения с norm_city.csv)."""
+def _read_city_aliases_json_payload() -> dict[str, Any]:
+    """Сырой объект city_aliases.json (city rules + region_rules в одном файле)."""
     p = city_aliases_file_path()
     if not p.is_file():
-        return []
+        return {}
     try:
         payload = json.loads(p.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return []
-    rows = payload.get("rules") if isinstance(payload, dict) else None
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _load_json_city_alias_rules_only() -> list[dict[str, Any]]:
+    """Только JSON-оверлей (без объединения с norm_city.csv)."""
+    payload = _read_city_aliases_json_payload()
+    rows = payload.get("rules")
     if not isinstance(rows, list):
         return []
     out: list[dict[str, Any]] = []
@@ -649,8 +666,292 @@ def save_city_alias_rules(rows: list[dict[str, Any]]) -> list[str]:
         "overlay_source_norm_city_csv": str(csv_path) if csv_path.is_file() else "",
         "rules": to_write,
     }
+    prev = _read_city_aliases_json_payload()
+    if isinstance(prev.get("region_rules"), list):
+        payload["region_rules"] = prev["region_rules"]
+    o_r = prev.get("overlay_source_norm_region_csv")
+    if isinstance(o_r, str) and o_r.strip():
+        payload.setdefault("overlay_source_norm_region_csv", o_r.strip())
+
     p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return []
+
+
+def _norm_region_token(value: str | None) -> str:
+    """Нормализация текста для сопоставления алиаса региона (как в profiles.region)."""
+    return _norm_alias_token(value)
+
+
+def _norm_region_csv_row_to_rule(row: dict[str, Any]) -> dict[str, Any] | None:
+    mm: dict[str, str] = {}
+    for k, v in row.items():
+        mm[_norm_csv_header_cell(str(k))] = str(v or "").strip()
+    alias = mm.get("region_alias", "") or mm.get("alias", "") or mm.get("region", "") or mm.get("регион", "")
+    ck = mm.get("канонический key", "") or mm.get("canonical_key", "")
+    clabel = mm.get("регион в ui", "") or mm.get("canonical_label", "") or mm.get("название", "")
+    alias = str(alias).strip()
+    ck = str(ck).strip()
+    clabel = str(clabel).strip()
+    if not alias or not ck or not clabel:
+        return None
+    return {
+        "region_alias": alias,
+        "canonical_key": ck,
+        "canonical_label": clabel,
+        "active": True,
+    }
+
+
+def _load_norm_region_csv_rules() -> list[dict[str, Any]]:
+    p = norm_region_aliases_file_path()
+    if not p.is_file():
+        return []
+    try:
+        txt = p.read_text(encoding="utf-8-sig", errors="ignore")
+    except OSError:
+        return []
+    if not txt.strip():
+        return []
+    rdr = csv.DictReader(txt.splitlines(), delimiter=";")
+    out: list[dict[str, Any]] = []
+    for row in rdr:
+        if not row:
+            continue
+        rec = _norm_region_csv_row_to_rule(dict(row))
+        if rec:
+            out.append(rec)
+    seen: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for rec in out:
+        nk = _norm_region_token(str(rec.get("region_alias") or ""))
+        if not nk:
+            continue
+        if nk not in seen:
+            order.append(nk)
+        seen[nk] = rec
+    return [seen[k] for k in order]
+
+
+def _load_json_region_alias_rules_only() -> list[dict[str, Any]]:
+    payload = _read_city_aliases_json_payload()
+    rows = payload.get("region_rules")
+    if not isinstance(rows, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        ra = str(r.get("region_alias") or r.get("alias") or "").strip()
+        ck = str(r.get("canonical_key") or "").strip()
+        cl = str(r.get("canonical_label") or "").strip()
+        active = bool(r.get("active", True))
+        if not ra or not ck or not cl:
+            continue
+        out.append(
+            {"region_alias": ra, "canonical_key": ck, "canonical_label": cl, "active": active}
+        )
+    return out
+
+
+def _merge_region_alias_rule_lists(base: list[dict[str, Any]], overlay: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for r in base:
+        nk = _norm_region_token(str(r.get("region_alias") or r.get("alias") or ""))
+        if not nk:
+            continue
+        merged[nk] = dict(r)
+    for r in overlay:
+        nk = _norm_region_token(str(r.get("region_alias") or r.get("alias") or ""))
+        if not nk:
+            continue
+        prev = merged.get(nk, {})
+        merged[nk] = {**prev, **dict(r)}
+    return sorted(
+        merged.values(),
+        key=lambda x: (
+            _norm_region_token(str(x.get("region_alias") or x.get("alias") or "")),
+            str(x.get("region_alias") or x.get("alias") or "").lower(),
+        ),
+    )
+
+
+def _rule_signature_for_region_overlay_compare(r: dict[str, Any]) -> tuple[str, ...]:
+    return (
+        str(r.get("canonical_key") or "").strip(),
+        str(r.get("canonical_label") or "").strip(),
+        "1" if bool(r.get("active", True)) else "0",
+    )
+
+
+def default_region_alias_rules() -> list[dict[str, Any]]:
+    return []
+
+
+def load_region_alias_rules() -> list[dict[str, Any]]:
+    csv_rows = _load_norm_region_csv_rules()
+    json_rows = _load_json_region_alias_rules_only()
+    merged = _merge_region_alias_rule_lists(csv_rows, json_rows)
+    if merged:
+        return merged
+    if csv_rows:
+        return csv_rows
+    if json_rows:
+        return json_rows
+    return default_region_alias_rules()
+
+
+def validate_region_alias_rules(rows: list[dict[str, Any]]) -> list[str]:
+    errors: list[str] = []
+    seen: dict[str, tuple[str, str]] = {}
+    for i, r in enumerate(rows, start=1):
+        ra = str(r.get("region_alias") or r.get("alias") or "").strip()
+        ck = str(r.get("canonical_key") or "").strip()
+        cl = str(r.get("canonical_label") or "").strip()
+        if not ra or not ck or not cl:
+            errors.append(
+                f"Строка {i}: заполните region_alias / canonical_key / canonical_label (Регион в UI)."
+            )
+            continue
+        if not bool(r.get("active", True)):
+            continue
+        key = _norm_region_token(ra)
+        val = (ck, cl)
+        if key in seen and seen[key] != val:
+            errors.append(
+                f"Конфликт region_alias '{ra}': уже связан с {seen[key][0]} / {seen[key][1]}."
+            )
+        else:
+            seen[key] = val
+    return errors
+
+
+def save_region_alias_rules(rows: list[dict[str, Any]]) -> list[str]:
+    dedup_map: dict[str, dict[str, Any]] = {}
+    dedup_order: list[str] = []
+    for r in rows:
+        ra = _str_from_editor_cell(r.get("region_alias") or r.get("alias"))
+        ck = _str_from_editor_cell(r.get("canonical_key"))
+        clabel = _str_from_editor_cell(r.get("canonical_label"))
+        if not ra and not ck and not clabel:
+            continue
+        nk = _norm_region_token(ra)
+        if not nk:
+            continue
+        row_out = {
+            "region_alias": ra,
+            "canonical_key": ck,
+            "canonical_label": clabel,
+            "active": bool(r.get("active", True)),
+        }
+        if nk not in dedup_map:
+            dedup_order.append(nk)
+        dedup_map[nk] = row_out
+
+    clean_rows: list[dict[str, Any]] = [dedup_map[k] for k in dedup_order if k in dedup_map]
+    errs = validate_region_alias_rules(clean_rows)
+    if errs:
+        return errs
+
+    csv_baselines = {
+        _norm_region_token(str(r.get("region_alias") or r.get("alias") or "")): r
+        for r in _load_norm_region_csv_rules()
+    }
+    csv_path = norm_region_aliases_file_path()
+    overlay_rows: list[dict[str, Any]] = []
+    if csv_path.is_file() and csv_baselines:
+        for r in clean_rows:
+            nk = _norm_region_token(str(r.get("region_alias") or r.get("alias") or ""))
+            base = csv_baselines.get(nk)
+            if base is None:
+                overlay_rows.append(dict(r))
+            elif _rule_signature_for_region_overlay_compare(base) != _rule_signature_for_region_overlay_compare(r):
+                overlay_rows.append(dict(r))
+        to_write_regions = overlay_rows
+    else:
+        to_write_regions = clean_rows
+
+    prev = _read_city_aliases_json_payload()
+    payload = dict(prev)
+    payload["updated_at_utc"] = datetime.now(timezone.utc).isoformat()
+    payload["overlay_source_norm_region_csv"] = str(csv_path) if csv_path.is_file() else ""
+    payload["region_rules"] = to_write_regions
+    if "overlay_source_norm_city_csv" not in payload:
+        csv_c = norm_city_aliases_file_path()
+        payload["overlay_source_norm_city_csv"] = str(csv_c) if csv_c.is_file() else ""
+    prev_rules = prev.get("rules")
+    payload["rules"] = prev_rules if isinstance(prev_rules, list) else []
+
+    p = city_aliases_file_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return []
+
+
+def normalize_region_by_alias_rules(
+    raw_region: str | None,
+    rules: list[dict[str, Any]] | None = None,
+) -> tuple[str, str]:
+    """Канонический key и название региона для UI по аналогии с городами."""
+    src = str(raw_region or "").strip()
+    if not src or src == "—":
+        return ("—", "—")
+    rr = rules if rules is not None else load_region_alias_rules()
+    nn = _norm_region_token(src)
+    alias_map: dict[str, tuple[str, str]] = {}
+    for r in rr:
+        if not bool(r.get("active", True)):
+            continue
+        ck = str(r.get("canonical_key") or "").strip()
+        cl = str(r.get("canonical_label") or "").strip()
+        ra = str(r.get("region_alias") or r.get("alias") or "").strip()
+        if not ck or not cl or not ra:
+            continue
+        alias_map[_norm_region_token(ra)] = (ck, cl)
+        alias_map[_norm_region_token(cl)] = (ck, cl)
+        alias_map[_norm_region_token(ck)] = (ck, cl)
+    if nn in alias_map:
+        return alias_map[nn]
+    return (f"raw::{nn}", src)
+
+
+def rollup_region_aggregate_rows(
+    rows: list[dict[str, Any]],
+    rules: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Перегруппировка SQL GROUP BY по сырым строкам регионов после нормализации алиасов."""
+    rr = rules if rules is not None else load_region_alias_rules()
+    agg: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        raw_reg = str(r.get("region") or "")
+        rkey, rlabel = normalize_region_by_alias_rules(raw_reg, rr)
+        cur = agg.get(rkey)
+        p_add = int(r.get("participants") or 0)
+        extras: dict[str, int] = {}
+        if "starts" in r:
+            extras["starts"] = int(r.get("starts") or 0)
+        if cur is None:
+            row_out: dict[str, Any] = {"region": rlabel, "participants": p_add, **extras}
+            agg[rkey] = row_out
+        else:
+            cur["participants"] = int(cur.get("participants") or 0) + p_add
+            if "starts" in cur and extras:
+                cur["starts"] = int(cur.get("starts") or 0) + extras.get("starts", 0)
+
+    out = list(agg.values())
+    first_has_starts = bool(rows) and isinstance(rows[0], dict) and "starts" in rows[0]
+    if first_has_starts:
+        out.sort(
+            key=lambda x: (
+                -int(x.get("participants") or 0),
+                -int(x.get("starts") or 0),
+                str(x.get("region") or ""),
+            )
+        )
+    else:
+        out.sort(
+            key=lambda x: (-int(x.get("participants") or 0), str(x.get("region") or ""))
+        )
+    return out
 
 
 def normalize_city_by_alias_rules(
@@ -4911,6 +5212,7 @@ def query_team_geography(
         """,
         tuple(params),
     )
+    regions = rollup_region_aggregate_rows(regions, load_region_alias_rules())[:30]
     countries = q_all(
         db_path,
         f"""
@@ -5322,6 +5624,7 @@ def query_interesting_facts_geography(
         """,
         tuple(params),
     )
+    regions = rollup_region_aggregate_rows(regions, load_region_alias_rules())[: int(limit)]
     countries = q_all(
         db_path,
         f"""
@@ -5406,6 +5709,8 @@ def query_vm_geography_page(
         """,
         tuple(params),
     )
+    vm_region_rules = load_region_alias_rules()
+    regions = rollup_region_aggregate_rows(regions, vm_region_rules)
     countries = q_all(
         db_path,
         f"""
@@ -5445,6 +5750,7 @@ def query_vm_geography_page(
     for r in raw_city_rows:
         raw_region = str(r.get("region") or "")
         _, label = normalize_city_by_alias_rules(r.get("city"), raw_region or None, city_rules)
+        _, reg_ui = normalize_region_by_alias_rules(raw_region or None, vm_region_rules)
         lbl = str(label or "").strip() or "—"
         key = _norm_alias_token(lbl)
         if not key:
@@ -5456,7 +5762,7 @@ def query_vm_geography_page(
                 "participants": int(r.get("participants") or 0),
                 "starts": int(r.get("starts") or 0),
             }
-            region_by_key[key] = raw_region.strip() or "—"
+            region_by_key[key] = reg_ui if reg_ui != "—" else (raw_region.strip() or "—")
         else:
             cur["participants"] = int(cur.get("participants") or 0) + int(r.get("participants") or 0)
             cur["starts"] = int(cur.get("starts") or 0) + int(r.get("starts") or 0)

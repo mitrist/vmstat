@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import tempfile
 from datetime import date
@@ -887,6 +888,64 @@ def test_normalize_city_by_alias_rules_basic() -> None:
     key, label = mq.normalize_city_by_alias_rules("СПБ", rules=rules)
     assert key == "sankt_peterburg"
     assert label == "Санкт-Петербург"
+
+
+def test_normalize_region_by_alias_rules_basic() -> None:
+    rules = [
+        {
+            "region_alias": "vo",
+            "canonical_key": "vologda_obl",
+            "canonical_label": "Вологодская область",
+            "active": True,
+        }
+    ]
+    k, lab = mq.normalize_region_by_alias_rules("VO", rules=rules)
+    assert k == "vologda_obl"
+    assert lab == "Вологодская область"
+
+
+def test_rollup_region_aggregate_rows_merges_aliases() -> None:
+    rules = [
+        {
+            "region_alias": "aaa",
+            "canonical_key": "k1",
+            "canonical_label": "Label",
+            "active": True,
+        }
+    ]
+    rows = [
+        {"region": "aaa", "participants": 2, "starts": 3},
+        {"region": "AAA", "participants": 1, "starts": 1},
+    ]
+    out = mq.rollup_region_aggregate_rows(rows, rules)
+    assert len(out) == 1
+    assert out[0]["region"] == "Label"
+    assert int(out[0]["participants"]) == 3
+    assert int(out[0]["starts"]) == 4
+
+
+def test_city_and_region_overlays_preserve_each_other(tmp_path: Path, monkeypatch) -> None:
+    f = tmp_path / "city_aliases.json"
+    monkeypatch.setenv("CITY_ALIASES_FILE", str(f))
+    f.write_text(
+        """{
+  "rules": [{"alias": "Xcity", "canonical_key": "xk", "canonical_label": "X", "active": true}],
+  "region_rules": [{"region_alias": "R1", "canonical_key": "rk", "canonical_label": "R", "active": true}]
+}""",
+        encoding="utf-8",
+    )
+    assert len(mq.save_city_alias_rules([{"alias": "Ycity", "canonical_key": "yk", "canonical_label": "Y", "active": True}])) == 0
+    data = json.loads(f.read_text(encoding="utf-8"))
+    assert any(r.get("alias") == "Ycity" for r in data["rules"])
+    rr = data.get("region_rules")
+    assert isinstance(rr, list) and any(r.get("region_alias") == "R1" for r in rr)
+
+    assert mq.save_region_alias_rules(
+        [{"region_alias": "R2", "canonical_key": "r2", "canonical_label": "R2 lab", "active": True}]
+    ) == []
+    data2 = json.loads(f.read_text(encoding="utf-8"))
+    assert any(r.get("region_alias") == "R2" for r in data2.get("region_rules", []))
+    assert any(r.get("alias") == "Ycity" for r in data2["rules"])
 
 
 def test_normalize_city_by_reference_csv(tmp_path: Path, monkeypatch) -> None:
