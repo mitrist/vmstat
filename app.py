@@ -1508,11 +1508,6 @@ def page_vm_geography() -> None:
     years_all = mq.query_distinct_years(path)
     sports_all = mq.query_distinct_sports(path)
 
-    st.markdown(
-        f'<p style="color:{VM_TEXT};font-weight:600;margin:0 0 4px 0;">Год</p>'
-        f'<p style="color:{VM_MUTED};font-size:0.85rem;margin:0 0 8px 0;">«Все» — без фильтра по году.</p>',
-        unsafe_allow_html=True,
-    )
     year_options = ["Все"] + [str(y) for y in years_all]
     year_pick = (
         st.pills(
@@ -1521,18 +1516,12 @@ def page_vm_geography() -> None:
             selection_mode="single",
             default="Все",
             key="geo_vm_pills_year",
-            label_visibility="collapsed",
         )
         if year_options
         else "Все"
     )
     year_val: int | None = None if year_pick == "Все" else int(year_pick)
 
-    st.markdown(
-        f'<p style="color:{VM_TEXT};font-weight:600;margin:0 0 4px 0;">Вид спорта</p>'
-        f'<p style="color:{VM_MUTED};font-size:0.85rem;margin:0 0 8px 0;">«Все» — без фильтра по виду спорта.</p>',
-        unsafe_allow_html=True,
-    )
     sport_options = ["Все"] + sports_all
     sport_pick = (
         st.pills(
@@ -1541,7 +1530,6 @@ def page_vm_geography() -> None:
             selection_mode="single",
             default="Все",
             key="geo_vm_pills_sport",
-            label_visibility="collapsed",
         )
         if sport_options
         else "Все"
@@ -1599,7 +1587,6 @@ def page_vm_geography() -> None:
                 "Участников": st.column_config.NumberColumn("Участников", format="%d"),
             },
         )
-        st.caption(f"На карте: **{len(pts)}** город(ов) из **{len(cities_all)}** с координатами в эталоне **city.csv**.")
 
 
 def page_vm_records() -> None:
