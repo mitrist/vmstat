@@ -397,7 +397,8 @@ def test_team_extended_queries(sample_db: Path) -> None:
     assert len(slices["by_distance"]) == 2
 
     geo = mq.query_team_geography(sample_db, "Team A")
-    assert geo["cities"][0]["city"] == "Vologda"
+    # Профиль: city=Vologda; при наличии norm_city.csv название становится каноническим русским («Вологда»).
+    assert geo["cities"][0]["city"] == "Вологда"
     assert geo["regions"][0]["region"] == "VO"
     assert geo["countries"][0]["country"] == "Россия"
 
@@ -410,6 +411,14 @@ def test_team_extended_queries(sample_db: Path) -> None:
     assert q_map["Стартов всего"] == 3
     assert q_map["Финишей"] == 2
     assert q_map["DNF"] == 1
+
+
+def test_vm_geography_page_queries(sample_db: Path) -> None:
+    out = mq.query_vm_geography_page(sample_db, year=None, sport=None)
+    assert isinstance(out["regions"], list)
+    assert isinstance(out["countries"], list)
+    assert isinstance(out["cities"], list)
+    assert isinstance(out["map_points"], list)
 
 
 def test_cups_for_obsh_header_filter(sample_db: Path) -> None:
@@ -881,17 +890,18 @@ def test_normalize_city_by_alias_rules_basic() -> None:
 
 
 def test_normalize_city_by_reference_csv(tmp_path: Path, monkeypatch) -> None:
+    """Второй слой: city.csv без алиасного справочника (пустой слой алиасов)."""
     city_ref = tmp_path / "city.csv"
     city_ref.write_text(
         "city,region,geo_lat,geo_lon,population,capital_marker,fias_id\n"
-        "Вологда,Вологодская,59.22,39.88,300000,2,fias-vologda\n",
+        "Chery,RegionX,59.22,39.88,300000,2,fias-example\n",
         encoding="utf-8",
     )
     monkeypatch.setenv("CITY_REFERENCE_FILE", str(city_ref))
-    monkeypatch.setenv("CITY_ALIASES_FILE", str(tmp_path / "missing_aliases.json"))
-    key, label = mq.normalize_city_by_alias_rules("г Вологда", "Вологодская")
+    monkeypatch.setattr(mq, "load_city_alias_rules", lambda: [])
+    key, label = mq.normalize_city_by_alias_rules("Chery", "RegionX")
     assert key.startswith("cityref::")
-    assert label == "Вологда"
+    assert label == "Chery"
 
 
 def test_interesting_facts_geography_city_aliases(sample_db: Path, tmp_path: Path, monkeypatch) -> None:
@@ -920,6 +930,129 @@ def test_interesting_facts_geography_city_aliases(sample_db: Path, tmp_path: Pat
     geo = mq.query_interesting_facts_geography(sample_db, year=2024, sport="run", limit=20)
     city_names = [str(r.get("city")) for r in geo.get("cities", [])]
     assert "Вологда" in city_names
+
+
+def test_city_normalization_schema_and_batch(sample_db: Path, tmp_path: Path, monkeypatch) -> None:
+    city_ref = tmp_path / "city.csv"
+    city_ref.write_text(
+        "city,region,population,capital_marker,fias_id\n"
+        "Vologda,VO,300000,2,fias-vologda\n"
+        "Cherepovets,VO,300000,1,fias-cherep\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CITY_REFERENCE_FILE", str(city_ref))
+    monkeypatch.setenv("CITY_ALIASES_FILE", str(tmp_path / "missing_aliases.json"))
+    mq.ensure_city_normalization_schema(sample_db)
+    dry = mq.run_city_normalization_batch(sample_db, limit=50, dry_run=True)
+    assert int(dry["processed"]) >= 2
+    apply = mq.run_city_normalization_batch(sample_db, limit=50, dry_run=False)
+    assert int(apply["updated_rows"]) >= 1
+    rows = mq.q_all(
+        sample_db,
+        "SELECT canonical_city_id, canonical_city_label, normalize_status FROM profiles WHERE id = 100",
+    )
+    assert rows
+    assert str(rows[0]["canonical_city_label"]).strip() != ""
+    assert str(rows[0]["normalize_status"]).startswith("auto")
+
+
+def test_city_queue_search_and_batch_by_city(sample_db: Path) -> None:
+    mq.ensure_city_normalization_schema(sample_db)
+    with mq.connect(sample_db) as c:
+        c.execute(
+            """
+            INSERT INTO city_normalization_queue
+                (profile_id, city_raw, region_raw, country_raw, canonical_city_key, canonical_city_label, reason, normalize_score, top_candidates_json, status)
+            VALUES (100, 'Vologda', 'VO', 'Russia', 'fias-vologda', 'Vologda', 'fuzzy_uncertain', 0.91, '[]', 'pending')
+            """
+        )
+        c.execute(
+            """
+            INSERT INTO city_normalization_queue
+                (profile_id, city_raw, region_raw, country_raw, canonical_city_key, canonical_city_label, reason, normalize_score, top_candidates_json, status)
+            VALUES (101, 'Vologda', 'VO', 'Russia', 'fias-vologda', 'Vologda', 'fuzzy_uncertain', 0.92, '[]', 'pending')
+            """
+        )
+        c.commit()
+    filtered = mq.query_city_normalization_queue(sample_db, limit=50, city_raw_search="volo")
+    assert len(filtered) == 2
+    assert all(str(r.get("canonical_city_key") or "") == "fias-vologda" for r in filtered)
+    grouped = mq.query_city_normalization_city_groups(sample_db, limit=50, city_raw_search="vol")
+    assert grouped
+    assert str(grouped[0]["city_raw"]) == "Vologda"
+    bout = mq.apply_city_queue_decision_for_city_raw(
+        sample_db,
+        "Vologda",
+        "fias-vologda",
+        "Vologda",
+        "VO",
+        create_alias=False,
+    )
+    assert bout["errors"] == []
+    assert int(bout["updated"]) == 2
+
+
+def test_apply_city_queue_decision_and_alias(sample_db: Path, tmp_path: Path, monkeypatch) -> None:
+    alias_file = tmp_path / "city_aliases.json"
+    alias_file.write_text('{"rules":[]}', encoding="utf-8")
+    monkeypatch.setenv("CITY_ALIASES_FILE", str(alias_file))
+    mq.ensure_city_normalization_schema(sample_db)
+    with mq.connect(sample_db) as c:
+        c.execute(
+            """
+            INSERT INTO city_normalization_queue
+                (profile_id, city_raw, region_raw, country_raw, reason, normalize_score, top_candidates_json, status)
+            VALUES (100, 'Вологда ', 'Вологодская', 'Россия', 'fuzzy_uncertain', 0.91, '[]', 'pending')
+            """
+        )
+        c.commit()
+    qrows = mq.query_city_normalization_queue(sample_db, limit=10)
+    assert qrows
+    qid = int(qrows[0]["id"])
+    errs = mq.apply_city_queue_decision(
+        sample_db,
+        qid,
+        "fias-vologda",
+        "Вологда",
+        "Вологодская",
+        create_alias=True,
+    )
+    assert errs == []
+    row = mq.q_one(
+        sample_db,
+        "SELECT canonical_city_id, canonical_city_label, normalize_status FROM profiles WHERE id = 100",
+    )
+    assert row is not None
+    assert row["canonical_city_id"] == "fias-vologda"
+    assert row["normalize_status"] == "manual"
+    alias_rows = mq.load_city_alias_rules()
+    assert any(str(r.get("canonical_label")) == "Вологда" for r in alias_rows)
+
+
+def test_save_city_alias_rules_deduplicates_by_city_raw(tmp_path: Path, monkeypatch) -> None:
+    alias_file = tmp_path / "city_aliases.json"
+    monkeypatch.setenv("CITY_ALIASES_FILE", str(alias_file))
+    errs = mq.save_city_alias_rules(
+        [
+            {
+                "alias": " Vologda ",
+                "canonical_key": "city-old",
+                "canonical_label": "Old Vologda",
+                "active": True,
+            },
+            {
+                "alias": "vologda",
+                "canonical_key": "city-new",
+                "canonical_label": "Vologda",
+                "active": True,
+            },
+        ]
+    )
+    assert errs == []
+    rows = mq.load_city_alias_rules()
+    same_alias_rows = [r for r in rows if str(r.get("alias") or "").strip().casefold() in {"vologda", " vologda "}]
+    assert len(same_alias_rows) == 1
+    assert same_alias_rows[0]["canonical_key"] == "city-new"
 
 
 def test_vm_records_champions_cards_counts_by_series_distance_gender(tmp_path: Path) -> None:

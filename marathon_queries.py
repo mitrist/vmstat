@@ -9,6 +9,7 @@ import os
 import re
 import sqlite3
 import csv
+from difflib import SequenceMatcher
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from functools import lru_cache
@@ -25,6 +26,10 @@ DEFAULT_CITY_ALIASES_FILE = (
 DEFAULT_CITY_REFERENCE_FILE = (
     Path(__file__).resolve().parent / "city-master" / "city-master" / "city.csv"
 )
+DEFAULT_NORM_CITY_ALIAS_FILE = (
+    Path(__file__).resolve().parent / "city-master" / "city-master" / "norm_city.csv"
+)
+DEFAULT_CITY_NORMALIZATION_CHUNK = 1000
 DEFAULT_STAGES_FILE = Path(__file__).resolve().parent / ".cursor" / "etapy.yaml"
 LEGACY_STAGES_FILE = Path(__file__).resolve().parent / ".cursor" / "etapi.md"
 # Fallback-карта этапов для Бегового кубка 2026 (cup_id=54), если файл карты недоступен.
@@ -271,6 +276,162 @@ def city_reference_file_path() -> Path:
     return DEFAULT_CITY_REFERENCE_FILE
 
 
+def norm_city_aliases_file_path() -> Path:
+    """Нормализованный справочник городов (norm_city.csv в корне city-master)."""
+    raw = os.environ.get("NORM_CITY_ALIAS_FILE", "").strip()
+    if raw:
+        return Path(raw)
+    return DEFAULT_NORM_CITY_ALIAS_FILE
+
+
+def _norm_csv_header_cell(h: str | None) -> str:
+    return (h or "").replace("\ufeff", "").strip().casefold()
+
+
+def _norm_city_csv_row_to_rule(row: dict[str, Any]) -> dict[str, Any] | None:
+    """Строка norm_city.csv -> rule c полями alias, canonical_key, canonical_label, canonical_city_id."""
+    mm: dict[str, str] = {}
+    for k, v in row.items():
+        mm[_norm_csv_header_cell(str(k))] = str(v or "").strip()
+    alias = (
+        mm.get("alias", "")
+        or mm.get("city_raw", "")
+        or mm.get("город", "")
+    )
+    ck = mm.get("канонический key", "") or mm.get("canonical_key", "")
+    clabel = (
+        mm.get("название города в ui", "")
+        or mm.get("canonical_label", "")
+        or mm.get("название", "")
+    )
+    cid = mm.get("canonical_city_id", "") or mm.get("city_id", "")
+    alias = str(alias).strip()
+    ck = str(ck).strip()
+    clabel = str(clabel).strip()
+    cid_s = str(cid).strip() if cid is not None and str(cid).strip() else ""
+    if not alias or not ck or not clabel:
+        return None
+    return {
+        "alias": alias,
+        "canonical_key": ck,
+        "canonical_label": clabel,
+        "canonical_city_id": cid_s,
+        "active": True,
+    }
+
+
+def _load_norm_city_csv_rules() -> list[dict[str, Any]]:
+    p = norm_city_aliases_file_path()
+    if not p.is_file():
+        return []
+    try:
+        txt = p.read_text(encoding="utf-8-sig", errors="ignore")
+    except OSError:
+        return []
+    if not txt.strip():
+        return []
+    rdr = csv.DictReader(txt.splitlines(), delimiter=";")
+    out: list[dict[str, Any]] = []
+    for row in rdr:
+        if not row:
+            continue
+        rec = _norm_city_csv_row_to_rule(dict(row))
+        if rec:
+            out.append(rec)
+    seen: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for rec in out:
+        nk = _norm_city_token(str(rec.get("alias") or ""))
+        if not nk:
+            continue
+        if nk not in seen:
+            order.append(nk)
+        seen[nk] = rec
+    return [seen[k] for k in order]
+
+
+def _load_json_city_alias_rules_only() -> list[dict[str, Any]]:
+    """Только JSON-оверлей (без объединения с norm_city.csv)."""
+    p = city_aliases_file_path()
+    if not p.is_file():
+        return []
+    try:
+        payload = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    rows = payload.get("rules") if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        alias = str(r.get("alias") or "").strip()
+        canonical_key = str(r.get("canonical_key") or "").strip()
+        canonical_label = str(r.get("canonical_label") or "").strip()
+        active = bool(r.get("active", True))
+        cid = str(r.get("canonical_city_id") or "").strip()
+        if not alias or not canonical_key or not canonical_label:
+            continue
+        row_d: dict[str, Any] = {
+            "alias": alias,
+            "canonical_key": canonical_key,
+            "canonical_label": canonical_label,
+            "active": active,
+        }
+        if cid:
+            row_d["canonical_city_id"] = cid
+        out.append(row_d)
+    return out
+
+
+def _merge_city_alias_rule_lists(base: list[dict[str, Any]], overlay: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Объединяет списки правил по нормализованному alias; overlay перекрывает base."""
+    merged: dict[str, dict[str, Any]] = {}
+    for r in base:
+        nk = _norm_city_token(str(r.get("alias") or ""))
+        if not nk:
+            continue
+        merged[nk] = dict(r)
+    for r in overlay:
+        nk = _norm_city_token(str(r.get("alias") or ""))
+        if not nk:
+            continue
+        prev = merged.get(nk, {})
+        merged[nk] = {**prev, **dict(r)}
+    return sorted(
+        merged.values(),
+        key=lambda x: (_norm_city_token(str(x.get("alias") or "")), str(x.get("alias") or "").lower()),
+    )
+
+
+def _rule_signature_for_overlay_compare(r: dict[str, Any]) -> tuple[str, ...]:
+    return (
+        str(r.get("canonical_key") or "").strip(),
+        str(r.get("canonical_label") or "").strip(),
+        "1" if bool(r.get("active", True)) else "0",
+        str(r.get("canonical_city_id") or "").strip(),
+    )
+
+
+def _str_from_editor_cell(v: Any) -> str:
+    """Приводит ячейку data_editor/DataFrame к строке; убирает NaN из pandas/streamlit."""
+    if v is None:
+        return ""
+    if isinstance(v, float):
+        try:
+            if v != v:  # NaN
+                return ""
+        except (TypeError, ValueError):
+            pass
+    s = str(v).strip()
+    if not s:
+        return ""
+    if s.lower() == "nan":
+        return ""
+    return s
+
+
 def _norm_city_token(value: str | None) -> str:
     s = _norm_alias_token(value)
     s = re.sub(r"^(г\.?|гор|город)\s+", "", s).strip()
@@ -282,6 +443,16 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return int(float(str(value)))
     except (TypeError, ValueError):
         return default
+
+
+def _safe_coord(value: Any) -> float | None:
+    try:
+        x = float(str(value).strip().replace(",", "."))
+        if x != x or abs(x) > 1e6:
+            return None
+        return x
+    except (TypeError, ValueError):
+        return None
 
 
 @lru_cache(maxsize=4)
@@ -309,6 +480,8 @@ def _load_city_reference_index_cached(path_str: str, mtime_ns: int) -> dict[str,
             "population": _safe_int(row.get("population"), 0),
             "capital_marker": _safe_int(row.get("capital_marker"), 0),
             "fias_id": str(row.get("fias_id") or "").strip(),
+            "geo_lat": _safe_coord(row.get("geo_lat")),
+            "geo_lon": _safe_coord(row.get("geo_lon")),
         }
         out.setdefault(city_norm, []).append(rec)
     for k, vals in out.items():
@@ -378,38 +551,20 @@ def default_city_alias_rules() -> list[dict[str, Any]]:
 
 def load_city_alias_rules() -> list[dict[str, Any]]:
     """
-    Читает справочник алиасов городов из JSON.
-    Если файла нет или формат некорректен — отдаёт дефолтные правила.
+    Справочник алиасов городов: norm_city.csv (база) + JSON-оверлей (поверх базы при совпадении alias).
+
+    Если нет ни CSV, ни валидного JSON — возвращает встроенные дефолтные строки.
     """
-    p = city_aliases_file_path()
-    if not p.is_file():
-        return default_city_alias_rules()
-    try:
-        payload = json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return default_city_alias_rules()
-    rows = payload.get("rules") if isinstance(payload, dict) else None
-    if not isinstance(rows, list):
-        return default_city_alias_rules()
-    out: list[dict[str, Any]] = []
-    for r in rows:
-        if not isinstance(r, dict):
-            continue
-        alias = str(r.get("alias") or "").strip()
-        canonical_key = str(r.get("canonical_key") or "").strip()
-        canonical_label = str(r.get("canonical_label") or "").strip()
-        active = bool(r.get("active", True))
-        if not alias or not canonical_key or not canonical_label:
-            continue
-        out.append(
-            {
-                "alias": alias,
-                "canonical_key": canonical_key,
-                "canonical_label": canonical_label,
-                "active": active,
-            }
-        )
-    return out if out else default_city_alias_rules()
+    csv_rows = _load_norm_city_csv_rules()
+    json_rows = _load_json_city_alias_rules_only()
+    merged = _merge_city_alias_rule_lists(csv_rows, json_rows)
+    if merged:
+        return merged
+    if csv_rows:
+        return csv_rows
+    if json_rows:
+        return json_rows
+    return default_city_alias_rules()
 
 
 def validate_city_alias_rules(rows: list[dict[str, Any]]) -> list[str]:
@@ -437,30 +592,62 @@ def validate_city_alias_rules(rows: list[dict[str, Any]]) -> list[str]:
 
 
 def save_city_alias_rules(rows: list[dict[str, Any]]) -> list[str]:
-    """Сохраняет справочник алиасов городов в JSON; возвращает список ошибок валидации."""
-    errs = validate_city_alias_rules(rows)
-    if errs:
-        return errs
-    clean_rows: list[dict[str, Any]] = []
+    """
+    Сохраняет отличия от norm_city.csv в JSON-оверлей (горизонты правки без дубля всего каталога).
+    Если norm_city.csv отсутствует — сохраняет полный набор строк в JSON.
+    """
+    # Дедупликация по нормализованному alias: сохраняем последнюю запись.
+    dedup_map: dict[str, dict[str, Any]] = {}
+    dedup_order: list[str] = []
     for r in rows:
-        alias = str(r.get("alias") or "").strip()
-        ckey = str(r.get("canonical_key") or "").strip()
-        clabel = str(r.get("canonical_label") or "").strip()
+        alias = _str_from_editor_cell(r.get("alias"))
+        ckey = _str_from_editor_cell(r.get("canonical_key"))
+        clabel = _str_from_editor_cell(r.get("canonical_label"))
         if not alias and not ckey and not clabel:
             continue
-        clean_rows.append(
-            {
-                "alias": alias,
-                "canonical_key": ckey,
-                "canonical_label": clabel,
-                "active": bool(r.get("active", True)),
-            }
-        )
+        norm_alias = _norm_city_token(alias)
+        if not norm_alias:
+            continue
+        cid = _str_from_editor_cell(r.get("canonical_city_id"))
+        row_out: dict[str, Any] = {
+            "alias": alias,
+            "canonical_key": ckey,
+            "canonical_label": clabel,
+            "active": bool(r.get("active", True)),
+        }
+        if cid:
+            row_out["canonical_city_id"] = cid
+        if norm_alias not in dedup_map:
+            dedup_order.append(norm_alias)
+        dedup_map[norm_alias] = row_out
+    clean_rows: list[dict[str, Any]] = [dedup_map[k] for k in dedup_order if k in dedup_map]
+
+    errs = validate_city_alias_rules(clean_rows)
+    if errs:
+        return errs
+
+    csv_baselines = { _norm_city_token(str(r.get("alias") or "")): r for r in _load_norm_city_csv_rules()}
+    csv_path = norm_city_aliases_file_path()
+
+    overlay_rows: list[dict[str, Any]] = []
+    if csv_path.is_file() and csv_baselines:
+        for r in clean_rows:
+            nk = _norm_city_token(str(r.get("alias") or ""))
+            base = csv_baselines.get(nk)
+            if base is None:
+                overlay_rows.append(dict(r))
+            elif _rule_signature_for_overlay_compare(base) != _rule_signature_for_overlay_compare(r):
+                overlay_rows.append(dict(r))
+        to_write = overlay_rows
+    else:
+        to_write = clean_rows
+
     p = city_aliases_file_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "updated_at_utc": datetime.now(timezone.utc).isoformat(),
-        "rules": clean_rows,
+        "overlay_source_norm_city_csv": str(csv_path) if csv_path.is_file() else "",
+        "rules": to_write,
     }
     p.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return []
@@ -509,6 +696,522 @@ def normalize_city_by_alias_rules(
         return (f"cityref::{city_key}", city_label)
 
     return (f"raw::{norm_src}", src)
+
+
+def ensure_city_normalization_schema(db_path: Path | str | None = None) -> None:
+    """Создаёт служебные таблицы и колонки для нормализации городов."""
+    path = Path(db_path) if db_path is not None else DEFAULT_DB
+    if not path.is_file():
+        return
+    with connect(path) as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS city_aliases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                alias_raw TEXT NOT NULL,
+                alias_norm TEXT NOT NULL,
+                canonical_city_id TEXT NOT NULL,
+                canonical_city_label TEXT NOT NULL,
+                canonical_region_label TEXT,
+                source TEXT NOT NULL DEFAULT 'manual',
+                confidence REAL,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(alias_norm)
+            );
+            CREATE TABLE IF NOT EXISTS city_normalization_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                profile_id INTEGER NOT NULL,
+                city_raw TEXT,
+                region_raw TEXT,
+                country_raw TEXT,
+                canonical_city_key TEXT,
+                canonical_city_label TEXT,
+                reason TEXT NOT NULL,
+                normalize_score REAL,
+                top_candidates_json TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(profile_id)
+            );
+            CREATE TABLE IF NOT EXISTS city_normalization_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                dry_run INTEGER NOT NULL DEFAULT 1,
+                processed INTEGER NOT NULL DEFAULT 0,
+                updated_rows INTEGER NOT NULL DEFAULT 0,
+                queued_rows INTEGER NOT NULL DEFAULT 0,
+                skipped_non_ru INTEGER NOT NULL DEFAULT 0,
+                details_json TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+            """
+        )
+        for col, ctype in [
+            ("canonical_city_id", "TEXT"),
+            ("canonical_city_label", "TEXT"),
+            ("canonical_region_label", "TEXT"),
+            ("normalize_status", "TEXT"),
+            ("normalize_score", "REAL"),
+            ("normalized_at", "TEXT"),
+        ]:
+            if not _table_has_column(path, "profiles", col):
+                c.execute(f"ALTER TABLE profiles ADD COLUMN {col} {ctype}")
+        for col, ctype in [
+            ("canonical_city_key", "TEXT"),
+            ("canonical_city_label", "TEXT"),
+        ]:
+            if not _table_has_column(path, "city_normalization_queue", col):
+                c.execute(f"ALTER TABLE city_normalization_queue ADD COLUMN {col} {ctype}")
+        c.commit()
+
+
+def _city_similarity_score(src: str, candidate: str) -> float:
+    return float(SequenceMatcher(None, _norm_city_token(src), _norm_city_token(candidate)).ratio())
+
+
+def _pick_best_city_candidate(
+    city_raw: str,
+    region_raw: str | None,
+    candidates: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, float, str]:
+    if not candidates:
+        return (None, 0.0, "not_found")
+    rr = _norm_alias_token(region_raw)
+    by_region = [x for x in candidates if rr and str(x.get("region_norm") or "") == rr]
+    if len(by_region) == 1:
+        return (by_region[0], 1.0, "auto_region")
+    pool = by_region if by_region else candidates
+    best = max(pool, key=lambda x: _city_similarity_score(city_raw, str(x.get("city_label") or "")))
+    score = _city_similarity_score(city_raw, str(best.get("city_label") or ""))
+    return (best, score, "auto_fuzzy")
+
+
+def query_city_normalization_queue(
+    db_path: Path | str,
+    limit: int = 200,
+    city_raw_search: str = "",
+) -> list[dict[str, Any]]:
+    ensure_city_normalization_schema(db_path)
+    lim = max(1, int(limit))
+    search = str(city_raw_search or "").strip()
+    where_extra = ""
+    params: tuple[Any, ...] = (lim,)
+    if search:
+        where_extra = " AND LOWER(COALESCE(q.city_raw, '')) LIKE ?"
+        params = (f"%{search.casefold()}%", lim)
+    return q_all(
+        db_path,
+        """
+        SELECT
+            q.id,
+            q.profile_id,
+            q.city_raw,
+            q.region_raw,
+            q.country_raw,
+            q.canonical_city_key,
+            q.canonical_city_label,
+            q.reason,
+            q.normalize_score,
+            q.top_candidates_json,
+            q.status,
+            q.updated_at
+        FROM city_normalization_queue q
+        WHERE q.status = 'pending'
+        """
+        + where_extra
+        + """
+        ORDER BY COALESCE(q.normalize_score, 0.0) DESC, q.id ASC
+        LIMIT ?
+        """,
+        params,
+    )
+
+
+def query_city_normalization_city_groups(
+    db_path: Path | str,
+    limit: int = 200,
+    city_raw_search: str = "",
+) -> list[dict[str, Any]]:
+    """Группы хвоста по city_raw для пакетной ручной модерации."""
+    ensure_city_normalization_schema(db_path)
+    lim = max(1, int(limit))
+    search = str(city_raw_search or "").strip()
+    where_extra = ""
+    params: tuple[Any, ...] = (lim,)
+    if search:
+        where_extra = " AND LOWER(COALESCE(city_raw, '')) LIKE ?"
+        params = (f"%{search.casefold()}%", lim)
+    return q_all(
+        db_path,
+        """
+        SELECT
+            city_raw,
+            COUNT(*) AS items_count,
+            MIN(COALESCE(normalize_score, 0.0)) AS min_score,
+            MAX(COALESCE(normalize_score, 0.0)) AS max_score,
+            COALESCE(MAX(canonical_city_key), '') AS canonical_city_key,
+            COALESCE(MAX(canonical_city_label), '') AS canonical_city_label
+        FROM city_normalization_queue
+        WHERE status = 'pending'
+        """
+        + where_extra
+        + """
+        GROUP BY city_raw
+        ORDER BY items_count DESC, city_raw ASC
+        LIMIT ?
+        """,
+        params,
+    )
+
+
+def append_city_alias_rule(
+    alias: str,
+    canonical_key: str,
+    canonical_label: str,
+    *,
+    canonical_city_id: str | None = None,
+) -> list[str]:
+    """Добавляет/обновляет один alias в JSON-оверлее городов."""
+    alias_raw = str(alias or "").strip()
+    ckey = str(canonical_key or "").strip()
+    clabel = str(canonical_label or "").strip()
+    cid_opt = str(canonical_city_id or "").strip()
+    if not alias_raw or not ckey or not clabel:
+        return ["Заполните alias / canonical_key / canonical_label."]
+    rows = load_city_alias_rules()
+    norm_alias = _norm_city_token(alias_raw)
+    updated = False
+    for r in rows:
+        if _norm_city_token(str(r.get("alias") or "")) == norm_alias:
+            r["canonical_key"] = ckey
+            r["canonical_label"] = clabel
+            r["active"] = True
+            if cid_opt:
+                r["canonical_city_id"] = cid_opt
+            elif "canonical_city_id" in r:
+                del r["canonical_city_id"]
+            updated = True
+            break
+    if not updated:
+        new_row: dict[str, Any] = {
+            "alias": alias_raw,
+            "canonical_key": ckey,
+            "canonical_label": clabel,
+            "active": True,
+        }
+        if cid_opt:
+            new_row["canonical_city_id"] = cid_opt
+        rows.append(new_row)
+    return save_city_alias_rules(rows)
+
+
+def apply_city_queue_decision(
+    db_path: Path | str,
+    queue_id: int,
+    canonical_city_id: str,
+    canonical_city_label: str,
+    canonical_region_label: str,
+    *,
+    create_alias: bool = False,
+) -> list[str]:
+    """Применяет ручное решение по записи очереди и опционально пополняет alias-справочник."""
+    ensure_city_normalization_schema(db_path)
+    qid = int(queue_id)
+    city_id = str(canonical_city_id or "").strip()
+    city_label = str(canonical_city_label or "").strip()
+    region_label = str(canonical_region_label or "").strip()
+    if not city_id or not city_label:
+        return ["Укажите canonical_city_id и canonical_city_label."]
+    with connect(db_path) as c:
+        row = c.execute(
+            "SELECT profile_id, city_raw FROM city_normalization_queue WHERE id = ?",
+            (qid,),
+        ).fetchone()
+        if not row:
+            return [f"Запись очереди #{qid} не найдена."]
+        pid = int(row["profile_id"])
+        city_raw = str(row["city_raw"] or "").strip()
+        now_utc = datetime.now(timezone.utc).isoformat()
+        c.execute(
+            """
+            UPDATE profiles
+            SET canonical_city_id = ?,
+                canonical_city_label = ?,
+                canonical_region_label = ?,
+                normalize_status = 'manual',
+                normalize_score = 1.0,
+                normalized_at = ?
+            WHERE id = ?
+            """,
+            (city_id, city_label, region_label, now_utc, pid),
+        )
+        c.execute(
+            """
+            UPDATE city_normalization_queue
+            SET status = 'resolved', updated_at = ?
+            WHERE id = ?
+            """,
+            (now_utc, qid),
+        )
+        c.commit()
+    if create_alias and city_raw:
+        errs = append_city_alias_rule(city_raw, city_id, city_label, canonical_city_id=city_id)
+        if errs:
+            return errs
+    return []
+
+
+def apply_city_queue_decision_for_city_raw(
+    db_path: Path | str,
+    city_raw: str,
+    canonical_city_id: str,
+    canonical_city_label: str,
+    canonical_region_label: str,
+    *,
+    create_alias: bool = False,
+) -> dict[str, Any]:
+    """Пакетно применяет ручное решение ко всем pending-записям выбранного city_raw."""
+    ensure_city_normalization_schema(db_path)
+    src_city = str(city_raw or "").strip()
+    city_id = str(canonical_city_id or "").strip()
+    city_label = str(canonical_city_label or "").strip()
+    region_label = str(canonical_region_label or "").strip()
+    if not src_city:
+        return {"errors": ["Укажите city_raw для пакетной правки."], "updated": 0}
+    if not city_id or not city_label:
+        return {"errors": ["Укажите canonical_city_id и canonical_city_label."], "updated": 0}
+    with connect(db_path) as c:
+        rows = c.execute(
+            """
+            SELECT id
+            FROM city_normalization_queue
+            WHERE status = 'pending' AND COALESCE(city_raw, '') = ?
+            """,
+            (src_city,),
+        ).fetchall()
+    updated = 0
+    errors: list[str] = []
+    for row in rows:
+        errs = apply_city_queue_decision(
+            db_path,
+            int(row["id"]),
+            city_id,
+            city_label,
+            region_label,
+            create_alias=False,
+        )
+        if errs:
+            errors.extend(errs)
+        else:
+            updated += 1
+    if create_alias and src_city and not errors:
+        alias_errs = append_city_alias_rule(src_city, city_id, city_label)
+        if alias_errs:
+            errors.extend(alias_errs)
+    return {"errors": errors, "updated": updated}
+
+
+def run_city_normalization_batch(
+    db_path: Path | str | None = None,
+    *,
+    limit: int = DEFAULT_CITY_NORMALIZATION_CHUNK,
+    offset: int = 0,
+    dry_run: bool = True,
+    fuzzy_auto_threshold: float = 0.95,
+    fuzzy_review_threshold: float = 0.90,
+) -> dict[str, Any]:
+    """
+    Батч-нормализация профилей по city/region/country.
+    dry_run=True считает статистику без записи в БД.
+    """
+    path = Path(db_path) if db_path is not None else DEFAULT_DB
+    ensure_city_normalization_schema(path)
+    lim = max(1, int(limit))
+    off = max(0, int(offset))
+    status_counts: dict[str, int] = {}
+    processed = 0
+    updated_rows = 0
+    queued_rows = 0
+    skipped_non_ru = 0
+    rules = load_city_alias_rules()
+    ref_idx = load_city_reference_index()
+    with connect(path) as c:
+        rows = c.execute(
+            """
+            SELECT
+                p.id,
+                COALESCE(TRIM(p.city), '') AS city,
+                COALESCE(TRIM(p.region), '') AS region,
+                COALESCE(TRIM(p.country), '') AS country
+            FROM profiles p
+            ORDER BY p.id
+            LIMIT ? OFFSET ?
+            """,
+            (lim, off),
+        ).fetchall()
+        now_utc = datetime.now(timezone.utc).isoformat()
+        for row in rows:
+            processed += 1
+            pid = int(row["id"])
+            city_raw = str(row["city"] or "").strip()
+            region_raw = str(row["region"] or "").strip()
+            country_raw = str(row["country"] or "").strip()
+            best: dict[str, Any] | None = None
+            if not city_raw:
+                status = "need_review"
+                score = 0.0
+                candidate_payload = json.dumps([], ensure_ascii=False)
+                reason = "empty_city"
+                decided: dict[str, Any] | None = None
+            elif country_raw and _norm_alias_token(country_raw) not in {"россия", "рф"}:
+                skipped_non_ru += 1
+                status = "skipped_non_ru"
+                score = 0.0
+                candidate_payload = json.dumps([], ensure_ascii=False)
+                reason = "non_ru_country"
+                decided = None
+            else:
+                key, label = normalize_city_by_alias_rules(city_raw, region_raw, rules=rules)
+                if key.startswith("raw::"):
+                    city_norm = _norm_city_token(city_raw)
+                    candidates = ref_idx.get(city_norm, [])
+                    best, fuzzy_score, detected_status = _pick_best_city_candidate(city_raw, region_raw, candidates)
+                    score = float(fuzzy_score)
+                    candidate_payload = json.dumps(
+                        [
+                            {
+                                "city_label": x.get("city_label"),
+                                "region_label": x.get("region_norm"),
+                                "fias_id": x.get("fias_id"),
+                            }
+                            for x in candidates[:5]
+                        ],
+                        ensure_ascii=False,
+                    )
+                    if best and score >= fuzzy_auto_threshold:
+                        status = detected_status
+                        decided = {
+                            "canonical_city_id": str(best.get("fias_id") or f"cityref::{city_norm}"),
+                            "canonical_city_label": str(best.get("city_label") or city_raw),
+                            "canonical_region_label": region_raw,
+                        }
+                        reason = "fuzzy_match"
+                    elif best and score >= fuzzy_review_threshold:
+                        status = "need_review"
+                        reason = "fuzzy_uncertain"
+                        decided = None
+                    else:
+                        status = "need_review"
+                        reason = "not_found"
+                        decided = None
+                else:
+                    score = 1.0
+                    status = "auto_exact"
+                    candidate_payload = json.dumps([], ensure_ascii=False)
+                    reason = "alias_or_ref_exact"
+                    canonical_city_id = key.replace("cityref::", "", 1)
+                    decided = {
+                        "canonical_city_id": canonical_city_id,
+                        "canonical_city_label": label,
+                        "canonical_region_label": region_raw,
+                    }
+            status_counts[status] = int(status_counts.get(status, 0)) + 1
+            if dry_run:
+                continue
+            if decided:
+                c.execute(
+                    """
+                    UPDATE profiles
+                    SET canonical_city_id = ?,
+                        canonical_city_label = ?,
+                        canonical_region_label = ?,
+                        normalize_status = ?,
+                        normalize_score = ?,
+                        normalized_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        decided["canonical_city_id"],
+                        decided["canonical_city_label"],
+                        decided["canonical_region_label"],
+                        status,
+                        score,
+                        now_utc,
+                        pid,
+                    ),
+                )
+                c.execute("DELETE FROM city_normalization_queue WHERE profile_id = ?", (pid,))
+                updated_rows += 1
+            elif status == "need_review":
+                queue_key = ""
+                queue_label = ""
+                if best and score >= fuzzy_review_threshold:
+                    queue_key = str(best.get("fias_id") or f"cityref::{_norm_city_token(city_raw)}")
+                    queue_label = str(best.get("city_label") or city_raw)
+                c.execute(
+                    """
+                    INSERT INTO city_normalization_queue
+                    (
+                        profile_id, city_raw, region_raw, country_raw, reason,
+                        canonical_city_key, canonical_city_label,
+                        normalize_score, top_candidates_json, status, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                    ON CONFLICT(profile_id) DO UPDATE SET
+                        city_raw = excluded.city_raw,
+                        region_raw = excluded.region_raw,
+                        country_raw = excluded.country_raw,
+                        reason = excluded.reason,
+                        canonical_city_key = excluded.canonical_city_key,
+                        canonical_city_label = excluded.canonical_city_label,
+                        normalize_score = excluded.normalize_score,
+                        top_candidates_json = excluded.top_candidates_json,
+                        status = 'pending',
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        pid,
+                        city_raw,
+                        region_raw,
+                        country_raw,
+                        reason,
+                        queue_key,
+                        queue_label,
+                        score,
+                        candidate_payload,
+                        now_utc,
+                    ),
+                )
+                queued_rows += 1
+        if not dry_run:
+            c.execute(
+                """
+                INSERT INTO city_normalization_runs
+                    (dry_run, processed, updated_rows, queued_rows, skipped_non_ru, details_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    0,
+                    processed,
+                    updated_rows,
+                    queued_rows,
+                    skipped_non_ru,
+                    json.dumps({"status_counts": status_counts}, ensure_ascii=False),
+                ),
+            )
+            c.commit()
+    return {
+        "dry_run": bool(dry_run),
+        "processed": processed,
+        "updated_rows": updated_rows,
+        "queued_rows": queued_rows,
+        "skipped_non_ru": skipped_non_ru,
+        "status_counts": status_counts,
+        "limit": lim,
+        "offset": off,
+    }
 
 
 def ensure_cup_scoring_schema(db_path: Path | str | None = None) -> None:
@@ -4639,6 +5342,157 @@ def query_interesting_facts_geography(
     return {"cities": cities, "regions": regions, "countries": countries}
 
 
+def lookup_city_coordinates(
+    city_display_label: str | None,
+    region_display: str | None = None,
+) -> tuple[float | None, float | None]:
+    """
+    Координаты центра города по эталону city.csv (ключ — нормализованное название).
+    При нескольких вариантах в одном регионе — уточняет по региону.
+    """
+    src = str(city_display_label or "").strip()
+    if not src or src == "—":
+        return (None, None)
+    nk = _norm_city_token(src)
+    if not nk:
+        return (None, None)
+    idx = load_city_reference_index()
+    candidates = idx.get(nk) or []
+    if not candidates:
+        return (None, None)
+    pool = list(candidates)
+    rr = _norm_alias_token(region_display) if region_display else ""
+    if len(pool) > 1 and rr:
+        matched = [x for x in pool if str(x.get("region_norm") or "") == rr]
+        if matched:
+            pool = matched
+    top = pool[0]
+    lat = top.get("geo_lat")
+    lon = top.get("geo_lon")
+    if lat is None or lon is None:
+        return (None, None)
+    try:
+        la = float(lat)
+        lo = float(lon)
+    except (TypeError, ValueError):
+        return (None, None)
+    return (la, lo)
+
+
+def query_vm_geography_page(
+    db_path: Path | str,
+    year: int | None = None,
+    sport: str | None = None,
+) -> dict[str, Any]:
+    """
+    Данные для страницы «География ВМ»: регионы, страны, города (с координатами для карты).
+    Счётчик — уникальные profile_id по стартам под выбранными фильтрами.
+    """
+    w, params = _build_interesting_facts_where(year, sport)
+
+    regions = q_all(
+        db_path,
+        f"""
+        SELECT
+            COALESCE(NULLIF(TRIM(p.region), ''), '—') AS region,
+            COUNT(DISTINCT CASE WHEN r.profile_id IS NOT NULL THEN r.profile_id END) AS participants,
+            COUNT(*) AS starts
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        LEFT JOIN profiles p ON p.id = r.profile_id
+        WHERE r.profile_id IS NOT NULL AND {w}
+        GROUP BY region
+        ORDER BY participants DESC, region
+        """,
+        tuple(params),
+    )
+    countries = q_all(
+        db_path,
+        f"""
+        SELECT
+            COALESCE(NULLIF(TRIM(p.country), ''), '—') AS country,
+            COUNT(DISTINCT CASE WHEN r.profile_id IS NOT NULL THEN r.profile_id END) AS participants,
+            COUNT(*) AS starts
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        LEFT JOIN profiles p ON p.id = r.profile_id
+        WHERE r.profile_id IS NOT NULL AND {w}
+        GROUP BY country
+        ORDER BY participants DESC, country
+        """,
+        tuple(params),
+    )
+    raw_city_rows = q_all(
+        db_path,
+        f"""
+        SELECT
+            COALESCE(NULLIF(TRIM(p.city), ''), '—') AS city,
+            COALESCE(NULLIF(TRIM(p.region), ''), '—') AS region,
+            COUNT(DISTINCT CASE WHEN r.profile_id IS NOT NULL THEN r.profile_id END) AS participants,
+            COUNT(*) AS starts
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        LEFT JOIN profiles p ON p.id = r.profile_id
+        WHERE r.profile_id IS NOT NULL AND {w}
+        GROUP BY city, region
+        """,
+        tuple(params),
+    )
+
+    city_rules = load_city_alias_rules()
+    city_agg: dict[str, dict[str, Any]] = {}
+    region_by_key: dict[str, str] = {}
+    for r in raw_city_rows:
+        raw_region = str(r.get("region") or "")
+        _, label = normalize_city_by_alias_rules(r.get("city"), raw_region or None, city_rules)
+        lbl = str(label or "").strip() or "—"
+        key = _norm_alias_token(lbl)
+        if not key:
+            key = _norm_alias_token(str(r.get("city") or "")) or lbl.casefold()
+        cur = city_agg.get(key)
+        if cur is None:
+            city_agg[key] = {
+                "city": lbl,
+                "participants": int(r.get("participants") or 0),
+                "starts": int(r.get("starts") or 0),
+            }
+            region_by_key[key] = raw_region.strip() or "—"
+        else:
+            cur["participants"] = int(cur.get("participants") or 0) + int(r.get("participants") or 0)
+            cur["starts"] = int(cur.get("starts") or 0) + int(r.get("starts") or 0)
+
+    cities_sorted = sorted(
+        city_agg.values(),
+        key=lambda x: (
+            -int(x.get("participants") or 0),
+            -int(x.get("starts") or 0),
+            str(x.get("city") or ""),
+        ),
+    )
+
+    map_points: list[dict[str, Any]] = []
+    for k, row in city_agg.items():
+        lbl = str(row.get("city") or "")
+        rg = region_by_key.get(k, "")
+        lat, lon = lookup_city_coordinates(lbl, rg)
+        if lat is not None and lon is not None:
+            map_points.append(
+                {
+                    "city": lbl,
+                    "participants": int(row.get("participants") or 0),
+                    "lat": lat,
+                    "lon": lon,
+                }
+            )
+
+    return {
+        "regions": regions,
+        "countries": countries,
+        "cities": cities_sorted,
+        "map_points": map_points,
+    }
+
+
 def is_team_scoring_enabled(cup_id: int, year: int) -> bool:
     """Новый контур расчёта team_scoring включён только для cup_id=54 и year=2026."""
     return int(cup_id) == 54 and int(year) == 2026
@@ -4693,10 +5547,27 @@ def query_competition_years_admin(db_path: Path | str) -> list[int]:
     return out
 
 
+def query_competition_series_admin(db_path: Path | str) -> list[str]:
+    if not _table_has_column(db_path, "competitions", "title_short"):
+        return []
+    rows = q_all(
+        db_path,
+        """
+        SELECT DISTINCT TRIM(title_short) AS s
+        FROM competitions
+        WHERE TRIM(COALESCE(title_short, '')) != ''
+        ORDER BY s COLLATE NOCASE
+        """,
+        (),
+    )
+    return [str(r.get("s") or "").strip() for r in rows if str(r.get("s") or "").strip()]
+
+
 def query_competitions_admin_rows(
     db_path: Path | str,
     *,
     year: int | None,
+    series_title: str | None = None,
     limit: int = 800,
 ) -> list[dict[str, Any]]:
     cols = ["id"]
@@ -4706,27 +5577,41 @@ def query_competitions_admin_rows(
     col_sql = ", ".join(cols)
     lim = max(10, min(int(limit), 5000))
 
-    if year is None:
-        sql = (
-            f"SELECT {col_sql} FROM competitions "
-            "ORDER BY date DESC NULLS LAST, id DESC LIMIT ?"
-        )
-        params: tuple[Any, ...] = (lim,)
-    else:
-        sql = (
-            f"SELECT {col_sql} FROM competitions WHERE year = ? "
-            "ORDER BY date DESC NULLS LAST, id DESC LIMIT ?"
-        )
-        params = (int(year), lim)
+    where: list[str] = []
+    params_l: list[Any] = []
+    if year is not None:
+        where.append("year = ?")
+        params_l.append(int(year))
+    if series_title is not None and str(series_title).strip():
+        where.append("TRIM(COALESCE(title_short, '')) = ?")
+        params_l.append(str(series_title).strip())
+
+    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+    sql = (
+        f"SELECT {col_sql} FROM competitions{where_sql} "
+        "ORDER BY date DESC NULLS LAST, id DESC LIMIT ?"
+    )
+    params_l.append(lim)
+    params: tuple[Any, ...] = tuple(params_l)
 
     return q_all(db_path, sql, params)
 
 
-def query_competitions_admin_count(db_path: Path | str, year: int | None) -> int:
-    if year is None:
-        row = q_one(db_path, "SELECT COUNT(*) AS n FROM competitions", ())
-    else:
-        row = q_one(db_path, "SELECT COUNT(*) AS n FROM competitions WHERE year = ?", (int(year),))
+def query_competitions_admin_count(
+    db_path: Path | str,
+    year: int | None,
+    series_title: str | None = None,
+) -> int:
+    where: list[str] = []
+    params_l: list[Any] = []
+    if year is not None:
+        where.append("year = ?")
+        params_l.append(int(year))
+    if series_title is not None and str(series_title).strip():
+        where.append("TRIM(COALESCE(title_short, '')) = ?")
+        params_l.append(str(series_title).strip())
+    where_sql = (" WHERE " + " AND ".join(where)) if where else ""
+    row = q_one(db_path, f"SELECT COUNT(*) AS n FROM competitions{where_sql}", tuple(params_l))
     if not row:
         return 0
     try:

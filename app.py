@@ -72,6 +72,7 @@ PAGE_ALIASES: dict[str, str] = {
     "Участники": "participant",
     "Команды": "team",
     "Кубки": "cups",
+    "Админ панель": "admin",
 }
 
 SECTION_SUBMENUS: dict[str, list[tuple[str, str]]] = {
@@ -916,7 +917,7 @@ def _sidebar_read_page_from_url() -> str | None:
         s = raw[0] if isinstance(raw, (list, tuple)) and len(raw) else str(raw)
         page_raw = str(s).strip()
         slug = _resolve_admin_route_slug()
-        if slug and page_raw == slug.strip():
+        if slug and page_raw.casefold() == str(slug).strip().casefold():
             return ADMIN_PANEL_PAGE
         key = page_raw.casefold()
     except Exception:
@@ -1500,7 +1501,105 @@ def page_interesting_facts() -> None:
 
 def page_vm_geography() -> None:
     st.header("География ВМ")
-    st.info("Страница в разработке")
+    path = db_path()
+    if not require_db(path):
+        return
+
+    years_all = mq.query_distinct_years(path)
+    sports_all = mq.query_distinct_sports(path)
+
+    st.markdown(
+        f'<p style="color:{VM_TEXT};font-weight:600;margin:0 0 4px 0;">Год</p>'
+        f'<p style="color:{VM_MUTED};font-size:0.85rem;margin:0 0 8px 0;">«Все» — без фильтра по году.</p>',
+        unsafe_allow_html=True,
+    )
+    year_options = ["Все"] + [str(y) for y in years_all]
+    year_pick = (
+        st.pills(
+            "Год",
+            options=year_options,
+            selection_mode="single",
+            default="Все",
+            key="geo_vm_pills_year",
+            label_visibility="collapsed",
+        )
+        if year_options
+        else "Все"
+    )
+    year_val: int | None = None if year_pick == "Все" else int(year_pick)
+
+    st.markdown(
+        f'<p style="color:{VM_TEXT};font-weight:600;margin:0 0 4px 0;">Вид спорта</p>'
+        f'<p style="color:{VM_MUTED};font-size:0.85rem;margin:0 0 8px 0;">«Все» — без фильтра по виду спорта.</p>',
+        unsafe_allow_html=True,
+    )
+    sport_options = ["Все"] + sports_all
+    sport_pick = (
+        st.pills(
+            "Вид спорта",
+            options=sport_options,
+            selection_mode="single",
+            default="Все",
+            key="geo_vm_pills_sport",
+            label_visibility="collapsed",
+        )
+        if sport_options
+        else "Все"
+    )
+    sport_val: str | None = None if sport_pick == "Все" else str(sport_pick).strip()
+
+    geo_vm = mq.query_vm_geography_page(path, year=year_val, sport=sport_val)
+
+    _section_anchor("geo-tables")
+    st.subheader("Количество участников по регионам")
+    reg_rows = geo_vm.get("regions") or []
+    if reg_rows:
+        dfr = pd.DataFrame(reg_rows)
+        dfr = dfr.rename(columns={"region": "Регион", "participants": "Участников", "starts": "Стартов"})
+        show_r = [c for c in ("Регион", "Участников", "Стартов") if c in dfr.columns]
+        st.dataframe(dfr[show_r], use_container_width=True, hide_index=True)
+    else:
+        st.caption("Нет данных для выбранных фильтров.")
+
+    st.subheader("Участники по странам")
+    cc_rows = geo_vm.get("countries") or []
+    if cc_rows:
+        dfc = pd.DataFrame(cc_rows)
+        dfc = dfc.rename(columns={"country": "Страна", "participants": "Участников", "starts": "Стартов"})
+        show_c = [c for c in ("Страна", "Участников", "Стартов") if c in dfc.columns]
+        st.dataframe(dfc[show_c], use_container_width=True, hide_index=True)
+    else:
+        st.caption("Нет данных для выбранных фильтров.")
+
+    _section_anchor("geo-map")
+    st.subheader("Города участников")
+    pts = geo_vm.get("map_points") or []
+    cities_all = geo_vm.get("cities") or []
+    if not cities_all:
+        st.caption("Нет городов для выбранных фильтров.")
+    elif not pts:
+        st.caption(
+            "Не удалось поставить точки на карту — для канонических названий городов нет координат в справочнике."
+        )
+    else:
+        df_map = pd.DataFrame(pts).sort_values(by="participants", ascending=False)
+        st.map(df_map[["lat", "lon"]], use_container_width=True)
+        st.dataframe(
+            df_map.rename(
+                columns={
+                    "city": "Город",
+                    "participants": "Участников",
+                    "lat": "Широта",
+                    "lon": "Долгота",
+                }
+            ),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Участников": st.column_config.NumberColumn("Участников", format="%d"),
+            },
+        )
+        st.caption(f"На карте: **{len(pts)}** город(ов) из **{len(cities_all)}** с координатами в эталоне **city.csv**.")
 
 
 def page_vm_records() -> None:
@@ -3613,17 +3712,27 @@ def page_admin() -> None:
         "Используется для нормализации написаний городов в географических блоках "
         "(Интересные факты, Команда, Общая статистика)."
     )
-    src_city = mq.city_aliases_file_path()
-    st.code(str(src_city), language=None)
+    norm_src = mq.norm_city_aliases_file_path()
+    st.markdown("Базовый каталог (**norm_city.csv**):", unsafe_allow_html=True)
+    st.code(str(norm_src), language=None)
+    overlay_src = mq.city_aliases_file_path()
+    st.markdown("JSON-оверлей правок (**city_aliases.json**):", unsafe_allow_html=True)
+    st.code(str(overlay_src), language=None)
+    st.caption(
+        "Подгружает **norm_city.csv** как основную таблицу; поверх можно хранить отличия в JSON. "
+        "При сохранении в JSON записываются только строки, отличные от **norm_city.csv**, и новые алиасы."
+    )
 
     city_rows = mq.load_city_alias_rules()
     if not city_rows:
         city_rows = mq.default_city_alias_rules()
     df_city = pd.DataFrame(city_rows)
-    for col in ("alias", "canonical_key", "canonical_label", "active"):
+    for col in ("alias", "canonical_key", "canonical_label", "canonical_city_id", "active"):
         if col not in df_city.columns:
             df_city[col] = "" if col != "active" else True
-    df_city = df_city[["alias", "canonical_key", "canonical_label", "active"]]
+    df_city = df_city[
+        ["alias", "canonical_key", "canonical_label", "canonical_city_id", "active"]
+    ]
 
     edited_city = st.data_editor(
         df_city,
@@ -3635,6 +3744,9 @@ def page_admin() -> None:
             "alias": st.column_config.TextColumn("Alias (как в исходных данных)"),
             "canonical_key": st.column_config.TextColumn("Канонический key"),
             "canonical_label": st.column_config.TextColumn("Название города в UI"),
+            "canonical_city_id": st.column_config.TextColumn(
+                "Канонический city id", help="Совпадение города для учёта (как в norm_city)."
+            ),
             "active": st.column_config.CheckboxColumn("Активно"),
         },
     )
@@ -3650,7 +3762,7 @@ def page_admin() -> None:
             for e in errs:
                 st.error(e)
         else:
-            st.success("Справочник городов сохранён.")
+            st.success("Справочник городов сохранён (JSON-оверлей при необходимости).")
             st.rerun()
 
     _section_anchor("admin-competitions")
@@ -3661,22 +3773,35 @@ def page_admin() -> None:
     )
     if require_db(path):
         years_admin = mq.query_competition_years_admin(path)
-        cnt_all = mq.query_competitions_admin_count(path, None)
+        series_admin = mq.query_competition_series_admin(path)
+        cnt_all = mq.query_competitions_admin_count(path, None, None)
         year_labels = ["Все годы"] + [str(y) for y in years_admin]
+        series_labels = ["Все серии"] + series_admin
 
-        picked = st.selectbox(
-            "Фильтр по году соревнования",
-            options=year_labels,
-            key="admin_comp_year_select",
-        )
+        fcol1, fcol2 = st.columns(2)
+        with fcol1:
+            picked = st.selectbox(
+                "Фильтр по году соревнования",
+                options=year_labels,
+                key="admin_comp_year_select",
+            )
+        with fcol2:
+            picked_series = st.selectbox(
+                "Серия событий",
+                options=series_labels,
+                key="admin_comp_series_select",
+            )
         year_val: int | None = None if picked == "Все годы" else int(picked)
-        total = mq.query_competitions_admin_count(path, year_val)
+        series_val: str | None = (
+            None if picked_series == "Все серии" else str(picked_series).strip()
+        )
+        total = mq.query_competitions_admin_count(path, year_val, series_val)
         lim_cap = 800
         caption_tail = ""
         if total > lim_cap:
             caption_tail = (
                 f"В базе **{total}** строк при выбранном фильтре — показываются первые **{lim_cap}**. "
-                "Уточните год или редактируйте порциями."
+                "Уточните год/серию или редактируйте порциями."
             )
         else:
             caption_tail = f"Строк к показу: **{total}**."
@@ -3684,7 +3809,9 @@ def page_admin() -> None:
             caption_tail += f" Всего событий в базе: **{cnt_all}**."
         st.caption(caption_tail)
 
-        rows_admin = mq.query_competitions_admin_rows(path, year=year_val, limit=lim_cap)
+        rows_admin = mq.query_competitions_admin_rows(
+            path, year=year_val, series_title=series_val, limit=lim_cap
+        )
         df_comp = pd.DataFrame(rows_admin)
 
         if not df_comp.empty:
@@ -3776,6 +3903,8 @@ def main() -> None:
         "Команды",
         "Кубки",
     ]
+    if _is_admin_user():
+        pages.append("Админ панель")
     PAGES: tuple[str, ...] = tuple(pages)
     if SIDEBAR_LOGO.is_file():
         st.sidebar.image(str(SIDEBAR_LOGO), use_container_width=True)
@@ -3824,6 +3953,8 @@ def main() -> None:
         page_participant()
     elif page == "Команды":
         page_team()
+    elif page == "Админ панель":
+        page_admin()
     elif page == ADMIN_PANEL_PAGE:
         page_admin()
     else:
