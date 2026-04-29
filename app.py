@@ -12,9 +12,14 @@ MVP-дашборд marathon.db (Streamlit).
 
 from __future__ import annotations
 
+import base64
 import calendar
 import datetime
+import math
 import json
+from collections.abc import Mapping
+from io import BytesIO
+import tomllib
 from urllib.parse import urljoin
 from typing import Any
 import html
@@ -22,6 +27,7 @@ import os
 from pathlib import Path
 
 import altair as alt
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
@@ -29,6 +35,7 @@ import plotly.io as pio
 import re
 import streamlit as st
 import streamlit.components.v1 as components
+from streamlit.errors import StreamlitSecretNotFoundError
 
 import marathon_queries as mq
 
@@ -39,9 +46,12 @@ FAVICON_LOCAL = APP_DIR / "favicon-32x32.png"
 FAVICON_ASSET = APP_DIR / "assets" / "vologdamarafon.png"
 REGION_CENTERS_FILE = APP_DIR / "config" / "region_centers.json"
 RUSSIA_REGIONS_GEOJSON_FILE = APP_DIR / "config" / "russia_regions.geojson"
+WORLD_COUNTRIES_GEOJSON_FILE = APP_DIR / "config" / "countries_ne110m.geojson"
 FAVICON_ATTACHED = Path(
     r"C:\Users\Pavlov DA\.cursor\projects\c-Projects-vm-stat\assets\c__Projects_vm_stat_favicon-32x32.png"
 )
+# Иконка Excel для кнопки выгрузки (Кубки → Командный зачёт)
+EXCEL_EXPORT_ICON_PNG = APP_DIR / "85-855276_excel-icon-microsoft-excel-logo-transparent.png"
 
 # Основные цвета сервиса
 VM_LINK = "#93BDDD"
@@ -87,7 +97,9 @@ SECTION_SUBMENUS: dict[str, list[tuple[str, str]]] = {
         ("facts-charts", "Графики"),
     ],
     "География ВМ": [
+        ("geo-top-cities", "Топ городов"),
         ("geo-map", "Карта"),
+        ("geo-map-regions", "Регионы и страны"),
         ("geo-tables", "Таблицы"),
     ],
     "События": [
@@ -255,6 +267,7 @@ ISO3_TO_CENTER: dict[str, tuple[float, float]] = {
 _RUSSIA_REGION_CENTER_CACHE: dict[str, tuple[float, float]] | None = None
 _RUSSIA_REGION_ALIAS_TO_CANONICAL_CACHE: dict[str, str] | None = None
 _RUSSIA_REGIONS_GEOJSON_CACHE: dict[str, Any] | None = None
+_WORLD_COUNTRIES_GEO_AND_ISO_INDEX_CACHE: tuple[dict[str, Any], dict[str, str]] | None = None
 
 
 def _country_to_iso3(country: str | None) -> str | None:
@@ -371,6 +384,125 @@ def _load_russia_regions_geojson_prepared() -> dict[str, Any] | None:
         props["norm_name"] = _norm_geo_token(props.get("name"))
     _RUSSIA_REGIONS_GEOJSON_CACHE = geo
     return geo
+
+
+def _regions_stats_to_norm_participants(reg_rows: Any) -> dict[str, int]:
+    """Сводка строк «регион → участников» в ключ geojson.properties.norm_name (канонический алиас или норм. название)."""
+    counts: dict[str, int] = {}
+    if not isinstance(reg_rows, list):
+        return counts
+    for r in reg_rows:
+        if not isinstance(r, dict):
+            continue
+        lbl = str(r.get("region") or "").strip()
+        try:
+            p = int(r.get("participants") or 0)
+        except (TypeError, ValueError):
+            continue
+        if p <= 0 or not lbl:
+            continue
+        key = _region_to_canonical(lbl) or _norm_geo_token(lbl)
+        if key:
+            counts[key] = counts.get(key, 0) + p
+    return counts
+
+
+def _natural_earth_admin0_iso(props: dict[str, Any]) -> str | None:
+    """ISO 3166-1 alpha-3 для полигона Natural Earth (ADM0 или валидный ISO_A3)."""
+    # Редко ISO_A3 = -99; тогда можно взять ADM0_A3 (NOR для Норвегии и островов и т.д.).
+    iso_a = props.get("ISO_A3") if isinstance(props.get("ISO_A3"), str) else ""
+    iso_a_s = iso_a.strip().upper()
+    if len(iso_a_s) == 3 and iso_a_s != "-99":
+        return iso_a_s
+    adm = props.get("ADM0_A3") if isinstance(props.get("ADM0_A3"), str) else ""
+    adm_s = adm.strip().upper()
+    if len(adm_s) == 3 and adm_s != "-99":
+        return adm_s
+    return None
+
+
+def _load_world_countries_geojson_and_iso_alias_index(
+) -> tuple[dict[str, Any] | None, dict[str, str]]:
+    """GeoJSON стран (Natural Earth) + составной индекс норм. название → ISO3 (ручной словарь + имена полигонов)."""
+    global _WORLD_COUNTRIES_GEO_AND_ISO_INDEX_CACHE
+    base_ix: dict[str, str] = dict(COUNTRY_TO_ISO3)
+    if _WORLD_COUNTRIES_GEO_AND_ISO_INDEX_CACHE is not None:
+        geo0, ix0 = _WORLD_COUNTRIES_GEO_AND_ISO_INDEX_CACHE
+        return geo0, ix0
+    ix = dict(base_ix)
+    geo: dict[str, Any] | None = None
+    try:
+        raw = WORLD_COUNTRIES_GEOJSON_FILE.read_text(encoding="utf-8")
+        cand = json.loads(raw)
+        if isinstance(cand, dict) and isinstance(cand.get("features"), list):
+            geo = cand
+    except (OSError, json.JSONDecodeError):
+        geo = None
+    if geo is None:
+        _WORLD_COUNTRIES_GEO_AND_ISO_INDEX_CACHE = (None, base_ix)
+        return None, base_ix
+
+    feats = geo.get("features")
+    if not isinstance(feats, list):
+        _WORLD_COUNTRIES_GEO_AND_ISO_INDEX_CACHE = (None, base_ix)
+        return None, base_ix
+
+    for f in feats:
+        if not isinstance(f, dict):
+            continue
+        props = f.get("properties")
+        if not isinstance(props, dict):
+            props = {}
+            f["properties"] = props
+        iso_fc = _natural_earth_admin0_iso(props)
+        props["iso_match"] = iso_fc or ""
+        if not iso_fc:
+            continue
+        for nk in (
+            props.get("NAME"),
+            props.get("ADMIN"),
+            props.get("NAME_EN"),
+            props.get("NAME_RU"),
+        ):
+            if not isinstance(nk, str):
+                continue
+            kn = _norm_geo_token(nk)
+            if kn and kn not in ix:
+                ix[kn] = iso_fc
+
+    _WORLD_COUNTRIES_GEO_AND_ISO_INDEX_CACHE = (geo, ix)
+    return geo, ix
+
+
+def _country_ui_to_iso3(country_ui: str | None) -> str | None:
+    """Сопоставить подпись страны из аналитики с ISO3 (без РФ на слое «страны» отдельно отсекаем)."""
+    nk = _norm_geo_token(country_ui)
+    if not nk:
+        return None
+    _, alias_ix = _load_world_countries_geojson_and_iso_alias_index()
+    return alias_ix.get(nk) or _country_to_iso3(country_ui)
+
+
+def _foreign_countries_iso_participants(cc_rows: Any) -> dict[str, int]:
+    """Участники по странам, ISO3, без России (РФ подсвечивается только областями)."""
+    out: dict[str, int] = {}
+    if not isinstance(cc_rows, list):
+        return out
+    for r in cc_rows:
+        if not isinstance(r, dict):
+            continue
+        lbl = str(r.get("country") or "").strip()
+        try:
+            p = int(r.get("participants") or 0)
+        except (TypeError, ValueError):
+            continue
+        if p <= 0 or not lbl:
+            continue
+        iso = _country_ui_to_iso3(lbl)
+        if not iso or iso == "RUS":
+            continue
+        out[iso] = out.get(iso, 0) + p
+    return out
 
 
 def _region_to_center(region: str | None) -> tuple[float, float] | None:
@@ -1647,6 +1779,170 @@ def page_interesting_facts() -> None:
         t = c.mark_text(align="left", baseline="middle", dx=4).encode(text="Участников:Q")
         st.altair_chart((c + t).properties(height=500), use_container_width=True)
 
+
+def _scatter_mapbox_viewport_geo(df_pts: pd.DataFrame) -> tuple[dict[str, float], float]:
+    """Центр и уровень zoom для карты городов по bbox точек (слой OSM через Mapbox raster)."""
+    lat = df_pts["lat"].astype(float)
+    lon = df_pts["lon"].astype(float)
+    lat_min, lat_max = float(lat.min()), float(lat.max())
+    lon_min, lon_max = float(lon.min()), float(lon.max())
+    lat_mid = (lat_min + lat_max) / 2.0
+    lon_mid = (lon_min + lon_max) / 2.0
+    lat_gap = max(lat_max - lat_min, 0.08)
+    lon_gap = max(lon_max - lon_min, 0.08)
+    lat_pad = max(0.35, lat_gap * 0.4)
+    lon_pad = max(0.35, lon_gap * 0.4)
+    cos_mid = float(max(0.12, np.cos(np.radians(lat_mid))))
+    lat_span = lat_gap + 2 * lat_pad
+    lon_span = (lon_gap + 2 * lon_pad) / cos_mid
+    span = max(lat_span, lon_span, 0.3)
+    zoom = float(np.clip(9.3 - np.log2(span * 4.0 + 0.12), 3.2, 12.0))
+    return dict(lat=lat_mid, lon=lon_mid), zoom
+
+
+# Хороплет «Регионы и страны»: узкий разброс (низ — явный бледно‑зелёный, не серо‑белый)
+_GEO_CHORO_FILL_COLORSCALE: list[list[float | str]] = [
+    [0.0, "rgb(210, 237, 220)"],
+    [0.3, "rgb(200, 230, 213)"],
+    [0.6, "rgb(186, 220, 201)"],
+    [0.88, "rgb(170, 210, 187)"],
+    [1.0, "rgb(155, 200, 175)"],
+]
+
+_GEO_CHORO_COLORBAR: dict[str, Any] = {
+    "title": {"text": "Участников"},
+    "tickformat": ".0f",
+    "len": 0.58,
+    "thickness": 11,
+    "outlinewidth": 0,
+    "bgcolor": "rgba(255, 255, 255, 0.92)",
+    "bordercolor": "#e0e0e0",
+    "borderwidth": 1,
+}
+
+# Вся зелёная градиентная заливка «вытягивается» между 100 … 500 участников (ось ln(1+n))
+_GEO_GREEN_BRACKET_MIN_P = 100
+_GEO_GREEN_BRACKET_MAX_P = 500
+_GEO_GREEN_BRACKET_MIN_LN = float(np.log1p(_GEO_GREEN_BRACKET_MIN_P))
+_GEO_GREEN_BRACKET_MAX_LN = float(np.log1p(_GEO_GREEN_BRACKET_MAX_P))
+# Сжатие по оси палитры: нет «чисто белого» — даже 2–3 участника дают бледно‑зелёный тон
+_GEO_GREEN_VISUAL_FLOOR_T = 0.10
+_GEO_GREEN_VISUAL_SPAN_T = 0.86
+
+
+def _geo_choro_green_t_bracket_line(n: int) -> float:
+    """Доля 0–1 между порогами 100–500 по ln(1+n) (до визуального сжатия)."""
+    lo = _GEO_GREEN_BRACKET_MIN_LN
+    hi = _GEO_GREEN_BRACKET_MAX_LN
+    d = hi - lo
+    if d <= 0:
+        return 0.0
+    ln_z = float(np.log1p(max(0, int(n))))
+    t_lin = (ln_z - lo) / d
+    return float(np.clip(t_lin, 0.0, 1.0))
+
+
+def _geo_choro_green_t_visual(bracket_unit: float) -> float:
+    """Сжимаем палитру: узкий разброс + пол гарантированно «бледно‑зелёный» даже для 2–3 участников."""
+    u = float(np.clip(bracket_unit, 0.0, 1.0))
+    return float(
+        _GEO_GREEN_VISUAL_FLOOR_T + _GEO_GREEN_VISUAL_SPAN_T * u,
+    )
+
+
+def _geo_choro_green_z_bracket_100_500(counts: list[int]) -> list[float]:
+    """Комбинация порога ln(между 100–500 участников) + сжатый интервал палитры (z для Plotly)."""
+    out: list[float] = []
+    for z in counts:
+        tl = _geo_choro_green_t_bracket_line(int(z))
+        out.append(_geo_choro_green_t_visual(tl))
+    return out
+
+
+def _geo_choro_green_bracket_t_tickvals_text(
+) -> tuple[list[float], list[str]]:
+    """Подписи colorbar как число участников; позиции — та же нормализация, что для заливки (100–500, ln)."""
+    lo = _GEO_GREEN_BRACKET_MIN_LN
+    hi = _GEO_GREEN_BRACKET_MAX_LN
+    d = hi - lo
+    if d <= 0:
+        return [0.0, 1.0], ["100", "500"]
+
+    def _t_visual_for_nlab(nlab: int) -> float:
+        return _geo_choro_green_t_visual(_geo_choro_green_t_bracket_line(nlab))
+
+    v_end_lo = _t_visual_for_nlab(_GEO_GREEN_BRACKET_MIN_P)
+    v_end_hi = _t_visual_for_nlab(_GEO_GREEN_BRACKET_MAX_P)
+
+    pairs: list[tuple[float, str]] = [
+        (v_end_lo, f"\u2264{_GEO_GREEN_BRACKET_MIN_P}"),
+        (v_end_hi, f"\u2265{_GEO_GREEN_BRACKET_MAX_P}"),
+    ]
+    for nl in (
+        120,
+        150,
+        180,
+        220,
+        260,
+        300,
+        340,
+        380,
+        420,
+        460,
+        498,
+    ):
+        if nl <= _GEO_GREEN_BRACKET_MIN_P or nl >= _GEO_GREEN_BRACKET_MAX_P:
+            continue
+        tv = _t_visual_for_nlab(nl)
+        if v_end_lo + 1e-3 < tv < v_end_hi - 1e-3:
+            pairs.append((tv, str(nl)))
+
+    pairs.sort(key=lambda p: (p[0], p[1]))
+    out_v: list[float] = []
+    out_t: list[str] = []
+    seen_round: set[float] = set()
+    for tv, lb in pairs:
+        rk = round(tv, 4)
+        if rk in seen_round:
+            continue
+        seen_round.add(rk)
+        out_v.append(tv)
+        out_t.append(lb)
+    return out_v, out_t
+
+
+def _geo_choro_green_colorbar_bundle_bracket_100_500() -> dict[str, Any]:
+    tv, tt = _geo_choro_green_bracket_t_tickvals_text()
+    cb = dict(_GEO_CHORO_COLORBAR)
+    cb.pop("tickformat", None)
+    cb.update(
+        {
+            "title": {
+                "text": "Участников<br>(100–500 ln(1+n))",
+                "font": {"size": 12},
+            },
+            "tickmode": "array",
+            "tickvals": tv,
+            "ticktext": tt,
+        }
+    )
+    return cb
+
+
+# Вологодская область — одна бледно-голубая заливка, вне общей шкалы участников по РФ (кроме ВО — зелёный градиент)
+_VO_RF_BLUE_COLORSCALE: list[list[float | str]] = [
+    [0.0, "rgb(214, 235, 250)"],
+    [1.0, "rgb(214, 235, 250)"],
+]
+
+
+def _geo_rf_norm_is_vologda_oblast(norm_name: str | None) -> bool:
+    """Совпадение с регионом GeoJSON после нормализации (имя полигона Вологодской области)."""
+    if not norm_name:
+        return False
+    return norm_name == _norm_geo_token("Вологодская область")
+
+
 def page_vm_geography() -> None:
     st.header("География ВМ")
     path = db_path()
@@ -1684,16 +1980,117 @@ def page_vm_geography() -> None:
     )
     sport_val: str | None = None if sport_pick == "Все" else str(sport_pick).strip()
 
+    with st.spinner("Загрузка таблиц и карт…"):
+        _page_vm_geography_body(path, year_val, sport_val)
+
+
+def _page_vm_geography_body(path: Path, year_val: int | None, sport_val: str | None) -> None:
     geo_vm = mq.query_vm_geography_page(path, year=year_val, sport=sport_val)
+
+    cities_all = geo_vm.get("cities") or []
+    _section_anchor("geo-top-cities")
+    st.subheader("Топ городов")
+    st.caption("Первые **30** городов по числу уникальных участников (учитывается нормализация городов из справочника). Строку можно отфильтровать подстрокой.")
+    needle = st.text_input(
+        "Фильтр по названию города",
+        key="geo_vm_city_needle",
+        placeholder="Например: Вологда",
+        label_visibility="collapsed",
+    )
+    nneedle = needle.strip().casefold()
+    if cities_all:
+        if nneedle:
+            cities_filt = [
+                r
+                for r in cities_all
+                if nneedle in str(r.get("city") or "").strip().casefold()
+            ]
+        else:
+            cities_filt = cities_all
+        df_top_c = pd.DataFrame(cities_filt[:30])
+        if df_top_c.empty:
+            st.caption("После фильтра не осталось городов.")
+        else:
+            rename_top = {"city": "Город", "participants": "Участников", "starts": "Стартов"}
+            for old, new in (
+                ("participants_m", "Участников М"),
+                ("participants_f", "Участников Ж"),
+                ("starts_m", "Стартов М"),
+                ("starts_f", "Стартов Ж"),
+            ):
+                rename_top[old] = new
+            df_top_c = df_top_c.rename(columns=rename_top)
+            show_tc = [
+                c
+                for c in (
+                    "Город",
+                    "Участников",
+                    "Участников М",
+                    "Участников Ж",
+                    "Стартов",
+                    "Стартов М",
+                    "Стартов Ж",
+                )
+                if c in df_top_c.columns
+            ]
+            st.dataframe(
+                df_top_c[show_tc],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Участников": st.column_config.NumberColumn(format="%d"),
+                    "Участников М": st.column_config.NumberColumn(format="%d"),
+                    "Участников Ж": st.column_config.NumberColumn(format="%d"),
+                    "Стартов": st.column_config.NumberColumn(format="%d"),
+                    "Стартов М": st.column_config.NumberColumn(format="%d"),
+                    "Стартов Ж": st.column_config.NumberColumn(format="%d"),
+                },
+            )
+    else:
+        st.caption("Нет данных для выбранных фильтров.")
 
     _section_anchor("geo-tables")
     st.subheader("Количество участников по регионам")
     reg_rows = geo_vm.get("regions") or []
     if reg_rows:
         dfr = pd.DataFrame(reg_rows)
-        dfr = dfr.rename(columns={"region": "Регион", "participants": "Участников", "starts": "Стартов"})
-        show_r = [c for c in ("Регион", "Участников", "Стартов") if c in dfr.columns]
-        st.dataframe(dfr[show_r], use_container_width=True, hide_index=True)
+        dfr = dfr.rename(
+            columns={
+                "region": "Регион",
+                "participants": "Участников",
+                "starts": "Стартов",
+                "participants_m": "Участников М",
+                "participants_f": "Участников Ж",
+                "starts_m": "Стартов М",
+                "starts_f": "Стартов Ж",
+            }
+        )
+        show_r = [
+            c
+            for c in (
+                "Регион",
+                "Участников",
+                "Участников М",
+                "Участников Ж",
+                "Стартов",
+                "Стартов М",
+                "Стартов Ж",
+            )
+            if c in dfr.columns
+        ]
+        st.dataframe(
+            dfr[show_r],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Участников": st.column_config.NumberColumn(format="%d"),
+                "Участников М": st.column_config.NumberColumn(format="%d"),
+                "Участников Ж": st.column_config.NumberColumn(format="%d"),
+                "Стартов": st.column_config.NumberColumn(format="%d"),
+                "Стартов М": st.column_config.NumberColumn(format="%d"),
+                "Стартов Ж": st.column_config.NumberColumn(format="%d"),
+            },
+        )
     else:
         st.caption("Нет данных для выбранных фильтров.")
 
@@ -1701,9 +2098,43 @@ def page_vm_geography() -> None:
     cc_rows = geo_vm.get("countries") or []
     if cc_rows:
         dfc = pd.DataFrame(cc_rows)
-        dfc = dfc.rename(columns={"country": "Страна", "participants": "Участников", "starts": "Стартов"})
-        show_c = [c for c in ("Страна", "Участников", "Стартов") if c in dfc.columns]
-        st.dataframe(dfc[show_c], use_container_width=True, hide_index=True)
+        dfc = dfc.rename(
+            columns={
+                "country": "Страна",
+                "participants": "Участников",
+                "starts": "Стартов",
+                "participants_m": "Участников М",
+                "participants_f": "Участников Ж",
+                "starts_m": "Стартов М",
+                "starts_f": "Стартов Ж",
+            }
+        )
+        show_c = [
+            c
+            for c in (
+                "Страна",
+                "Участников",
+                "Участников М",
+                "Участников Ж",
+                "Стартов",
+                "Стартов М",
+                "Стартов Ж",
+            )
+            if c in dfc.columns
+        ]
+        st.dataframe(
+            dfc[show_c],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Участников": st.column_config.NumberColumn(format="%d"),
+                "Участников М": st.column_config.NumberColumn(format="%d"),
+                "Участников Ж": st.column_config.NumberColumn(format="%d"),
+                "Стартов": st.column_config.NumberColumn(format="%d"),
+                "Стартов М": st.column_config.NumberColumn(format="%d"),
+                "Стартов Ж": st.column_config.NumberColumn(format="%d"),
+            },
+        )
     else:
         st.caption("Нет данных для выбранных фильтров.")
 
@@ -1711,13 +2142,21 @@ def page_vm_geography() -> None:
     vo_rows = geo_vm.get("vologda_districts") or []
     if vo_rows:
         dfd = pd.DataFrame(vo_rows).rename(
-            columns={"district": "Район", "participants": "Участников", "starts": "Стартов"}
+            columns={
+                "district": "Район",
+                "participants": "Участников",
+                "starts": "Стартов",
+                "participants_m": "Участников М",
+                "participants_f": "Участников Ж",
+                "starts_m": "Стартов М",
+                "starts_f": "Стартов Ж",
+            }
         )
         pie_df = dfd[["Район", "Участников"]].copy()
         pie_df = pie_df[pie_df["Участников"] > 0]
         if not pie_df.empty:
             total_vo = int(pie_df["Участников"].sum())
-            share_df = pie_df.copy()
+            share_df = dfd[dfd["Участников"] > 0].copy()
             share_df["Доля района"] = (
                 (100.0 * share_df["Участников"] / total_vo) if total_vo > 0 else 0.0
             )
@@ -1732,16 +2171,23 @@ def page_vm_geography() -> None:
             fig_vo.update_traces(textposition="inside", textinfo="percent+label")
             fig_vo.update_layout(margin=dict(l=0, r=0, t=60, b=0))
 
+            tbl_cols = ["Район", "Доля района"]
+            for extras in ("Участников М", "Участников Ж"):
+                if extras in share_df.columns:
+                    tbl_cols.append(extras)
+
             col_pie, col_tbl = st.columns(2)
             with col_pie:
                 st.plotly_chart(fig_vo, use_container_width=True)
             with col_tbl:
                 st.dataframe(
-                    share_df[["Район", "Доля района"]],
+                    share_df[tbl_cols],
                     use_container_width=True,
                     hide_index=True,
                     column_config={
                         "Доля района": st.column_config.NumberColumn("Доля района", format="%.1f%%"),
+                        "Участников М": st.column_config.NumberColumn(format="%d"),
+                        "Участников Ж": st.column_config.NumberColumn(format="%d"),
                     },
                 )
     else:
@@ -1749,8 +2195,13 @@ def page_vm_geography() -> None:
 
     _section_anchor("geo-map")
     st.subheader("Города участников")
+    st.caption(
+        "Размер круга — по числу уникальных участников в городе (цвет маркеров единый для контраста). "
+        "Подложка — **OpenStreetMap** © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright)."
+    )
     pts = geo_vm.get("map_points") or []
-    cities_all = geo_vm.get("cities") or []
+    map_viewport_center: dict[str, float] | None = None
+    map_viewport_zoom: float | None = None
     if not cities_all:
         st.caption("Нет городов для выбранных фильтров.")
     elif not pts:
@@ -1759,22 +2210,244 @@ def page_vm_geography() -> None:
         )
     else:
         df_map = pd.DataFrame(pts).sort_values(by="participants", ascending=False)
-        st.map(df_map[["lat", "lon"]], use_container_width=True)
-        st.dataframe(
-            df_map.rename(
-                columns={
-                    "city": "Город",
-                    "participants": "Участников",
-                    "lat": "Широта",
-                    "lon": "Долгота",
-                }
-            ),
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Участников": st.column_config.NumberColumn("Участников", format="%d"),
-            },
+        df_geo = df_map.copy()
+        br = np.sqrt(np.maximum(1.0, df_geo["participants"].astype(float)))
+        df_geo["_r"] = br
+        bm = float(br.max()) if len(br) else 12.0
+        center_geo, zoom_geo = _scatter_mapbox_viewport_geo(df_geo)
+        map_viewport_center, map_viewport_zoom = center_geo, zoom_geo
+        # Один контрастный цвет на светлой OSM; размер задаёт вклад участников (см. _r).
+        _geo_marker_color = "#b71c1c"
+        fig_geo = px.scatter_mapbox(
+            df_geo,
+            lat="lat",
+            lon="lon",
+            size="_r",
+            hover_name="city",
+            labels={"city": "Город", "participants": "Участников", "_r": ""},
+            hover_data={"participants": True, "_r": False},
+            size_max=max(42.0, bm * 1.2),
+            mapbox_style="open-street-map",
+            zoom=zoom_geo,
+            center=center_geo,
         )
+        fig_geo.update_traces(marker=dict(color=_geo_marker_color, opacity=0.5))
+        fig_geo.update_layout(
+            margin=dict(l=0, r=0, t=52, b=0),
+            height=680,
+            mapbox=dict(
+                style="open-street-map",
+                bearing=0,
+                pitch=0,
+            ),
+            showlegend=False,
+        )
+        st.plotly_chart(fig_geo, use_container_width=True)
+
+    _section_anchor("geo-map-regions")
+    st.subheader("Регионы и страны")
+
+    part_by_norm = _regions_stats_to_norm_participants(reg_rows)
+    part_iso_foreign = _foreign_countries_iso_participants(cc_rows)
+
+    geo_rf = _load_russia_regions_geojson_prepared()
+    geo_world, _ = _load_world_countries_geojson_and_iso_alias_index()
+
+    if geo_rf is None:
+        st.caption(
+            "Не загружается файл контурной карты регионов России (`config/russia_regions.geojson`)."
+        )
+    if geo_world is None:
+        st.caption(
+            "Не загружается файл границ стран (`config/countries_ne110m.geojson`). "
+            "Скопируйте [ne_110m_admin_0_countries.geojson](https://github.com/nvkelso/natural-earth-vector/blob/master/geojson/ne_110m_admin_0_countries.geojson) в `config/`."
+        )
+
+    map_c = (
+        map_viewport_center
+        if map_viewport_center is not None
+        else dict(lat=58.55, lon=43.82)
+    )
+    map_z = map_viewport_zoom if map_viewport_zoom is not None else 3.85
+
+    rf_green_locations: list[str] = []
+    rf_green_z: list[int] = []
+    rf_green_hover: list[str] = []
+    rf_vo_locations: list[str] = []
+    rf_vo_z: list[int] = []
+    rf_vo_hover: list[str] = []
+    feats_rf_list = geo_rf.get("features") if isinstance(geo_rf, dict) else None
+    if feats_rf_list and isinstance(feats_rf_list, list) and part_by_norm:
+        for f in feats_rf_list:
+            if not isinstance(f, dict):
+                continue
+            props = f.get("properties")
+            nn = ""
+            dn = ""
+            if isinstance(props, dict):
+                nn = str(props.get("norm_name") or "")
+                dn = str(props.get("name") or nn)
+            pv = part_by_norm.get(nn, 0) if nn else 0
+            if pv <= 0:
+                continue
+            if _geo_rf_norm_is_vologda_oblast(nn):
+                rf_vo_locations.append(nn)
+                rf_vo_z.append(pv)
+                rf_vo_hover.append(dn)
+            else:
+                rf_green_locations.append(nn)
+                rf_green_z.append(pv)
+                rf_green_hover.append(dn)
+
+    world_locations: list[str] = []
+    world_z: list[int] = []
+    world_hover: list[str] = []
+    if isinstance(geo_world, dict):
+        feats_w_raw = geo_world.get("features")
+        if isinstance(feats_w_raw, list):
+            iso_label_rf: dict[str, str] = {}
+            for f in feats_w_raw:
+                if not isinstance(f, dict):
+                    continue
+                props = f.get("properties")
+                if not isinstance(props, dict):
+                    continue
+                iso_m = str(props.get("iso_match") or "")
+                if not iso_m or iso_m in iso_label_rf:
+                    continue
+                lab = (
+                    props.get("NAME_RU")
+                    or props.get("NAME_EN")
+                    or props.get("ADMIN")
+                    or props.get("NAME")
+                    or iso_m
+                )
+                iso_label_rf[iso_m] = str(lab)
+
+            iso_on_map = set(iso_label_rf.keys())
+            for iso, pv in sorted(part_iso_foreign.items()):
+                if pv <= 0 or iso not in iso_on_map:
+                    continue
+                world_locations.append(iso)
+                world_z.append(pv)
+                world_hover.append(iso_label_rf.get(iso) or iso)
+
+    rf_green_z_br = _geo_choro_green_z_bracket_100_500(rf_green_z)
+    world_z_br = _geo_choro_green_z_bracket_100_500(world_z)
+    z_geo_max = 1.0
+    z_geo_min = 0.0
+
+    cb_green = _geo_choro_green_colorbar_bundle_bracket_100_500()
+
+    fig_reg = go.Figure()
+    want_rf_green = geo_rf is not None and bool(rf_green_locations)
+    want_rf_vo = geo_rf is not None and bool(rf_vo_locations)
+    want_world = geo_world is not None and bool(world_locations)
+    cb_on_rf_green_alone = bool(want_rf_green and not want_world)
+
+    if want_rf_green:
+        r_custom = [[hi, zp] for hi, zp in zip(rf_green_hover, rf_green_z)]
+        fig_reg.add_trace(
+            go.Choroplethmapbox(
+                geojson=geo_rf,
+                locations=rf_green_locations,
+                featureidkey="properties.norm_name",
+                z=rf_green_z_br,
+                zmin=z_geo_min,
+                zmax=z_geo_max,
+                colorscale=_GEO_CHORO_FILL_COLORSCALE,
+                autocolorscale=False,
+                marker_opacity=0.74,
+                showscale=cb_on_rf_green_alone,
+                colorbar=cb_green if cb_on_rf_green_alone else None,
+                customdata=r_custom,
+                hovertemplate=(
+                    "<b>%{customdata[0]}</b><br>Участников: %{customdata[1]}<extra></extra>"
+                ),
+                name="rf_regions_green",
+            )
+        )
+
+    if want_world:
+        w_custom = [[hi, zp] for hi, zp in zip(world_hover, world_z)]
+        fig_reg.add_trace(
+            go.Choroplethmapbox(
+                geojson=geo_world,
+                locations=world_locations,
+                featureidkey="properties.iso_match",
+                z=world_z_br,
+                zmin=z_geo_min,
+                zmax=z_geo_max,
+                colorscale=_GEO_CHORO_FILL_COLORSCALE,
+                autocolorscale=False,
+                marker_opacity=0.74,
+                showscale=True,
+                colorbar=cb_green,
+                customdata=w_custom,
+                hovertemplate=(
+                    "<b>%{customdata[0]}</b><br>Участников: %{customdata[1]}<extra></extra>"
+                ),
+                name="countries",
+            )
+        )
+
+    if want_rf_vo:
+        vo_pts = len(rf_vo_locations)
+        vo_custom = [[hi, zp] for hi, zp in zip(rf_vo_hover, rf_vo_z)]
+        fig_reg.add_trace(
+            go.Choroplethmapbox(
+                geojson=geo_rf,
+                locations=rf_vo_locations,
+                featureidkey="properties.norm_name",
+                z=[1.0] * vo_pts,
+                zmin=0.0,
+                zmax=1.0,
+                colorscale=_VO_RF_BLUE_COLORSCALE,
+                autocolorscale=False,
+                marker_opacity=0.74,
+                showscale=False,
+                customdata=vo_custom,
+                hovertemplate=(
+                    "<b>%{customdata[0]}</b><br>Участников: %{customdata[1]}<extra></extra>"
+                ),
+                name="vologda_oblast",
+            )
+        )
+
+    if len(fig_reg.data) > 0:
+        fig_reg.update_layout(
+            margin=dict(l=0, r=0, t=52, b=0),
+            height=680,
+            mapbox=dict(
+                style="open-street-map",
+                bearing=0,
+                pitch=0,
+                center=dict(lat=map_c["lat"], lon=map_c["lon"]),
+                zoom=map_z,
+            ),
+            showlegend=False,
+        )
+        st.plotly_chart(fig_reg, use_container_width=True)
+    else:
+        has_layer_file = geo_rf is not None or geo_world is not None
+        has_stats = bool(part_by_norm or part_iso_foreign)
+        if has_layer_file and has_stats:
+            if geo_rf is not None and part_by_norm and (
+                not rf_green_locations and not rf_vo_locations
+            ):
+                st.caption(
+                    "Не удалось сопоставить названия регионов с полигонами карты России "
+                    "(алиасы см. в `config/region_centers.json`)."
+                )
+            if geo_world is not None and part_iso_foreign and not world_locations:
+                st.caption(
+                    "Не удалось сопоставить страны из данных с контурной картой — дополните словарь "
+                    "`COUNTRY_TO_ISO3` в `app.py` или проверьте написание как в Natural Earth."
+                )
+        elif has_layer_file and not has_stats:
+            st.caption(
+                "Нет строк по регионам и странам с числом участников больше нуля для выбранных фильтров."
+            )
 
 
 def page_vm_records() -> None:
@@ -1877,7 +2550,10 @@ def page_vm_records() -> None:
     if not rec_rows:
         st.caption("Нет данных для построения рекордов по выбранным фильтрам.")
     else:
-        st.caption("Иерархия: **событие → дистанция → топ-5 мужчин и топ-5 женщин (по всем годам)**.")
+        st.caption(
+            "Иерархия: **событие → дистанция → топ-5 мужчин и топ-5 женщин (по всем годам)**. "
+            "Для бега и трэйла колонка **Темп** — мин:сек на км; километраж берётся из справочника алиасов дистанций."
+        )
         frag = _event_records_hierarchy_html(rec_rows)
         if hasattr(st, "html"):
             st.html(frag)
@@ -2326,6 +3002,52 @@ def _is_admin_user() -> bool:
     }
 
 
+def _admin_route_slug_from_nested(adm: Any) -> str | None:
+    """[admin].route_slug из dict / Mapping / объекта Streamlit Secrets."""
+    if adm is None:
+        return None
+    rs_any: Any
+    if isinstance(adm, dict):
+        rs_any = adm.get("route_slug")
+    elif isinstance(adm, Mapping):
+        rs_any = adm.get("route_slug")
+    else:
+        rs_any = getattr(adm, "route_slug", None)
+    rs = str(rs_any or "").strip()
+    return rs or None
+
+
+def _read_route_slug_local_secrets_files() -> str | None:
+    """Если st.secrets не нашёл файл (cwd, локальный деплой). Обходим Streamlit-секреты."""
+    roots: list[Path] = [APP_DIR.resolve(), Path.cwd().resolve()]
+    tried: set[str] = set()
+    paths: list[Path] = []
+    for root in roots:
+        cur = root
+        for _ in range(8):
+            candidate = (cur / ".streamlit" / "secrets.toml").resolve()
+            sid = str(candidate)
+            if sid not in tried:
+                tried.add(sid)
+                paths.append(candidate)
+            parent = cur.parent
+            if parent == cur:
+                break
+            cur = parent
+    for secrets_path in paths:
+        if not secrets_path.is_file():
+            continue
+        try:
+            with secrets_path.open("rb") as fp:
+                data = tomllib.load(fp)
+            rs = _admin_route_slug_from_nested(data.get("admin"))
+            if rs:
+                return rs
+        except (OSError, TypeError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+            continue
+    return None
+
+
 def _resolve_admin_route_slug() -> str | None:
     """
     Секретный сегмент URL: ?page=<slug> открывает панель администратора без пункта в меню.
@@ -2334,15 +3056,18 @@ def _resolve_admin_route_slug() -> str | None:
     env_sl = str(os.environ.get("VMSTAT_ADMIN_ROUTE", "")).strip()
     if env_sl:
         return env_sl
-    try:
-        adm: Any = st.secrets.get("admin", {}) if hasattr(st, "secrets") else {}
-        if isinstance(adm, dict):
-            rs = str(adm.get("route_slug") or "").strip()
+
+    if hasattr(st, "secrets"):
+        try:
+            rs = _admin_route_slug_from_nested(st.secrets.get("admin"))
             if rs:
                 return rs
-    except Exception:
-        return None
-    return None
+        except StreamlitSecretNotFoundError:
+            pass
+        except Exception:
+            pass
+
+    return _read_route_slug_local_secrets_files()
 
 
 def _chart_style_experiment_default() -> bool:
@@ -2462,6 +3187,246 @@ def _team_participants_ranked_with_rows(
         out.append((pid, name, tot, rows))
     out.sort(key=lambda x: -x[2])
     return out
+
+
+def _dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Данные") -> bytes:
+    buf = BytesIO()
+    safe_name = sheet_name[:31]
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=safe_name)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _dataframes_to_excel_bytes(sheets: list[tuple[str, pd.DataFrame]]) -> bytes:
+    """Несколько листов Excel; имя листа ≤ 31 символа."""
+    buf = BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        for sheet_name, df in sheets:
+            safe = sheet_name[:31]
+            df.to_excel(writer, index=False, sheet_name=safe)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+_MAX_EXCEL_BYTES_FOR_DATA_URL = 1_500_000
+
+
+def _html_excel_download_anchor_png(
+    file_bytes: bytes,
+    file_name: str,
+    icon_path: Path,
+    mime: str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+) -> str:
+    """Ссылка с PNG: скачивание через data: URL (умеренный размер файла)."""
+    img_b64 = base64.standard_b64encode(icon_path.read_bytes()).decode("ascii")
+    xlsx_b64 = base64.standard_b64encode(file_bytes).decode("ascii")
+    fname_attr = html.escape(file_name, quote=True)
+    return (
+        f'<a href="data:{mime};base64,{xlsx_b64}" download="{fname_attr}" '
+        'title="Выгрузить в Excel" style="display:inline-block;line-height:0;">'
+        '<img src="data:image/png;base64,'
+        + img_b64
+        + '" width="44" style="height:auto;display:block;border:0;" '
+        'alt="" /></a>'
+    )
+
+
+def _excel_download_button_png_or_fallback(
+    file_bytes: bytes,
+    file_name: str,
+    *,
+    streamlit_key: str,
+) -> None:
+    """Выгрузка Excel: кликабельное лого PNG или встроенная кнопка при большом файле / без картинки."""
+    if (
+        EXCEL_EXPORT_ICON_PNG.is_file()
+        and len(file_bytes) <= _MAX_EXCEL_BYTES_FOR_DATA_URL
+    ):
+        components.html(
+            _html_excel_download_anchor_png(file_bytes, file_name, EXCEL_EXPORT_ICON_PNG),
+            height=54,
+            width=56,
+        )
+        return
+    st.download_button(
+        label="",
+        icon=":material/table_chart:",
+        help="Выгрузить в Excel",
+        data=file_bytes,
+        file_name=file_name,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key=streamlit_key,
+        type="tertiary",
+        width="content",
+    )
+
+
+def _cup_team_flat_excel_team_scoring_v1(
+    cup_title: str,
+    cup_id: int,
+    year: int,
+    team_totals: list[dict[str, Any]],
+    member_totals: list[dict[str, Any]],
+) -> pd.DataFrame:
+    """Одна строка на связку команда × участник (расчёт team_scoring)."""
+    from collections import defaultdict
+
+    ordered_teams = sorted(
+        team_totals,
+        key=lambda r: (-int(r.get("очков") or 0), str(r.get("команда") or "")),
+    )
+    team_place_by_name: dict[str, int] = {}
+    team_pts_by_name: dict[str, int] = {}
+    for i, row in enumerate(ordered_teams, start=1):
+        tn = str(row.get("команда") or "").strip()
+        if not tn:
+            continue
+        team_place_by_name[tn] = i
+        team_pts_by_name[tn] = int(row.get("очков") or 0)
+
+    by_team: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for m in member_totals:
+        t = str(m.get("команда") or "").strip()
+        by_team[t].append(m)
+
+    out_rows: list[dict[str, Any]] = []
+    for team_name, members in sorted(by_team.items(), key=lambda x: (-team_pts_by_name.get(x[0], 0), x[0])):
+        members_sorted = sorted(
+            members,
+            key=lambda r: (-float(r.get("очков_7из8") or 0.0), str(r.get("участник") or "")),
+        )
+        tpl = team_place_by_name.get(team_name)
+        tpts = team_pts_by_name.get(team_name)
+        for rk, mr in enumerate(members_sorted, start=1):
+            scj = mr.get("stages_counted_json")
+            if scj is not None and not isinstance(scj, str):
+                try:
+                    scj = json.dumps(scj, ensure_ascii=False)
+                except TypeError:
+                    scj = str(scj)
+            out_rows.append(
+                {
+                    "Год": year,
+                    "Кубок (id)": cup_id,
+                    "Наименование кубка": cup_title,
+                    "Место команды": tpl,
+                    "Команда": team_name,
+                    "Очки команды (топ‑5, итог)": tpts,
+                    "Место участника в команде": rk,
+                    "В топ‑5 участников команды": "Да" if rk <= 5 else "Нет",
+                    "profile_id": mr.get("profile_id"),
+                    "Участник": mr.get("участник"),
+                    "Очки 7 из 8 этапов": mr.get("очков_7из8"),
+                    "Очки по всем этапам": mr.get("очков_всего"),
+                    "Этапы (JSON)": scj if scj is not None else "",
+                }
+            )
+    return pd.DataFrame(out_rows)
+
+
+def _cup_team_stage_rows_excel_team_scoring_v1(
+    cup_title: str,
+    cup_id: int,
+    year: int,
+    team_totals: list[dict[str, Any]],
+    stage_rows: list[dict[str, Any]],
+) -> pd.DataFrame:
+    """
+    Одна строка на участника × этап: название события и комментарий про бонус 50+
+    (как во вкладке / в team_scoring_stage_points).
+    """
+    ordered_teams = sorted(
+        team_totals,
+        key=lambda r: (-int(r.get("очков") or 0), str(r.get("команда") or "")),
+    )
+    team_place_by_name: dict[str, int] = {}
+    for i, row in enumerate(ordered_teams, start=1):
+        tn = str(row.get("команда") or "").strip()
+        if not tn:
+            continue
+        team_place_by_name[tn] = i
+
+    def _stage_sort_key(sr: dict[str, Any]) -> tuple[str, str, int]:
+        st = int(sr.get("этап") or 0)
+        tm = str(sr.get("команда") or "")
+        ua = str(sr.get("участник") or "")
+        return (tm, ua, st)
+
+    out_rows: list[dict[str, Any]] = []
+    for sr in sorted(stage_rows, key=_stage_sort_key):
+        tn = str(sr.get("команда") or "").strip()
+        bonus_txt = str(sr.get("комментарий") or "").strip()
+        ev = sr.get("событие")
+        out_rows.append(
+            {
+                "Год": year,
+                "Кубок (id)": cup_id,
+                "Наименование кубка": cup_title,
+                "Место команды": team_place_by_name.get(tn),
+                "Команда": tn or None,
+                "profile_id": sr.get("profile_id"),
+                "Участник": sr.get("участник"),
+                "Этап": sr.get("этап"),
+                "Наименование события": ev if ev is not None and str(ev).strip() != "" else "",
+                "competition_id": sr.get("competition_id"),
+                "Место абсолют": sr.get("место_абс"),
+                "Очки базовые": sr.get("очков_база"),
+                "Очки бонус": sr.get("очков_бонус"),
+                "Очков в командный зачёт": sr.get("очков_в_командный"),
+                "Комментарий (бонус 50+)": bonus_txt,
+            }
+        )
+    if not out_rows:
+        return pd.DataFrame(
+            columns=[
+                "Год",
+                "Кубок (id)",
+                "Наименование кубка",
+                "Место команды",
+                "Команда",
+                "profile_id",
+                "Участник",
+                "Этап",
+                "Наименование события",
+                "competition_id",
+                "Место абсолют",
+                "Очки базовые",
+                "Очки бонус",
+                "Очков в командный зачёт",
+                "Комментарий (бонус 50+)",
+            ]
+        )
+    return pd.DataFrame(out_rows)
+
+
+def _cup_team_flat_excel_legacy(
+    cup_title: str,
+    cup_id: int,
+    year: int,
+    teams_agg: list[tuple[str, int, list[dict]]],
+) -> pd.DataFrame:
+    """Одна строка на связку команда × участник (старая схема по profile_cup_results)."""
+    rows_out: list[dict[str, Any]] = []
+    for team_place, (team, team_total_pts, members) in enumerate(teams_agg, start=1):
+        ranked = _team_participants_ranked_with_rows(members)
+        for rk, (_pid, pname, ptot, _rows_p) in enumerate(ranked, start=1):
+            rows_out.append(
+                {
+                    "Год": year,
+                    "Кубок (id)": cup_id,
+                    "Наименование кубка": cup_title,
+                    "Место команды": team_place,
+                    "Команда": team,
+                    "Очки команды (топ‑5, итог)": team_total_pts,
+                    "Место участника в команде": rk,
+                    "В топ‑5 участников команды": "Да" if rk <= 5 else "Нет",
+                    "profile_id": _pid,
+                    "Участник": pname,
+                    "Сумма очков участника (по строкам кубка)": ptot,
+                }
+            )
+    return pd.DataFrame(rows_out)
 
 
 def _esc_html(s: Any) -> str:
@@ -2694,7 +3659,7 @@ def _event_records_hierarchy_html(rows: list[dict[str, Any]]) -> str:
                 "</summary>"
             )
             parts.append("<table class='vm-cup-ev'><thead><tr>")
-            for h in ("Пол", "Место", "Год", "Этап", "Участник", "Время"):
+            for h in ("Пол", "Место", "Год", "Этап", "Участник", "Время", "Темп"):
                 parts.append(f"<th>{_esc_html(h)}</th>")
             parts.append("</tr></thead><tbody>")
             for row in dist_rows:
@@ -2702,6 +3667,7 @@ def _event_records_hierarchy_html(rows: list[dict[str, Any]]) -> str:
                 place_s = str(place_raw) if place_raw is not None else "—"
                 if place_s == "1":
                     place_s = "👑 1"
+                tempo = row.get("Темп") if row.get("Темп") is not None else "—"
                 parts.append(
                     "<tr>"
                     f"<td>{_esc_html(row.get('Пол'))}</td>"
@@ -2710,6 +3676,7 @@ def _event_records_hierarchy_html(rows: list[dict[str, Any]]) -> str:
                     f"<td>{_esc_html(row.get('Этап'))}</td>"
                     f"<td>{_esc_html(row.get('Участник'))}</td>"
                     f"<td>{_esc_html(row.get('Время'))}</td>"
+                    f"<td>{_esc_html(tempo)}</td>"
                     "</tr>"
                 )
             parts.append("</tbody></table></details>")
@@ -3728,6 +4695,24 @@ def page_cups() -> None:
                 all_stages = mq.query_team_scoring_stage_points(
                     path, cup_id, year, team_name=None, rule_version="team_v1"
                 )
+                _, _team_dl = st.columns([4, 1])
+                with _team_dl:
+                    _df_team = _cup_team_flat_excel_team_scoring_v1(
+                        cup_title, cup_id, year, team_tot, all_members
+                    )
+                    _df_stages = _cup_team_stage_rows_excel_team_scoring_v1(
+                        cup_title, cup_id, year, team_tot, all_stages
+                    )
+                    _excel_download_button_png_or_fallback(
+                        _dataframes_to_excel_bytes(
+                            [
+                                ("Участники", _df_team),
+                                ("По этапам", _df_stages),
+                            ]
+                        ),
+                        f"komandnyy_zachyot_{cup_id}_{year}.xlsx",
+                        streamlit_key=f"cups_team_xlsx_v1_{year}_{cup_id}",
+                    )
                 with st.spinner("Загрузка…"):
                     frag = _team_scoring_hierarchy_html(team_tot, all_members, all_stages)
                 if hasattr(st, "html"):
@@ -3758,15 +4743,26 @@ def page_cups() -> None:
                 if not score_rows:
                     st.caption("После фильтра команд не осталось.")
                 else:
+                    teams_agg = _cup_team_aggregate_points(score_rows)
                     st.caption(
                         "Сумма в командный зачёт = сумма **очков пяти лучших участников** "
                         "(очки из **profile_cup_results.total_points**, по каждому этапу — целое после округления). "
                         "Таблица: **место · команда · очки**; под участником — **все его финиши** в соревнованиях этого кубка за год "
                         "(**results** + **cup_competitions**)."
                     )
+                    _, _team_dl_legacy = st.columns([4, 1])
+                    with _team_dl_legacy:
+                        _df_legacy = _cup_team_flat_excel_legacy(
+                            cup_title, cup_id, year, teams_agg
+                        )
+                        _excel_download_button_png_or_fallback(
+                            _dataframe_to_excel_bytes(_df_legacy, "Командный зачёт"),
+                            f"komandnyy_zachyot_{cup_id}_{year}.xlsx",
+                            streamlit_key=f"cups_team_xlsx_legacy_{year}_{cup_id}",
+                        )
                     with st.spinner("Загрузка…"):
                         frag = _cup_team_hierarchy_html(
-                            _cup_team_aggregate_points(score_rows), path, cup_id, year
+                            teams_agg, path, cup_id, year
                         )
                     if hasattr(st, "html"):
                         st.html(frag)
@@ -3837,7 +4833,8 @@ def page_admin() -> None:
     st.subheader("Справочник алиасов дистанций")
     st.caption(
         "Используется в разделе «Событие» для нормализации дистанций "
-        "в блоке «Рекорды события» (группировка топов по канонической дистанции)."
+        "в блоке «Рекорды события» (группировка топов по канонической дистанции). "
+        "Колонка **км** — числовая фактическая дистанция для дальнейшего расчёта суммарного километража участников."
     )
     src = mq.distance_aliases_file_path()
     st.code(str(src), language=None)
@@ -3846,10 +4843,15 @@ def page_admin() -> None:
     if not current_rows:
         current_rows = mq.default_distance_alias_rules()
     df = pd.DataFrame(current_rows)
-    for col in ("alias", "canonical_key", "canonical_label", "active"):
+    for col in ("alias", "canonical_key", "canonical_label", "km", "active"):
         if col not in df.columns:
-            df[col] = "" if col != "active" else True
-    df = df[["alias", "canonical_key", "canonical_label", "active"]]
+            if col == "active":
+                df[col] = True
+            elif col == "km":
+                df[col] = pd.NA
+            else:
+                df[col] = ""
+    df = df[["alias", "canonical_key", "canonical_label", "km", "active"]]
 
     edited = st.data_editor(
         df,
@@ -3861,6 +4863,13 @@ def page_admin() -> None:
             "alias": st.column_config.TextColumn("Alias (как в исходных данных)"),
             "canonical_key": st.column_config.TextColumn("Канонический key"),
             "canonical_label": st.column_config.TextColumn("Название в UI"),
+            "km": st.column_config.NumberColumn(
+                "км",
+                help="Фактическая дистанция, км (можно оставить пустым).",
+                min_value=0.0,
+                format="%.6g",
+                step=0.001,
+            ),
             "active": st.column_config.CheckboxColumn("Активно"),
         },
     )

@@ -557,6 +557,7 @@ def test_event_section_records_hierarchy(sample_db: Path) -> None:
         assert r["Год"] == 2024
         assert "Test Marathon" in str(r["Этап"])
         assert str(r["Время"]).strip() != ""
+        assert "Темп" in r
     assert mq.query_event_section_records_hierarchy(
         sample_db, years=[2024], sports=["ski"], top_n=5
     ) == []
@@ -633,6 +634,9 @@ def test_event_records_use_distance_alias_dictionary(sample_db: Path) -> None:
     assert len(hm_rows) == 4
     assert {r["Дистанция"] for r in hm_rows} == {"Полумарафон (21.1 км)"}
     assert {r["Пол"] for r in hm_rows} == {"Мужчины", "Женщины"}
+    for r in hm_rows:
+        assert "Темп" in r
+        assert r["Темп"] != "—" and ":" in str(r["Темп"])
 
 
 def test_profile_analytics_queries(sample_db: Path) -> None:

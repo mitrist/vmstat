@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sqlite3
@@ -92,6 +93,40 @@ def _norm_alias_token(value: str | None) -> str:
     return s
 
 
+def _parse_optional_distance_km(raw: Any) -> float | None:
+    """Число км из JSON/редактора; None если пусто или некорректно."""
+    if raw is None or raw == "":
+        return None
+    try:
+        x = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(x) or math.isnan(x) or x < 0:
+        return None
+    return x
+
+
+def format_running_pace_per_km_mmss(finish_time_sec: Any, distance_km: float | None) -> str:
+    """
+    Темп бега и трэйла: мин:сек на один километр.
+
+    ``distance_km`` — как правило из ``normalize_distance_by_alias_rules_km`` (справочник км).
+    """
+    km = distance_km
+    if km is None or km <= 0:
+        return "—"
+    try:
+        sec_total = float(finish_time_sec)
+    except (TypeError, ValueError):
+        return "—"
+    if not math.isfinite(sec_total) or sec_total <= 0:
+        return "—"
+    sec_per_km = round(sec_total / km)
+    m = sec_per_km // 60
+    s = sec_per_km % 60
+    return f"{int(m)}:{int(s):02d}"
+
+
 def distance_aliases_file_path() -> Path:
     raw = os.environ.get("DISTANCE_ALIASES_FILE", "").strip()
     if raw:
@@ -106,42 +141,49 @@ def default_distance_alias_rules() -> list[dict[str, Any]]:
             "alias": "полмарафон",
             "canonical_key": "half_marathon",
             "canonical_label": "Полумарафон (21.1 км)",
+            "km": 21.0975,
             "active": True,
         },
         {
             "alias": "21 км",
             "canonical_key": "half_marathon",
             "canonical_label": "Полумарафон (21.1 км)",
+            "km": 21.0975,
             "active": True,
         },
         {
             "alias": "21 км 97,5м",
             "canonical_key": "half_marathon",
             "canonical_label": "Полумарафон (21.1 км)",
+            "km": 21.0975,
             "active": True,
         },
         {
             "alias": "21.0975 км",
             "canonical_key": "half_marathon",
             "canonical_label": "Полумарафон (21.1 км)",
+            "km": 21.0975,
             "active": True,
         },
         {
             "alias": "марафон",
             "canonical_key": "marathon",
             "canonical_label": "Марафон (42.195 км)",
+            "km": 42.195,
             "active": True,
         },
         {
             "alias": "42 км",
             "canonical_key": "marathon",
             "canonical_label": "Марафон (42.195 км)",
+            "km": 42.195,
             "active": True,
         },
         {
             "alias": "42,195 км",
             "canonical_key": "marathon",
             "canonical_label": "Марафон (42.195 км)",
+            "km": 42.195,
             "active": True,
         },
     ]
@@ -172,11 +214,13 @@ def load_distance_alias_rules() -> list[dict[str, Any]]:
         active = bool(r.get("active", True))
         if not alias or not canonical_key or not canonical_label:
             continue
+        km = _parse_optional_distance_km(r.get("km"))
         out.append(
             {
                 "alias": alias,
                 "canonical_key": canonical_key,
                 "canonical_label": canonical_label,
+                "km": km,
                 "active": active,
             }
         )
@@ -191,6 +235,13 @@ def validate_distance_alias_rules(rows: list[dict[str, Any]]) -> list[str]:
         alias = str(r.get("alias") or "").strip()
         ckey = str(r.get("canonical_key") or "").strip()
         clabel = str(r.get("canonical_label") or "").strip()
+        km_raw = r.get("km")
+        if km_raw is not None and km_raw != "" and str(km_raw).strip() != "":
+            km = _parse_optional_distance_km(km_raw)
+            if km is None:
+                errors.append(f"Строка {i}: поле «км» должно быть неотрицательным числом или пустым.")
+        if not alias and not ckey and not clabel:
+            continue
         if not alias or not ckey or not clabel:
             errors.append(f"Строка {i}: заполните alias / canonical_key / canonical_label.")
             continue
@@ -219,14 +270,16 @@ def save_distance_alias_rules(rows: list[dict[str, Any]]) -> list[str]:
         clabel = str(r.get("canonical_label") or "").strip()
         if not alias and not ckey and not clabel:
             continue
-        clean_rows.append(
-            {
-                "alias": alias,
-                "canonical_key": ckey,
-                "canonical_label": clabel,
-                "active": bool(r.get("active", True)),
-            }
-        )
+        km = _parse_optional_distance_km(r.get("km"))
+        row_out: dict[str, Any] = {
+            "alias": alias,
+            "canonical_key": ckey,
+            "canonical_label": clabel,
+            "active": bool(r.get("active", True)),
+        }
+        if km is not None:
+            row_out["km"] = km
+        clean_rows.append(row_out)
     p = distance_aliases_file_path()
     p.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -237,17 +290,20 @@ def save_distance_alias_rules(rows: list[dict[str, Any]]) -> list[str]:
     return []
 
 
-def normalize_distance_by_alias_rules(
+def normalize_distance_by_alias_rules_km(
     raw_distance_name: str | None,
     rules: list[dict[str, Any]] | None = None,
-) -> tuple[str, str]:
-    """Возвращает (ключ_группировки, label_для_UI) по справочнику алиасов."""
+) -> tuple[str, str, float | None]:
+    """
+    Как normalize_distance_by_alias_rules, плюс фактическая дистанция в км по строке
+    справочника, совпавшей с сырым названием (для суммарного километража).
+    """
     src = str(raw_distance_name or "").strip()
     if not src:
-        return ("—", "—")
+        return ("—", "—", None)
     rule_rows = rules if rules is not None else load_distance_alias_rules()
     norm_src = _norm_alias_token(src)
-    alias_map: dict[str, tuple[str, str]] = {}
+    alias_map: dict[str, tuple[str, str, float | None]] = {}
     for r in rule_rows:
         if not bool(r.get("active", True)):
             continue
@@ -256,13 +312,24 @@ def normalize_distance_by_alias_rules(
         alias = str(r.get("alias") or "").strip()
         if not ckey or not clabel or not alias:
             continue
-        alias_map[_norm_alias_token(alias)] = (ckey, clabel)
-        alias_map[_norm_alias_token(clabel)] = (ckey, clabel)
-        alias_map[_norm_alias_token(ckey)] = (ckey, clabel)
+        km = _parse_optional_distance_km(r.get("km"))
+        triple = (ckey, clabel, km)
+        alias_map[_norm_alias_token(alias)] = triple
+        alias_map[_norm_alias_token(clabel)] = triple
+        alias_map[_norm_alias_token(ckey)] = triple
     if norm_src in alias_map:
-        key, label = alias_map[norm_src]
-        return (key, label)
-    return (f"raw::{norm_src}", src)
+        key, label, km_out = alias_map[norm_src]
+        return (key, label, km_out)
+    return (f"raw::{norm_src}", src, None)
+
+
+def normalize_distance_by_alias_rules(
+    raw_distance_name: str | None,
+    rules: list[dict[str, Any]] | None = None,
+) -> tuple[str, str]:
+    """Возвращает (ключ_группировки, label_для_UI) по справочнику алиасов."""
+    key, label, _km = normalize_distance_by_alias_rules_km(raw_distance_name, rules)
+    return (key, label)
 
 
 def city_aliases_file_path() -> Path:
@@ -2957,6 +3024,7 @@ def query_event_section_records_hierarchy(
                 c.id,
                 c.year,
                 c.title,
+                LOWER(TRIM(COALESCE(c.sport, ''))) AS sport_code,
                 {series_expr} AS title_series
             FROM competitions c
             WHERE {w}
@@ -2965,6 +3033,7 @@ def query_event_section_records_hierarchy(
             cp.title_series AS event_series,
             COALESCE(NULLIF(TRIM(d.name), ''), '—') AS distance_name,
             LOWER(TRIM(COALESCE(p.gender, ''))) AS gender_code,
+            cp.sport_code AS sport_code,
             cp.year AS event_year,
             cp.title AS event_title,
             COALESCE(NULLIF(TRIM(COALESCE(p.last_name, '') || ' ' || COALESCE(p.first_name, '')), ''), '—') AS athlete_name,
@@ -3006,6 +3075,13 @@ def query_event_section_records_hierarchy(
             )
         )
         for rank, row in enumerate(items[:n], start=1):
+            sp = str(row.get("sport_code") or "").strip().lower()
+            km_alias = normalize_distance_by_alias_rules_km(row.get("distance_name"), rules)[2]
+            pace_str = "—"
+            if sp in {"run", "trail_run"}:
+                pace_str = format_running_pace_per_km_mmss(
+                    row.get("finish_time_sec"), km_alias
+                )
             out.append(
                 {
                     "Событие": event_series,
@@ -3016,6 +3092,7 @@ def query_event_section_records_hierarchy(
                     "Этап": row.get("event_title"),
                     "Участник": row.get("athlete_name"),
                     "Время": row.get("finish_time"),
+                    "Темп": pace_str,
                 }
             )
     out.sort(
@@ -6145,8 +6222,11 @@ def query_vm_geography_page(
     sport: str | None = None,
 ) -> dict[str, Any]:
     """
-    Данные для страницы «География ВМ»: регионы, страны, города (с координатами для карты).
-    Счётчик — уникальные profile_id по стартам под выбранными фильтрами.
+    Данные для страницы «География ВМ»: регионы, страны, города (с координатами для карты),
+    районы ВО — с разбивкой по полу (участников_м/участников_ж и стартов_м/стартов_ж).
+
+    Счётчик — уникальные ``profile_id`` по стартам под выбранными фильтрами; участники без (m)/(f)
+    в сумме входят в общие счётчики, но не в колонки М/Ж.
     """
     w, params = _build_interesting_facts_where(year, sport)
 
@@ -6157,13 +6237,14 @@ def query_vm_geography_page(
             COALESCE(NULLIF(TRIM(p.city), ''), '—') AS city,
             COALESCE(NULLIF(TRIM(p.region), ''), '—') AS region,
             COALESCE(NULLIF(TRIM(p.country), ''), '—') AS country,
+            LOWER(TRIM(COALESCE(p.gender, ''))) AS gender_code,
             COUNT(DISTINCT CASE WHEN r.profile_id IS NOT NULL THEN r.profile_id END) AS participants,
             COUNT(*) AS starts
         FROM results r
         INNER JOIN competitions c ON c.id = r.competition_id
         LEFT JOIN profiles p ON p.id = r.profile_id
         WHERE r.profile_id IS NOT NULL AND {w}
-        GROUP BY city, region, country
+        GROUP BY city, region, country, gender_code
         """,
         tuple(params),
     )
@@ -6179,6 +6260,7 @@ def query_vm_geography_page(
     region_agg: dict[str, dict[str, Any]] = {}
     country_agg: dict[str, dict[str, Any]] = {}
     vo_district_agg: dict[str, dict[str, Any]] = {}
+
     for r in raw_city_rows:
         raw_region = str(r.get("region") or "")
         geo = resolve_city_geo_by_alias_rules(r.get("city"), raw_region or None, r.get("country"), city_rules)
@@ -6193,32 +6275,69 @@ def query_vm_geography_page(
         cur = city_agg.get(key)
         participants = int(r.get("participants") or 0)
         starts = int(r.get("starts") or 0)
+        gsex = str(r.get("gender_code") or "").strip().lower()
+        pm = participants if gsex == "m" else 0
+        pf = participants if gsex == "f" else 0
+        sm = starts if gsex == "m" else 0
+        sf_st = starts if gsex == "f" else 0
         if cur is None:
             city_agg[key] = {
                 "city": lbl,
                 "participants": participants,
                 "starts": starts,
+                "participants_m": pm,
+                "participants_f": pf,
+                "starts_m": sm,
+                "starts_f": sf_st,
             }
             region_by_key[key] = reg_ui if reg_ui != "—" else region_from_city
         else:
             cur["participants"] = int(cur.get("participants") or 0) + participants
             cur["starts"] = int(cur.get("starts") or 0) + starts
+            cur["participants_m"] = int(cur.get("participants_m") or 0) + pm
+            cur["participants_f"] = int(cur.get("participants_f") or 0) + pf
+            cur["starts_m"] = int(cur.get("starts_m") or 0) + sm
+            cur["starts_f"] = int(cur.get("starts_f") or 0) + sf_st
 
         rk = _norm_alias_token(region_by_key[key]) or region_by_key[key].casefold()
         rcur = region_agg.get(rk)
         if rcur is None:
-            region_agg[rk] = {"region": region_by_key[key], "participants": participants, "starts": starts}
+            region_agg[rk] = {
+                "region": region_by_key[key],
+                "participants": participants,
+                "starts": starts,
+                "participants_m": pm,
+                "participants_f": pf,
+                "starts_m": sm,
+                "starts_f": sf_st,
+            }
         else:
             rcur["participants"] = int(rcur.get("participants") or 0) + participants
             rcur["starts"] = int(rcur.get("starts") or 0) + starts
+            rcur["participants_m"] = int(rcur.get("participants_m") or 0) + pm
+            rcur["participants_f"] = int(rcur.get("participants_f") or 0) + pf
+            rcur["starts_m"] = int(rcur.get("starts_m") or 0) + sm
+            rcur["starts_f"] = int(rcur.get("starts_f") or 0) + sf_st
 
         ck = _norm_alias_token(country_ui) or country_ui.casefold()
         ccur = country_agg.get(ck)
         if ccur is None:
-            country_agg[ck] = {"country": country_ui, "participants": participants, "starts": starts}
+            country_agg[ck] = {
+                "country": country_ui,
+                "participants": participants,
+                "starts": starts,
+                "participants_m": pm,
+                "participants_f": pf,
+                "starts_m": sm,
+                "starts_f": sf_st,
+            }
         else:
             ccur["participants"] = int(ccur.get("participants") or 0) + participants
             ccur["starts"] = int(ccur.get("starts") or 0) + starts
+            ccur["participants_m"] = int(ccur.get("participants_m") or 0) + pm
+            ccur["participants_f"] = int(ccur.get("participants_f") or 0) + pf
+            ccur["starts_m"] = int(ccur.get("starts_m") or 0) + sm
+            ccur["starts_f"] = int(ccur.get("starts_f") or 0) + sf_st
 
         eff_region = region_by_key.get(key, region_from_city)
         if _norm_alias_token(eff_region) in vo_region_tokens:
@@ -6226,10 +6345,22 @@ def query_vm_geography_page(
             dk = _norm_alias_token(district) or district.casefold()
             dcur = vo_district_agg.get(dk)
             if dcur is None:
-                vo_district_agg[dk] = {"district": district, "participants": participants, "starts": starts}
+                vo_district_agg[dk] = {
+                    "district": district,
+                    "participants": participants,
+                    "starts": starts,
+                    "participants_m": pm,
+                    "participants_f": pf,
+                    "starts_m": sm,
+                    "starts_f": sf_st,
+                }
             else:
                 dcur["participants"] = int(dcur.get("participants") or 0) + participants
                 dcur["starts"] = int(dcur.get("starts") or 0) + starts
+                dcur["participants_m"] = int(dcur.get("participants_m") or 0) + pm
+                dcur["participants_f"] = int(dcur.get("participants_f") or 0) + pf
+                dcur["starts_m"] = int(dcur.get("starts_m") or 0) + sm
+                dcur["starts_f"] = int(dcur.get("starts_f") or 0) + sf_st
 
     cities_sorted = sorted(
         city_agg.values(),
