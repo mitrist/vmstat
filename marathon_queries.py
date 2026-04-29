@@ -5635,6 +5635,61 @@ def query_interesting_facts_wins_leaders_by_sport(
     return sorted(by_sport.values(), key=lambda x: str(x.get("sport") or ""))
 
 
+def query_interesting_facts_abs_wins_top10(
+    db_path: Path | str,
+    year: int | None = None,
+    sport: str | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    """Топ-10 по победам в абсолюте (place_abs=1), отдельно мужчины/женщины."""
+    w, params = _build_interesting_facts_where(year, sport)
+    rows = q_all(
+        db_path,
+        f"""
+        SELECT
+            LOWER(TRIM(COALESCE(p.gender, ''))) AS gender_code,
+            r.profile_id AS profile_id,
+            TRIM(COALESCE(p.last_name, '') || ' ' || COALESCE(p.first_name, '')) AS participant,
+            COUNT(*) AS wins
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        LEFT JOIN profiles p ON p.id = r.profile_id
+        WHERE COALESCE(r.dnf, 0) = 0
+          AND r.profile_id IS NOT NULL
+          AND COALESCE(r.place_abs, 0) = 1
+          AND LOWER(TRIM(COALESCE(p.gender, ''))) IN ('m', 'f')
+          AND {w}
+        GROUP BY gender_code, profile_id, participant
+        """,
+        tuple(params),
+    )
+    males: list[dict[str, Any]] = []
+    females: list[dict[str, Any]] = []
+    for r in rows:
+        rec = {
+            "profile_id": int(r.get("profile_id") or 0),
+            "participant": str(r.get("participant") or "").strip() or "—",
+            "wins": int(r.get("wins") or 0),
+        }
+        gc = str(r.get("gender_code") or "").strip().lower()
+        if gc == "m":
+            males.append(rec)
+        elif gc == "f":
+            females.append(rec)
+
+    def _top10(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        out = sorted(
+            items,
+            key=lambda x: (
+                -int(x.get("wins") or 0),
+                str(x.get("participant") or "").casefold(),
+                int(x.get("profile_id") or 0),
+            ),
+        )
+        return out[:10]
+
+    return {"males": _top10(males), "females": _top10(females)}
+
+
 def query_interesting_facts_loyal_participants(
     db_path: Path | str,
     year: int | None = None,

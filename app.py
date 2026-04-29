@@ -1450,7 +1450,7 @@ def page_interesting_facts() -> None:
     record_leaders_cards = mq.query_interesting_facts_record_leaders_by_sport(
         path, year=year_val, sport=sport_val
     )
-    wins_leaders_cards = mq.query_interesting_facts_wins_leaders_by_sport(
+    abs_wins_top = mq.query_interesting_facts_abs_wins_top10(
         path, year=year_val, sport=sport_val
     )
 
@@ -1578,32 +1578,25 @@ def page_interesting_facts() -> None:
                             f"М: {male} | Ж: {female}",
                         )
 
-    if wins_leaders_cards:
+    if abs_wins_top:
         st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
         with st.container(border=True):
-            _facts_block_title("Лидеры по количеству побед в событиях (по видам спорта)")
-            sport_labels = {
-                "run": "бег",
-                "trail_run": "трейл",
-                "bike": "вело",
-                "ski": "лыжи",
-                "service": "сервис",
-                "other": "другое",
-            }
-            for i in range(0, len(wins_leaders_cards), 3):
-                row_cards = wins_leaders_cards[i : i + 3]
-                cols = st.columns(len(row_cards))
-                for col, card in zip(cols, row_cards):
-                    code = str(card.get("sport") or "").strip()
-                    icon = sport_calendar_icon(code)
-                    sport_name = sport_labels.get(code, code or "unknown")
-                    male = f"{card.get('male_participant', '—')} ({int(card.get('male_wins') or 0)})"
-                    female = f"{card.get('female_participant', '—')} ({int(card.get('female_wins') or 0)})"
-                    with col:
-                        metric_plaque(
-                            f"{icon} Лидер по количеству побед в событиях ({sport_name})",
-                            f"М: {male} | Ж: {female}",
-                        )
+            _facts_block_title("Лидеры по количеству побед в абсолюте (Топ-10)")
+            c_m, c_f = st.columns(2)
+            with c_m:
+                st.markdown("**Мужчины**")
+                for idx, row in enumerate(abs_wins_top.get("males") or [], start=1):
+                    metric_plaque(
+                        f"#{idx} {row.get('participant', '—')}",
+                        f"{int(row.get('wins') or 0)} побед",
+                    )
+            with c_f:
+                st.markdown("**Женщины**")
+                for idx, row in enumerate(abs_wins_top.get("females") or [], start=1):
+                    metric_plaque(
+                        f"#{idx} {row.get('participant', '—')}",
+                        f"{int(row.get('wins') or 0)} побед",
+                    )
 
     f1, f2 = st.columns(2)
     with f1:

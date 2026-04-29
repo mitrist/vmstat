@@ -483,6 +483,14 @@ def test_interesting_facts_wins_leaders_split_by_sport(sample_db: Path) -> None:
     assert str(bike_w.get("male_participant") or "").startswith("Secondov")
 
 
+def test_interesting_facts_abs_wins_top10(sample_db: Path) -> None:
+    out = mq.query_interesting_facts_abs_wins_top10(sample_db, year=None, sport=None)
+    assert isinstance(out.get("males"), list)
+    assert isinstance(out.get("females"), list)
+    assert out["males"]
+    assert str(out["males"][0].get("participant") or "").startswith("Testov")
+
+
 def test_cups_for_obsh_header_filter(sample_db: Path) -> None:
     all_c = mq.query_cups_for_obsh_header_filter(sample_db, None, None)
     ids = {r["id"] for r in all_c}
