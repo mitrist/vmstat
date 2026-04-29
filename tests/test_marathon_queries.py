@@ -400,7 +400,7 @@ def test_team_extended_queries(sample_db: Path) -> None:
     geo = mq.query_team_geography(sample_db, "Team A")
     # Профиль: city=Vologda; при наличии norm_city.csv название становится каноническим русским («Вологда»).
     assert geo["cities"][0]["city"] == "Вологда"
-    assert geo["regions"][0]["region"] == "VO"
+    assert geo["regions"][0]["region"] == "Вологодская Область"
     assert geo["countries"][0]["country"] == "Россия"
 
     trends = mq.query_team_yearly_trends(sample_db, "Team A")
@@ -420,6 +420,46 @@ def test_vm_geography_page_queries(sample_db: Path) -> None:
     assert isinstance(out["countries"], list)
     assert isinstance(out["cities"], list)
     assert isinstance(out["map_points"], list)
+    assert isinstance(out.get("vologda_districts"), list)
+
+
+def test_interesting_facts_starts_per_participant_counts(sample_db: Path) -> None:
+    row = mq.query_interesting_facts_starts_per_participant(sample_db, year=None, sport=None)
+    assert int(row["starts_total"]) == 4
+    assert int(row["participants_total"]) == 2
+    assert int(row["starts_male"]) == 4
+    assert int(row["participants_male"]) == 2
+    assert int(row["starts_female"]) == 0
+    assert int(row["participants_female"]) == 0
+
+
+def test_interesting_facts_starts_per_participant_per_year(sample_db: Path) -> None:
+    row = mq.query_interesting_facts_starts_per_participant_per_year(sample_db, year=None, sport=None)
+    assert float(row["avg_starts_total"]) == pytest.approx(2.0)
+    assert float(row["avg_participants_total"]) == pytest.approx(1.5)
+    assert float(row["avg_starts_male"]) == pytest.approx(2.0)
+    assert float(row["avg_participants_male"]) == pytest.approx(1.5)
+    assert float(row["avg_starts_female"]) == pytest.approx(0.0)
+    assert float(row["avg_participants_female"]) == pytest.approx(0.0)
+
+
+def test_interesting_facts_longest_series_by_sport_without_title_short(sample_db: Path) -> None:
+    rows = mq.query_interesting_facts_longest_series_by_sport(sample_db, year=None, sport=None)
+    assert rows == []
+
+
+def test_interesting_facts_record_and_wins_leaders_by_sport(sample_db: Path) -> None:
+    rec = mq.query_interesting_facts_record_leaders_by_sport(sample_db, year=None, sport=None)
+    assert rec
+    run_row = next((r for r in rec if str(r.get("sport")) == "run"), None)
+    assert run_row is not None
+    assert int(run_row["male_records"]) >= 1
+
+    wins = mq.query_interesting_facts_wins_leaders_by_sport(sample_db, year=None, sport=None)
+    assert wins
+    run_w = next((r for r in wins if str(r.get("sport")) == "run"), None)
+    assert run_w is not None
+    assert int(run_w["male_wins"]) >= 0
 
 
 def test_cups_for_obsh_header_filter(sample_db: Path) -> None:
@@ -968,7 +1008,14 @@ def test_interesting_facts_geography_city_aliases(sample_db: Path, tmp_path: Pat
     city_alias_file.write_text(
         """{
   "rules": [
-    {"alias":"Vologda", "canonical_key":"vologda", "canonical_label":"Вологда", "active":true}
+    {
+      "alias":"Vologda",
+      "canonical_key":"vologda",
+      "canonical_label":"Вологда",
+      "region":"Вологодская Область",
+      "country":"Россия",
+      "active":true
+    }
   ]
 }""",
         encoding="utf-8",
@@ -979,7 +1026,7 @@ def test_interesting_facts_geography_city_aliases(sample_db: Path, tmp_path: Pat
     conn.executescript(
         """
         INSERT INTO profiles VALUES (110, 'A', 'B', '', 'm', 30, 1994, 'Vologda',
-            NULL, 'VO', 36, 'Россия', '', 0, 0, 0, 0, 0, 0, '{}');
+            NULL, 'WrongRegion', 36, 'WrongCountry', '', 0, 0, 0, 0, 0, 0, '{}');
         INSERT INTO results VALUES (60, 1, 10, 110, 0, 3900.0, 'Team A', 10, 9, 5, 'M40', '01:05:00', '{}');
         """
     )
@@ -989,6 +1036,10 @@ def test_interesting_facts_geography_city_aliases(sample_db: Path, tmp_path: Pat
     geo = mq.query_interesting_facts_geography(sample_db, year=2024, sport="run", limit=20)
     city_names = [str(r.get("city")) for r in geo.get("cities", [])]
     assert "Вологда" in city_names
+    region_names = [str(r.get("region")) for r in geo.get("regions", [])]
+    country_names = [str(r.get("country")) for r in geo.get("countries", [])]
+    assert "Вологодская Область" in region_names
+    assert "Россия" in country_names
 
 
 def test_city_normalization_schema_and_batch(sample_db: Path, tmp_path: Path, monkeypatch) -> None:

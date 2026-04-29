@@ -316,6 +316,9 @@ def _norm_city_csv_row_to_rule(row: dict[str, Any]) -> dict[str, Any] | None:
         or mm.get("название", "")
     )
     cid = mm.get("canonical_city_id", "") or mm.get("city_id", "")
+    region = mm.get("region", "") or mm.get("регион", "")
+    country = mm.get("country", "") or mm.get("страна", "")
+    rayon = mm.get("район", "") or mm.get("district", "")
     alias = str(alias).strip()
     ck = str(ck).strip()
     clabel = str(clabel).strip()
@@ -327,6 +330,9 @@ def _norm_city_csv_row_to_rule(row: dict[str, Any]) -> dict[str, Any] | None:
         "canonical_key": ck,
         "canonical_label": clabel,
         "canonical_city_id": cid_s,
+        "region": str(region).strip(),
+        "country": str(country).strip(),
+        "rayon": str(rayon).strip(),
         "active": True,
     }
 
@@ -388,6 +394,9 @@ def _load_json_city_alias_rules_only() -> list[dict[str, Any]]:
         canonical_label = str(r.get("canonical_label") or "").strip()
         active = bool(r.get("active", True))
         cid = str(r.get("canonical_city_id") or "").strip()
+        region = str(r.get("region") or "").strip()
+        country = str(r.get("country") or "").strip()
+        rayon = str(r.get("rayon") or r.get("район") or "").strip()
         if not alias or not canonical_key or not canonical_label:
             continue
         row_d: dict[str, Any] = {
@@ -398,6 +407,12 @@ def _load_json_city_alias_rules_only() -> list[dict[str, Any]]:
         }
         if cid:
             row_d["canonical_city_id"] = cid
+        if region:
+            row_d["region"] = region
+        if country:
+            row_d["country"] = country
+        if rayon:
+            row_d["rayon"] = rayon
         out.append(row_d)
     return out
 
@@ -428,6 +443,9 @@ def _rule_signature_for_overlay_compare(r: dict[str, Any]) -> tuple[str, ...]:
         str(r.get("canonical_label") or "").strip(),
         "1" if bool(r.get("active", True)) else "0",
         str(r.get("canonical_city_id") or "").strip(),
+        str(r.get("region") or "").strip(),
+        str(r.get("country") or "").strip(),
+        str(r.get("rayon") or "").strip(),
     )
 
 
@@ -452,6 +470,18 @@ def _str_from_editor_cell(v: Any) -> str:
 def _norm_city_token(value: str | None) -> str:
     s = _norm_alias_token(value)
     s = re.sub(r"^(г\.?|гор|город)\s+", "", s).strip()
+    return s
+
+
+def _is_missing_geo_label(value: str | None) -> bool:
+    s = _norm_alias_token(value)
+    return s in {"", "-", "—", "н/д", "#н/д", "na", "n/a", "none", "null", "unknown", "?"}
+
+
+def _clean_geo_label(value: str | None, fallback: str = "—") -> str:
+    s = str(value or "").strip()
+    if _is_missing_geo_label(s):
+        return fallback
     return s
 
 
@@ -634,6 +664,15 @@ def save_city_alias_rules(rows: list[dict[str, Any]]) -> list[str]:
         }
         if cid:
             row_out["canonical_city_id"] = cid
+        region = _str_from_editor_cell(r.get("region"))
+        country = _str_from_editor_cell(r.get("country"))
+        rayon = _str_from_editor_cell(r.get("rayon") if "rayon" in r else r.get("район"))
+        if region:
+            row_out["region"] = region
+        if country:
+            row_out["country"] = country
+        if rayon:
+            row_out["rayon"] = rayon
         if norm_alias not in dedup_map:
             dedup_order.append(norm_alias)
         dedup_map[norm_alias] = row_out
@@ -997,6 +1036,52 @@ def normalize_city_by_alias_rules(
         return (f"cityref::{city_key}", city_label)
 
     return (f"raw::{norm_src}", src)
+
+
+def resolve_city_geo_by_alias_rules(
+    raw_city_name: str | None,
+    raw_region_name: str | None = None,
+    raw_country_name: str | None = None,
+    rules: list[dict[str, Any]] | None = None,
+) -> dict[str, str]:
+    """Нормализует город и возвращает канонические geo-поля из справочника."""
+    src_city = str(raw_city_name or "").strip() or "—"
+    src_region = _clean_geo_label(raw_region_name)
+    src_country = _clean_geo_label(raw_country_name)
+    rr = rules if rules is not None else load_city_alias_rules()
+    norm_src = _norm_city_token(src_city)
+
+    alias_map: dict[str, dict[str, str]] = {}
+    for r in rr:
+        if not bool(r.get("active", True)):
+            continue
+        ckey = str(r.get("canonical_key") or "").strip()
+        clabel = str(r.get("canonical_label") or "").strip()
+        alias = str(r.get("alias") or "").strip()
+        if not ckey or not clabel or not alias:
+            continue
+        rec = {
+            "city_key": ckey,
+            "city_label": clabel,
+            "region_label": _clean_geo_label(r.get("region"), src_region),
+            "country_label": _clean_geo_label(r.get("country"), src_country),
+            "rayon_label": str(r.get("rayon") or "").strip(),
+        }
+        alias_map[_norm_city_token(alias)] = rec
+        alias_map[_norm_city_token(clabel)] = rec
+        alias_map[_norm_city_token(ckey)] = rec
+
+    if norm_src in alias_map:
+        return alias_map[norm_src]
+
+    key, label = normalize_city_by_alias_rules(src_city, src_region, rr)
+    return {
+        "city_key": key,
+        "city_label": label,
+        "region_label": src_region,
+        "country_label": src_country,
+        "rayon_label": "",
+    }
 
 
 def ensure_city_normalization_schema(db_path: Path | str | None = None) -> None:
@@ -5163,72 +5248,67 @@ def query_team_geography(
     if year is not None:
         year_sql = " AND c.year = ?"
         params.append(int(year))
-    cities = q_all(
+    city_rows = q_all(
         db_path,
         f"""
         SELECT
             COALESCE(NULLIF(TRIM(p.city), ''), '—') AS city,
             COALESCE(NULLIF(TRIM(p.region), ''), '—') AS region,
-            COUNT(DISTINCT CASE WHEN r.profile_id IS NOT NULL THEN r.profile_id END) AS participants
-        FROM results r
-        INNER JOIN competitions c ON c.id = r.competition_id
-        LEFT JOIN profiles p ON p.id = r.profile_id
-        WHERE TRIM(COALESCE(r.team, '')) = ? {year_sql}
-        GROUP BY city, region
-        ORDER BY participants DESC, city, region
-        LIMIT 30
-        """,
-        tuple(params),
-    )
-    city_rules = load_city_alias_rules()
-    city_agg: dict[str, dict[str, Any]] = {}
-    for r in cities:
-        _, label = normalize_city_by_alias_rules(r.get("city"), r.get("region"), city_rules)
-        key = _norm_alias_token(label)
-        if key not in city_agg:
-            city_agg[key] = {"city": label, "participants": int(r.get("participants") or 0)}
-        else:
-            city_agg[key]["participants"] = int(city_agg[key].get("participants") or 0) + int(
-                r.get("participants") or 0
-            )
-    cities = list(city_agg.values())
-    cities.sort(
-        key=lambda x: (-int(x.get("participants") or 0), str(x.get("city") or ""))
-    )
-    cities = cities[:30]
-    regions = q_all(
-        db_path,
-        f"""
-        SELECT
-            COALESCE(NULLIF(TRIM(p.region), ''), '—') AS region,
-            COUNT(DISTINCT CASE WHEN r.profile_id IS NOT NULL THEN r.profile_id END) AS participants
-        FROM results r
-        INNER JOIN competitions c ON c.id = r.competition_id
-        LEFT JOIN profiles p ON p.id = r.profile_id
-        WHERE TRIM(COALESCE(r.team, '')) = ? {year_sql}
-        GROUP BY region
-        ORDER BY participants DESC, region
-        LIMIT 30
-        """,
-        tuple(params),
-    )
-    regions = rollup_region_aggregate_rows(regions, load_region_alias_rules())[:30]
-    countries = q_all(
-        db_path,
-        f"""
-        SELECT
             COALESCE(NULLIF(TRIM(p.country), ''), '—') AS country,
             COUNT(DISTINCT CASE WHEN r.profile_id IS NOT NULL THEN r.profile_id END) AS participants
         FROM results r
         INNER JOIN competitions c ON c.id = r.competition_id
         LEFT JOIN profiles p ON p.id = r.profile_id
         WHERE TRIM(COALESCE(r.team, '')) = ? {year_sql}
-        GROUP BY country
-        ORDER BY participants DESC, country
+        GROUP BY city, region, country
+        ORDER BY participants DESC, city, region, country
         LIMIT 30
         """,
         tuple(params),
     )
+    city_rules = load_city_alias_rules()
+    city_agg: dict[str, dict[str, Any]] = {}
+    region_agg: dict[str, dict[str, Any]] = {}
+    country_agg: dict[str, dict[str, Any]] = {}
+    for r in city_rows:
+        geo = resolve_city_geo_by_alias_rules(r.get("city"), r.get("region"), r.get("country"), city_rules)
+        label = str(geo.get("city_label") or "—")
+        key = _norm_alias_token(label) or _norm_alias_token(str(r.get("city") or ""))
+        participants = int(r.get("participants") or 0)
+        if key not in city_agg:
+            city_agg[key] = {"city": label, "participants": participants}
+        else:
+            city_agg[key]["participants"] = int(city_agg[key].get("participants") or 0) + participants
+
+        region_lbl = _clean_geo_label(geo.get("region_label"))
+        rk = _norm_alias_token(region_lbl) or region_lbl.casefold()
+        if rk not in region_agg:
+            region_agg[rk] = {"region": region_lbl, "participants": participants}
+        else:
+            region_agg[rk]["participants"] = int(region_agg[rk].get("participants") or 0) + participants
+
+        country_lbl = _clean_geo_label(geo.get("country_label"))
+        ck = _norm_alias_token(country_lbl) or country_lbl.casefold()
+        if ck not in country_agg:
+            country_agg[ck] = {"country": country_lbl, "participants": participants}
+        else:
+            country_agg[ck]["participants"] = int(country_agg[ck].get("participants") or 0) + participants
+
+    cities = list(city_agg.values())
+    cities.sort(
+        key=lambda x: (-int(x.get("participants") or 0), str(x.get("city") or ""))
+    )
+    cities = cities[:30]
+    regions = sorted(
+        region_agg.values(),
+        key=lambda x: (-int(x.get("participants") or 0), str(x.get("region") or "")),
+    )
+    regions = [r for r in regions if not _is_missing_geo_label(str(r.get("region") or ""))][:30]
+    countries = sorted(
+        country_agg.values(),
+        key=lambda x: (-int(x.get("participants") or 0), str(x.get("country") or "")),
+    )
+    countries = [r for r in countries if not _is_missing_geo_label(str(r.get("country") or ""))][:30]
     return {"cities": cities, "regions": regions, "countries": countries}
 
 
@@ -5319,6 +5399,241 @@ def _build_interesting_facts_where(year: int | None, sport: str | None) -> tuple
         parts.append("c.sport = ?")
         params.append(str(sport).strip())
     return (" AND ".join(parts) if parts else "1=1"), params
+
+
+def _canonical_sport_code(value: str | None) -> str:
+    """Нормализация sport с учетом алиасов."""
+    s = _norm_alias_token(value)
+    alias_map = {
+        "run": "run",
+        "running": "run",
+        "road_run": "run",
+        "roadrun": "run",
+        "trail_run": "trail_run",
+        "trail run": "trail_run",
+        "trailrun": "trail_run",
+        "trail": "trail_run",
+        "bike": "bike",
+        "cycling": "bike",
+        "velo": "bike",
+        "ski": "ski",
+        "xc_ski": "ski",
+        "cross_country_ski": "ski",
+        "service": "service",
+        "other": "other",
+    }
+    if not s:
+        return "other"
+    return alias_map.get(s, s)
+
+
+def query_interesting_facts_longest_series_by_sport(
+    db_path: Path | str,
+    year: int | None = None,
+    sport: str | None = None,
+) -> list[dict[str, Any]]:
+    """Для каждого вида спорта возвращает самую длинную серию по title_short."""
+    if not _table_has_column(db_path, "competitions", "title_short"):
+        return []
+    w, params = _build_interesting_facts_where(year, None)
+    rows = q_all(
+        db_path,
+        f"""
+        SELECT DISTINCT
+            c.id AS competition_id,
+            TRIM(COALESCE(c.title_short, '')) AS title_short,
+            TRIM(COALESCE(c.sport, '')) AS sport
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        WHERE r.profile_id IS NOT NULL
+          AND {w}
+          AND TRIM(COALESCE(c.title_short, '')) != ''
+        """,
+        tuple(params),
+    )
+    requested = _canonical_sport_code(sport) if sport and str(sport).strip() else ""
+    by_sport_series: dict[tuple[str, str], set[int]] = {}
+    for r in rows:
+        sport_can = _canonical_sport_code(r.get("sport"))
+        if requested and sport_can != requested:
+            continue
+        title = str(r.get("title_short") or "").strip()
+        if not title:
+            continue
+        cid = int(r.get("competition_id") or 0)
+        by_sport_series.setdefault((sport_can, title), set()).add(cid)
+
+    best_by_sport: dict[str, dict[str, Any]] = {}
+    for (sport_can, title), ids in by_sport_series.items():
+        editions = len(ids)
+        prev = best_by_sport.get(sport_can)
+        if prev is None or editions > int(prev.get("editions") or 0) or (
+            editions == int(prev.get("editions") or 0)
+            and str(title).casefold() < str(prev.get("series_title") or "").casefold()
+        ):
+            best_by_sport[sport_can] = {
+                "sport": sport_can,
+                "series_title": title,
+                "editions": editions,
+            }
+    return sorted(best_by_sport.values(), key=lambda x: str(x.get("sport") or ""))
+
+
+def query_interesting_facts_record_leaders_by_sport(
+    db_path: Path | str,
+    year: int | None = None,
+    sport: str | None = None,
+) -> list[dict[str, Any]]:
+    """Лидеры по числу действующих рекордов (по видам спорта, мужчины/женщины)."""
+    series_expr = (
+        "COALESCE(NULLIF(TRIM(c.title_short), ''), TRIM(c.title))"
+        if _table_has_column(db_path, "competitions", "title_short")
+        else "TRIM(c.title)"
+    )
+    w, params = _build_interesting_facts_where(year, None)
+    requested = _canonical_sport_code(sport) if sport and str(sport).strip() else ""
+    base_rows = q_all(
+        db_path,
+        f"""
+        SELECT
+            {series_expr} AS event_series,
+            TRIM(COALESCE(c.sport, '')) AS sport,
+            COALESCE(NULLIF(TRIM(d.name), ''), '—') AS distance_name,
+            LOWER(TRIM(COALESCE(p.gender, ''))) AS gender_code,
+            c.year AS event_year,
+            c.title AS event_title,
+            r.profile_id AS profile_id,
+            TRIM(COALESCE(p.last_name, '') || ' ' || COALESCE(p.first_name, '')) AS participant,
+            r.finish_time_sec AS finish_time_sec
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        INNER JOIN distances d ON d.id = r.distance_id
+        LEFT JOIN profiles p ON p.id = r.profile_id
+        WHERE COALESCE(r.dnf, 0) = 0
+          AND r.finish_time_sec IS NOT NULL
+          AND r.profile_id IS NOT NULL
+          AND LOWER(TRIM(COALESCE(p.gender, ''))) IN ('m', 'f')
+          AND TRIM(COALESCE({series_expr}, '')) != ''
+          AND {w}
+        """,
+        tuple(params),
+    )
+    dist_rules = load_distance_alias_rules()
+    grouped: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
+    for row in base_rows:
+        sport_can = _canonical_sport_code(row.get("sport"))
+        if requested and sport_can != requested:
+            continue
+        event_series = str(row.get("event_series") or "").strip()
+        if not event_series:
+            continue
+        gender_code = str(row.get("gender_code") or "").strip().lower()
+        if gender_code not in {"m", "f"}:
+            continue
+        d_key, _ = normalize_distance_by_alias_rules(row.get("distance_name"), dist_rules)
+        grouped.setdefault((sport_can, event_series, d_key, gender_code), []).append(dict(row))
+
+    counts: dict[tuple[str, str, int], int] = {}
+    labels: dict[int, str] = {}
+    for (sport_can, _series, _dkey, gc), items in grouped.items():
+        winner = sorted(
+            items,
+            key=lambda r: (
+                float(r.get("finish_time_sec") or 0.0),
+                int(r.get("event_year") or 0),
+                str(r.get("event_title") or ""),
+                int(r.get("profile_id") or 0),
+            ),
+        )[0]
+        pid = int(winner.get("profile_id") or 0)
+        if pid <= 0:
+            continue
+        labels[pid] = str(winner.get("participant") or "").strip() or f"id {pid}"
+        key = (sport_can, gc, pid)
+        counts[key] = int(counts.get(key, 0) or 0) + 1
+
+    by_sport: dict[str, dict[str, Any]] = {}
+    for (sport_can, gc, pid), n in counts.items():
+        rec = by_sport.setdefault(
+            sport_can,
+            {
+                "sport": sport_can,
+                "male_participant": "—",
+                "male_records": 0,
+                "female_participant": "—",
+                "female_records": 0,
+            },
+        )
+        if gc == "m":
+            if n > int(rec.get("male_records") or 0):
+                rec["male_records"] = n
+                rec["male_participant"] = labels.get(pid, f"id {pid}")
+        else:
+            if n > int(rec.get("female_records") or 0):
+                rec["female_records"] = n
+                rec["female_participant"] = labels.get(pid, f"id {pid}")
+    return sorted(by_sport.values(), key=lambda x: str(x.get("sport") or ""))
+
+
+def query_interesting_facts_wins_leaders_by_sport(
+    db_path: Path | str,
+    year: int | None = None,
+    sport: str | None = None,
+) -> list[dict[str, Any]]:
+    """Лидеры по количеству побед в событиях (profiles.stat_first), по видам спорта и полу."""
+    w, params = _build_interesting_facts_where(year, None)
+    requested = _canonical_sport_code(sport) if sport and str(sport).strip() else ""
+    rows = q_all(
+        db_path,
+        f"""
+        WITH base AS (
+            SELECT DISTINCT
+                TRIM(COALESCE(c.sport, '')) AS sport,
+                p.id AS profile_id,
+                LOWER(TRIM(COALESCE(p.gender, ''))) AS gender_code,
+                TRIM(COALESCE(p.last_name, '') || ' ' || COALESCE(p.first_name, '')) AS participant,
+                COALESCE(p.stat_first, 0) AS wins
+            FROM results r
+            INNER JOIN competitions c ON c.id = r.competition_id
+            INNER JOIN profiles p ON p.id = r.profile_id
+            WHERE r.profile_id IS NOT NULL
+              AND LOWER(TRIM(COALESCE(p.gender, ''))) IN ('m', 'f')
+              AND {w}
+        )
+        SELECT sport, gender_code, profile_id, participant, wins
+        FROM base
+        """,
+        tuple(params),
+    )
+    by_sport: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        sport_can = _canonical_sport_code(r.get("sport"))
+        if requested and sport_can != requested:
+            continue
+        gc = str(r.get("gender_code") or "").strip().lower()
+        if gc not in {"m", "f"}:
+            continue
+        rec = by_sport.setdefault(
+            sport_can,
+            {
+                "sport": sport_can,
+                "male_participant": "—",
+                "male_wins": 0,
+                "female_participant": "—",
+                "female_wins": 0,
+            },
+        )
+        wins = int(r.get("wins") or 0)
+        participant = str(r.get("participant") or "").strip() or f"id {int(r.get('profile_id') or 0)}"
+        if gc == "m":
+            if wins > int(rec.get("male_wins") or 0):
+                rec["male_wins"] = wins
+                rec["male_participant"] = participant
+        else:
+            if wins > int(rec.get("female_wins") or 0):
+                rec["female_wins"] = wins
+                rec["female_participant"] = participant
+    return sorted(by_sport.values(), key=lambda x: str(x.get("sport") or ""))
 
 
 def query_interesting_facts_loyal_participants(
@@ -5557,6 +5872,87 @@ def query_interesting_facts_team_longevity(
     )
 
 
+def query_interesting_facts_starts_per_participant(
+    db_path: Path | str,
+    year: int | None = None,
+    sport: str | None = None,
+) -> dict[str, int]:
+    """Счётчики для карточек среднего стартов на участника (общий/м/ж)."""
+    w, params = _build_interesting_facts_where(year, sport)
+    row = q_one(
+        db_path,
+        f"""
+        SELECT
+            COUNT(*) AS starts_total,
+            COUNT(DISTINCT CASE WHEN r.profile_id IS NOT NULL THEN r.profile_id END) AS participants_total,
+            SUM(CASE WHEN LOWER(TRIM(COALESCE(p.gender, ''))) IN ('m', 'м') THEN 1 ELSE 0 END) AS starts_male,
+            COUNT(DISTINCT CASE WHEN LOWER(TRIM(COALESCE(p.gender, ''))) IN ('m', 'м') THEN r.profile_id END) AS participants_male,
+            SUM(CASE WHEN LOWER(TRIM(COALESCE(p.gender, ''))) IN ('f', 'ж') THEN 1 ELSE 0 END) AS starts_female,
+            COUNT(DISTINCT CASE WHEN LOWER(TRIM(COALESCE(p.gender, ''))) IN ('f', 'ж') THEN r.profile_id END) AS participants_female
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        LEFT JOIN profiles p ON p.id = r.profile_id
+        WHERE {w}
+        """,
+        tuple(params),
+    ) or {}
+    return {
+        "starts_total": int(row.get("starts_total") or 0),
+        "participants_total": int(row.get("participants_total") or 0),
+        "starts_male": int(row.get("starts_male") or 0),
+        "participants_male": int(row.get("participants_male") or 0),
+        "starts_female": int(row.get("starts_female") or 0),
+        "participants_female": int(row.get("participants_female") or 0),
+    }
+
+
+def query_interesting_facts_starts_per_participant_per_year(
+    db_path: Path | str,
+    year: int | None = None,
+    sport: str | None = None,
+) -> dict[str, float]:
+    """Средние за год: старты/участники (общий, мужчины, женщины)."""
+    w, params = _build_interesting_facts_where(year, sport)
+    row = q_one(
+        db_path,
+        f"""
+        WITH yearly AS (
+            SELECT
+                c.year AS y,
+                COUNT(*) AS starts_total,
+                COUNT(DISTINCT CASE WHEN r.profile_id IS NOT NULL THEN r.profile_id END) AS participants_total,
+                SUM(CASE WHEN LOWER(TRIM(COALESCE(p.gender, ''))) IN ('m', 'м') THEN 1 ELSE 0 END) AS starts_male,
+                COUNT(DISTINCT CASE WHEN LOWER(TRIM(COALESCE(p.gender, ''))) IN ('m', 'м') THEN r.profile_id END) AS participants_male,
+                SUM(CASE WHEN LOWER(TRIM(COALESCE(p.gender, ''))) IN ('f', 'ж') THEN 1 ELSE 0 END) AS starts_female,
+                COUNT(DISTINCT CASE WHEN LOWER(TRIM(COALESCE(p.gender, ''))) IN ('f', 'ж') THEN r.profile_id END) AS participants_female
+            FROM results r
+            INNER JOIN competitions c ON c.id = r.competition_id
+            LEFT JOIN profiles p ON p.id = r.profile_id
+            WHERE {w}
+              AND c.year IS NOT NULL
+            GROUP BY c.year
+        )
+        SELECT
+            AVG(starts_total) AS avg_starts_total,
+            AVG(participants_total) AS avg_participants_total,
+            AVG(starts_male) AS avg_starts_male,
+            AVG(participants_male) AS avg_participants_male,
+            AVG(starts_female) AS avg_starts_female,
+            AVG(participants_female) AS avg_participants_female
+        FROM yearly
+        """,
+        tuple(params),
+    ) or {}
+    return {
+        "avg_starts_total": float(row.get("avg_starts_total") or 0.0),
+        "avg_participants_total": float(row.get("avg_participants_total") or 0.0),
+        "avg_starts_male": float(row.get("avg_starts_male") or 0.0),
+        "avg_participants_male": float(row.get("avg_participants_male") or 0.0),
+        "avg_starts_female": float(row.get("avg_starts_female") or 0.0),
+        "avg_participants_female": float(row.get("avg_participants_female") or 0.0),
+    }
+
+
 def query_interesting_facts_geography(
     db_path: Path | str,
     year: int | None = None,
@@ -5565,39 +5961,63 @@ def query_interesting_facts_geography(
 ) -> dict[str, list[dict[str, Any]]]:
     """География участников: города, регионы и страны."""
     w, params = _build_interesting_facts_where(year, sport)
-    cities = q_all(
+    city_rows = q_all(
         db_path,
         f"""
         SELECT
             COALESCE(NULLIF(TRIM(p.city), ''), '—') AS city,
             COALESCE(NULLIF(TRIM(p.region), ''), '—') AS region,
+            COALESCE(NULLIF(TRIM(p.country), ''), '—') AS country,
             COUNT(DISTINCT CASE WHEN r.profile_id IS NOT NULL THEN r.profile_id END) AS participants,
             COUNT(*) AS starts
         FROM results r
         INNER JOIN competitions c ON c.id = r.competition_id
         LEFT JOIN profiles p ON p.id = r.profile_id
         WHERE {w}
-        GROUP BY city, region
-        ORDER BY participants DESC, starts DESC, city, region
+        GROUP BY city, region, country
+        ORDER BY participants DESC, starts DESC, city, region, country
         LIMIT {int(limit)}
         """,
         tuple(params),
     )
     city_rules = load_city_alias_rules()
     city_agg: dict[str, dict[str, Any]] = {}
-    for r in cities:
-        _, label = normalize_city_by_alias_rules(r.get("city"), r.get("region"), city_rules)
-        key = _norm_alias_token(label)
+    region_agg: dict[str, dict[str, Any]] = {}
+    country_agg: dict[str, dict[str, Any]] = {}
+    for r in city_rows:
+        geo = resolve_city_geo_by_alias_rules(r.get("city"), r.get("region"), r.get("country"), city_rules)
+        label = str(geo.get("city_label") or "—")
+        key = _norm_alias_token(label) or _norm_alias_token(str(r.get("city") or ""))
         cur = city_agg.get(key)
+        participants = int(r.get("participants") or 0)
+        starts = int(r.get("starts") or 0)
         if cur is None:
             city_agg[key] = {
                 "city": label,
-                "participants": int(r.get("participants") or 0),
-                "starts": int(r.get("starts") or 0),
+                "participants": participants,
+                "starts": starts,
             }
         else:
-            cur["participants"] = int(cur.get("participants") or 0) + int(r.get("participants") or 0)
-            cur["starts"] = int(cur.get("starts") or 0) + int(r.get("starts") or 0)
+            cur["participants"] = int(cur.get("participants") or 0) + participants
+            cur["starts"] = int(cur.get("starts") or 0) + starts
+
+        region_lbl = _clean_geo_label(geo.get("region_label"))
+        rk = _norm_alias_token(region_lbl) or region_lbl.casefold()
+        rcur = region_agg.get(rk)
+        if rcur is None:
+            region_agg[rk] = {"region": region_lbl, "participants": participants, "starts": starts}
+        else:
+            rcur["participants"] = int(rcur.get("participants") or 0) + participants
+            rcur["starts"] = int(rcur.get("starts") or 0) + starts
+
+        country_lbl = _clean_geo_label(geo.get("country_label"))
+        ck = _norm_alias_token(country_lbl) or country_lbl.casefold()
+        ccur = country_agg.get(ck)
+        if ccur is None:
+            country_agg[ck] = {"country": country_lbl, "participants": participants, "starts": starts}
+        else:
+            ccur["participants"] = int(ccur.get("participants") or 0) + participants
+            ccur["starts"] = int(ccur.get("starts") or 0) + starts
     cities = list(city_agg.values())
     cities.sort(
         key=lambda x: (
@@ -5607,41 +6027,24 @@ def query_interesting_facts_geography(
         )
     )
     cities = cities[: int(limit)]
-    regions = q_all(
-        db_path,
-        f"""
-        SELECT
-            COALESCE(NULLIF(TRIM(p.region), ''), '—') AS region,
-            COUNT(DISTINCT CASE WHEN r.profile_id IS NOT NULL THEN r.profile_id END) AS participants,
-            COUNT(*) AS starts
-        FROM results r
-        INNER JOIN competitions c ON c.id = r.competition_id
-        LEFT JOIN profiles p ON p.id = r.profile_id
-        WHERE {w}
-        GROUP BY region
-        ORDER BY participants DESC, starts DESC, region
-        LIMIT {int(limit)}
-        """,
-        tuple(params),
+    regions = sorted(
+        region_agg.values(),
+        key=lambda x: (
+            -int(x.get("participants") or 0),
+            -int(x.get("starts") or 0),
+            str(x.get("region") or ""),
+        ),
     )
-    regions = rollup_region_aggregate_rows(regions, load_region_alias_rules())[: int(limit)]
-    countries = q_all(
-        db_path,
-        f"""
-        SELECT
-            COALESCE(NULLIF(TRIM(p.country), ''), '—') AS country,
-            COUNT(DISTINCT CASE WHEN r.profile_id IS NOT NULL THEN r.profile_id END) AS participants,
-            COUNT(*) AS starts
-        FROM results r
-        INNER JOIN competitions c ON c.id = r.competition_id
-        LEFT JOIN profiles p ON p.id = r.profile_id
-        WHERE {w}
-        GROUP BY country
-        ORDER BY participants DESC, starts DESC, country
-        LIMIT {int(limit)}
-        """,
-        tuple(params),
+    regions = [r for r in regions if not _is_missing_geo_label(str(r.get("region") or ""))][: int(limit)]
+    countries = sorted(
+        country_agg.values(),
+        key=lambda x: (
+            -int(x.get("participants") or 0),
+            -int(x.get("starts") or 0),
+            str(x.get("country") or ""),
+        ),
     )
+    countries = [r for r in countries if not _is_missing_geo_label(str(r.get("country") or ""))][: int(limit)]
     return {"cities": cities, "regions": regions, "countries": countries}
 
 
@@ -5693,28 +6096,12 @@ def query_vm_geography_page(
     """
     w, params = _build_interesting_facts_where(year, sport)
 
-    regions = q_all(
+    raw_city_rows = q_all(
         db_path,
         f"""
         SELECT
+            COALESCE(NULLIF(TRIM(p.city), ''), '—') AS city,
             COALESCE(NULLIF(TRIM(p.region), ''), '—') AS region,
-            COUNT(DISTINCT CASE WHEN r.profile_id IS NOT NULL THEN r.profile_id END) AS participants,
-            COUNT(*) AS starts
-        FROM results r
-        INNER JOIN competitions c ON c.id = r.competition_id
-        LEFT JOIN profiles p ON p.id = r.profile_id
-        WHERE r.profile_id IS NOT NULL AND {w}
-        GROUP BY region
-        ORDER BY participants DESC, region
-        """,
-        tuple(params),
-    )
-    vm_region_rules = load_region_alias_rules()
-    regions = rollup_region_aggregate_rows(regions, vm_region_rules)
-    countries = q_all(
-        db_path,
-        f"""
-        SELECT
             COALESCE(NULLIF(TRIM(p.country), ''), '—') AS country,
             COUNT(DISTINCT CASE WHEN r.profile_id IS NOT NULL THEN r.profile_id END) AS participants,
             COUNT(*) AS starts
@@ -5722,50 +6109,73 @@ def query_vm_geography_page(
         INNER JOIN competitions c ON c.id = r.competition_id
         LEFT JOIN profiles p ON p.id = r.profile_id
         WHERE r.profile_id IS NOT NULL AND {w}
-        GROUP BY country
-        ORDER BY participants DESC, country
-        """,
-        tuple(params),
-    )
-    raw_city_rows = q_all(
-        db_path,
-        f"""
-        SELECT
-            COALESCE(NULLIF(TRIM(p.city), ''), '—') AS city,
-            COALESCE(NULLIF(TRIM(p.region), ''), '—') AS region,
-            COUNT(DISTINCT CASE WHEN r.profile_id IS NOT NULL THEN r.profile_id END) AS participants,
-            COUNT(*) AS starts
-        FROM results r
-        INNER JOIN competitions c ON c.id = r.competition_id
-        LEFT JOIN profiles p ON p.id = r.profile_id
-        WHERE r.profile_id IS NOT NULL AND {w}
-        GROUP BY city, region
+        GROUP BY city, region, country
         """,
         tuple(params),
     )
 
     city_rules = load_city_alias_rules()
+    vm_region_rules = load_region_alias_rules()
+    vo_region_tokens = {
+        _norm_alias_token("Вологодская область"),
+        _norm_alias_token("Вологодская Область"),
+    }
     city_agg: dict[str, dict[str, Any]] = {}
     region_by_key: dict[str, str] = {}
+    region_agg: dict[str, dict[str, Any]] = {}
+    country_agg: dict[str, dict[str, Any]] = {}
+    vo_district_agg: dict[str, dict[str, Any]] = {}
     for r in raw_city_rows:
         raw_region = str(r.get("region") or "")
-        _, label = normalize_city_by_alias_rules(r.get("city"), raw_region or None, city_rules)
-        _, reg_ui = normalize_region_by_alias_rules(raw_region or None, vm_region_rules)
+        geo = resolve_city_geo_by_alias_rules(r.get("city"), raw_region or None, r.get("country"), city_rules)
+        label = str(geo.get("city_label") or "—")
+        region_from_city = _clean_geo_label(geo.get("region_label"), _clean_geo_label(raw_region))
+        _, reg_ui = normalize_region_by_alias_rules(region_from_city, vm_region_rules)
+        country_ui = _clean_geo_label(geo.get("country_label"), _clean_geo_label(r.get("country")))
         lbl = str(label or "").strip() or "—"
         key = _norm_alias_token(lbl)
         if not key:
             key = _norm_alias_token(str(r.get("city") or "")) or lbl.casefold()
         cur = city_agg.get(key)
+        participants = int(r.get("participants") or 0)
+        starts = int(r.get("starts") or 0)
         if cur is None:
             city_agg[key] = {
                 "city": lbl,
-                "participants": int(r.get("participants") or 0),
-                "starts": int(r.get("starts") or 0),
+                "participants": participants,
+                "starts": starts,
             }
-            region_by_key[key] = reg_ui if reg_ui != "—" else (raw_region.strip() or "—")
+            region_by_key[key] = reg_ui if reg_ui != "—" else region_from_city
         else:
-            cur["participants"] = int(cur.get("participants") or 0) + int(r.get("participants") or 0)
-            cur["starts"] = int(cur.get("starts") or 0) + int(r.get("starts") or 0)
+            cur["participants"] = int(cur.get("participants") or 0) + participants
+            cur["starts"] = int(cur.get("starts") or 0) + starts
+
+        rk = _norm_alias_token(region_by_key[key]) or region_by_key[key].casefold()
+        rcur = region_agg.get(rk)
+        if rcur is None:
+            region_agg[rk] = {"region": region_by_key[key], "participants": participants, "starts": starts}
+        else:
+            rcur["participants"] = int(rcur.get("participants") or 0) + participants
+            rcur["starts"] = int(rcur.get("starts") or 0) + starts
+
+        ck = _norm_alias_token(country_ui) or country_ui.casefold()
+        ccur = country_agg.get(ck)
+        if ccur is None:
+            country_agg[ck] = {"country": country_ui, "participants": participants, "starts": starts}
+        else:
+            ccur["participants"] = int(ccur.get("participants") or 0) + participants
+            ccur["starts"] = int(ccur.get("starts") or 0) + starts
+
+        eff_region = region_by_key.get(key, region_from_city)
+        if _norm_alias_token(eff_region) in vo_region_tokens:
+            district = _clean_geo_label(geo.get("rayon_label"), "Не указан")
+            dk = _norm_alias_token(district) or district.casefold()
+            dcur = vo_district_agg.get(dk)
+            if dcur is None:
+                vo_district_agg[dk] = {"district": district, "participants": participants, "starts": starts}
+            else:
+                dcur["participants"] = int(dcur.get("participants") or 0) + participants
+                dcur["starts"] = int(dcur.get("starts") or 0) + starts
 
     cities_sorted = sorted(
         city_agg.values(),
@@ -5791,11 +6201,38 @@ def query_vm_geography_page(
                 }
             )
 
+    regions = sorted(
+        region_agg.values(),
+        key=lambda x: (
+            -int(x.get("participants") or 0),
+            -int(x.get("starts") or 0),
+            str(x.get("region") or ""),
+        ),
+    )
+    regions = [r for r in regions if not _is_missing_geo_label(str(r.get("region") or ""))]
+    countries = sorted(
+        country_agg.values(),
+        key=lambda x: (
+            -int(x.get("participants") or 0),
+            -int(x.get("starts") or 0),
+            str(x.get("country") or ""),
+        ),
+    )
+    countries = [r for r in countries if not _is_missing_geo_label(str(r.get("country") or ""))]
+    vo_districts = sorted(
+        vo_district_agg.values(),
+        key=lambda x: (
+            -int(x.get("participants") or 0),
+            -int(x.get("starts") or 0),
+            str(x.get("district") or ""),
+        ),
+    )
     return {
         "regions": regions,
         "countries": countries,
         "cities": cities_sorted,
         "map_points": map_points,
+        "vologda_districts": vo_districts,
     }
 
 

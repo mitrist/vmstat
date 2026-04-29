@@ -1100,33 +1100,37 @@ def _layout_year_bar_with_labels_and_ma3(
 
 
 def metric_plaque(label: str, value: int | str) -> None:
-    """Карточка-метрика на светлой плашке (как фон гистограмм Plotly)."""
+    """Карточка-метрика с единым стилем/высотой."""
     lab = html.escape(label)
     v = html.escape(str(value))
     st.markdown(
         f"""
         <div style="
-            background: #ffffff;
-            border: 1px solid {VM_CARD_BORDER};
-            border-radius: 6px;
-            padding: 14px 12px;
+            background: #eef7ff;
+            border: 1px solid #d8e9fb;
+            border-radius: 10px;
+            padding: 12px 12px;
             margin: 2px 0 8px 0;
-            min-height: 88px;
-            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+            min-height: 100px;
+            box-shadow: 0 3px 10px rgba(22, 76, 126, 0.12);
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
         ">
             <div style="
                 font-size: 0.78rem;
-                color: {VM_MUTED};
-                font-weight: 500;
-                letter-spacing: 0.03em;
+                color: #3f668f;
+                font-weight: 600;
+                letter-spacing: 0.01em;
                 line-height: 1.3;
             ">{lab}</div>
             <div style="
-                font-size: 1.85rem;
+                font-size: 1.05rem;
                 font-weight: 700;
                 color: {VM_TEXT};
-                line-height: 1.2;
-                margin-top: 8px;
+                line-height: 1.35;
+                margin-top: 6px;
+                word-break: break-word;
             ">{v}</div>
         </div>
         """,
@@ -1436,6 +1440,19 @@ def page_interesting_facts() -> None:
         path, year=year_val, sport=sport_val, min_starts=int(min_starts), limit=100
     )
     geo = mq.query_interesting_facts_geography(path, year=year_val, sport=sport_val, limit=100)
+    starts_avg = mq.query_interesting_facts_starts_per_participant(path, year=year_val, sport=sport_val)
+    starts_avg_year = mq.query_interesting_facts_starts_per_participant_per_year(
+        path, year=year_val, sport=sport_val
+    )
+    longest_series_cards = mq.query_interesting_facts_longest_series_by_sport(
+        path, year=year_val, sport=sport_val
+    )
+    record_leaders_cards = mq.query_interesting_facts_record_leaders_by_sport(
+        path, year=year_val, sport=sport_val
+    )
+    wins_leaders_cards = mq.query_interesting_facts_wins_leaders_by_sport(
+        path, year=year_val, sport=sport_val
+    )
 
     st.subheader("Факт дня")
     if loyal:
@@ -1450,6 +1467,144 @@ def page_interesting_facts() -> None:
 
     _section_anchor("facts-collection")
     st.subheader("Подборка фактов")
+
+    def _facts_block_title(text: str) -> None:
+        st.markdown(
+            f"""
+            <div style="
+                border-left: 4px solid {VM_ACCENT};
+                background: #e4effa;
+                border-radius: 8px;
+                padding: 8px 12px;
+                margin: 10px 0 10px 0;
+                color: {VM_TEXT};
+                font-weight: 700;
+            ">{html.escape(text)}</div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    def _avg(starts_n: int, participants_n: int) -> float:
+        return (float(starts_n) / float(participants_n)) if int(participants_n) > 0 else 0.0
+
+    with st.container(border=True):
+        _facts_block_title("Средние старты на участника")
+        a1, a2, a3 = st.columns(3)
+        with a1:
+            metric_plaque(
+                "Среднее количество стартов на одного участника",
+                f"{_avg(int(starts_avg.get('starts_total') or 0), int(starts_avg.get('participants_total') or 0)):.2f}",
+            )
+        with a2:
+            metric_plaque(
+                "Среднее стартов на одного участника (мужчины)",
+                f"{_avg(int(starts_avg.get('starts_male') or 0), int(starts_avg.get('participants_male') or 0)):.2f}",
+            )
+        with a3:
+            metric_plaque(
+                "Среднее стартов на одного участника (женщины)",
+                f"{_avg(int(starts_avg.get('starts_female') or 0), int(starts_avg.get('participants_female') or 0)):.2f}",
+            )
+
+    st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
+    with st.container(border=True):
+        _facts_block_title("Средние старты на участника в год")
+        b1, b2, b3 = st.columns(3)
+        with b1:
+            metric_plaque(
+                "Среднее количество стартов на одного участника в год",
+                f"{_avg(float(starts_avg_year.get('avg_starts_total') or 0.0), float(starts_avg_year.get('avg_participants_total') or 0.0)):.2f}",
+            )
+        with b2:
+            metric_plaque(
+                "Среднее стартов на одного участника в год (мужчины)",
+                f"{_avg(float(starts_avg_year.get('avg_starts_male') or 0.0), float(starts_avg_year.get('avg_participants_male') or 0.0)):.2f}",
+            )
+        with b3:
+            metric_plaque(
+                "Среднее стартов на одного участника в год (женщины)",
+                f"{_avg(float(starts_avg_year.get('avg_starts_female') or 0.0), float(starts_avg_year.get('avg_participants_female') or 0.0)):.2f}",
+            )
+
+    if longest_series_cards:
+        st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
+        with st.container(border=True):
+            _facts_block_title("Самая длинная серия событий по видам спорта")
+            sport_labels = {
+                "run": "бег",
+                "trail_run": "трейл",
+                "bike": "вело",
+                "ski": "лыжи",
+                "service": "сервис",
+                "other": "другое",
+            }
+            for i in range(0, len(longest_series_cards), 3):
+                row_cards = longest_series_cards[i : i + 3]
+                cols = st.columns(len(row_cards))
+                for col, card in zip(cols, row_cards):
+                    code = str(card.get("sport") or "").strip()
+                    icon = sport_calendar_icon(code)
+                    sport_name = sport_labels.get(code, code or "unknown")
+                    with col:
+                        metric_plaque(
+                            f"{icon} Самая длинная серия ({sport_name})",
+                            f"{card.get('series_title', '—')} · {int(card.get('editions') or 0)} событий",
+                        )
+
+    if record_leaders_cards:
+        st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
+        with st.container(border=True):
+            _facts_block_title("Лидеры по числу действующих рекордов (по видам спорта)")
+            sport_labels = {
+                "run": "бег",
+                "trail_run": "трейл",
+                "bike": "вело",
+                "ski": "лыжи",
+                "service": "сервис",
+                "other": "другое",
+            }
+            for i in range(0, len(record_leaders_cards), 3):
+                row_cards = record_leaders_cards[i : i + 3]
+                cols = st.columns(len(row_cards))
+                for col, card in zip(cols, row_cards):
+                    code = str(card.get("sport") or "").strip()
+                    icon = sport_calendar_icon(code)
+                    sport_name = sport_labels.get(code, code or "unknown")
+                    male = f"{card.get('male_participant', '—')} ({int(card.get('male_records') or 0)})"
+                    female = f"{card.get('female_participant', '—')} ({int(card.get('female_records') or 0)})"
+                    with col:
+                        metric_plaque(
+                            f"{icon} Действующие рекорды ({sport_name})",
+                            f"М: {male} | Ж: {female}",
+                        )
+
+    if wins_leaders_cards:
+        st.markdown("<div style='height:8px;'></div>", unsafe_allow_html=True)
+        with st.container(border=True):
+            _facts_block_title("Лидеры по количеству побед в событиях (по видам спорта)")
+            sport_labels = {
+                "run": "бег",
+                "trail_run": "трейл",
+                "bike": "вело",
+                "ski": "лыжи",
+                "service": "сервис",
+                "other": "другое",
+            }
+            for i in range(0, len(wins_leaders_cards), 3):
+                row_cards = wins_leaders_cards[i : i + 3]
+                cols = st.columns(len(row_cards))
+                for col, card in zip(cols, row_cards):
+                    code = str(card.get("sport") or "").strip()
+                    icon = sport_calendar_icon(code)
+                    sport_name = sport_labels.get(code, code or "unknown")
+                    male = f"{card.get('male_participant', '—')} ({int(card.get('male_wins') or 0)})"
+                    female = f"{card.get('female_participant', '—')} ({int(card.get('female_wins') or 0)})"
+                    with col:
+                        metric_plaque(
+                            f"{icon} Лидер по количеству побед в событиях ({sport_name})",
+                            f"М: {male} | Ж: {female}",
+                        )
+
     f1, f2 = st.columns(2)
     with f1:
         st.markdown("**Самые преданные участники**")
@@ -1558,6 +1713,46 @@ def page_vm_geography() -> None:
         st.dataframe(dfc[show_c], use_container_width=True, hide_index=True)
     else:
         st.caption("Нет данных для выбранных фильтров.")
+
+    st.subheader("Количество участников по районам Вологодской области")
+    vo_rows = geo_vm.get("vologda_districts") or []
+    if vo_rows:
+        dfd = pd.DataFrame(vo_rows).rename(
+            columns={"district": "Район", "participants": "Участников", "starts": "Стартов"}
+        )
+        pie_df = dfd[["Район", "Участников"]].copy()
+        pie_df = pie_df[pie_df["Участников"] > 0]
+        if not pie_df.empty:
+            total_vo = int(pie_df["Участников"].sum())
+            share_df = pie_df.copy()
+            share_df["Доля района"] = (
+                (100.0 * share_df["Участников"] / total_vo) if total_vo > 0 else 0.0
+            )
+            share_df = share_df.sort_values(by="Участников", ascending=False)
+
+            fig_vo = px.pie(
+                pie_df,
+                names="Район",
+                values="Участников",
+                title="Доля района в общем количестве участников Вологодской области",
+            )
+            fig_vo.update_traces(textposition="inside", textinfo="percent+label")
+            fig_vo.update_layout(margin=dict(l=0, r=0, t=60, b=0))
+
+            col_pie, col_tbl = st.columns(2)
+            with col_pie:
+                st.plotly_chart(fig_vo, use_container_width=True)
+            with col_tbl:
+                st.dataframe(
+                    share_df[["Район", "Доля района"]],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Доля района": st.column_config.NumberColumn("Доля района", format="%.1f%%"),
+                    },
+                )
+    else:
+        st.caption("Нет данных по районам Вологодской области для выбранных фильтров.")
 
     _section_anchor("geo-map")
     st.subheader("Города участников")
