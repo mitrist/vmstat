@@ -104,6 +104,7 @@ SECTION_SUBMENUS: dict[str, list[tuple[str, str]]] = {
         ("yamap-cities", "Города"),
         ("yamap-regions", "Регионы и страны"),
         ("yamap-vo-districts", "Районы Вологодской области"),
+        ("yamap-vo-by-event", "Участники по событиям"),
     ],
     "События": [
         ("event-list", "События"),
@@ -2954,7 +2955,151 @@ def page_vm_geography() -> None:
     _render_geo_vm_data_tables(geo_vm, widget_key_prefix="yamap_geo")
 
     api_key = _resolve_yandex_maps_api_key()
-    if not api_key:
+    if api_key:
+        pts: list[dict[str, Any]] = list(geo_vm.get("map_points") or [])
+        cities_any = geo_vm.get("cities") or []
+
+        default_lat = 59.218
+        default_lon = 39.884
+        default_zoom = 6
+        start_lat = default_lat
+        start_lon = default_lon
+        start_zoom_i = default_zoom
+        if pts:
+            cen, zf = _scatter_mapbox_viewport_geo(pd.DataFrame(pts))
+            start_lat = float(cen["lat"])
+            start_lon = float(cen["lon"])
+            start_zoom_i = int(np.clip(round(zf), 3, 12))
+
+        _section_anchor("yamap-cities")
+        st.subheader("Города участников")
+        st.caption(
+            "**Вологда** и **Череповец** — голубые маркеры (как заливка ВО на карте регионов); в суммировании участников "
+            "**по полигону района** по точке города они не участвуют (см. карту районов ниже). Остальные города — красные точки."
+        )
+        if cities_any and not pts:
+            st.caption(
+                "Не удалось поставить точки на карту — для канонических названий городов нет координат в справочнике."
+            )
+        elif not cities_any:
+            st.caption("Нет городов для выбранных фильтров.")
+    
+        _enrich_map_points_vo_blue_capital(pts)
+        html_map = _yandex_maps_cities_html(
+            api_key,
+            pts,
+            start_lat=start_lat,
+            start_lon=start_lon,
+            start_zoom=start_zoom_i,
+        )
+        components.html(html_map, height=720, scrolling=False)
+    
+        _section_anchor("yamap-regions")
+        st.subheader("Регионы и страны")
+    
+        geo_rf_chk = _load_russia_regions_geojson_prepared()
+        geo_world_chk, _wix = _load_world_countries_geojson_and_iso_alias_index()
+        if geo_rf_chk is None:
+            st.caption(
+                "Не загружается файл контурной карты регионов России (`config/russia_regions.geojson`)."
+            )
+        if geo_world_chk is None:
+            st.caption(
+                "Не загружается файл границ стран (`config/countries_ne110m.geojson`). "
+                "Файл GeoJSON стран — см. подсказки в этом блоке или в документации репозитория (`config/`)."
+            )
+    
+        fc_choro: dict[str, Any] = _yandex_choropleth_feature_collection(geo_vm)
+        reg_rows_vm = geo_vm.get("regions") or []
+        cc_rows_vm = geo_vm.get("countries") or []
+        part_by_norm_vm = _regions_stats_to_norm_participants(reg_rows_vm)
+        part_iso_vm = _foreign_countries_iso_participants(cc_rows_vm)
+        chor_feats = fc_choro.get("features") if isinstance(fc_choro, dict) else []
+        if not isinstance(chor_feats, list):
+            chor_feats = []
+    
+        if chor_feats:
+            ch_lat = start_lat if pts else 58.55
+            ch_lon = start_lon if pts else 43.82
+            ch_zoom = int(np.clip(round(start_zoom_i if pts else 3.95), 2, 11))
+            html_choro = _yandex_maps_choropleth_html(
+                api_key,
+                fc_choro,
+                start_lat=ch_lat,
+                start_lon=ch_lon,
+                start_zoom=ch_zoom,
+                map_dom_id="yamap-choro-rf",
+                json_script_id="yamap-choro-rf-data",
+            )
+            components.html(html_choro, height=720, scrolling=False)
+        else:
+            has_layer_file = geo_rf_chk is not None or geo_world_chk is not None
+            has_stats = bool(part_by_norm_vm or part_iso_vm)
+            if has_layer_file and has_stats:
+                if geo_rf_chk is not None and part_by_norm_vm:
+                    rf_feats_rf = geo_rf_chk.get("features") if isinstance(geo_rf_chk, dict) else None
+                    rf_match = False
+                    if feats_rf_list := (rf_feats_rf if isinstance(rf_feats_rf, list) else None):
+                        for f_try in feats_rf_list:
+                            if not isinstance(f_try, dict):
+                                continue
+                            pr_try = f_try.get("properties")
+                            nn_try = ""
+                            if isinstance(pr_try, dict):
+                                nn_try = str(pr_try.get("norm_name") or "")
+                            pv_try = part_by_norm_vm.get(nn_try, 0) if nn_try else 0
+                            if pv_try > 0:
+                                rf_match = True
+                                break
+                    if not rf_match:
+                        st.caption(
+                            "Не удалось сопоставить названия регионов из данных с полигонами карты России "
+                            "(алиасы см. в `config/region_centers.json`)."
+                        )
+                if geo_world_chk is not None and part_iso_vm:
+                    st.caption(
+                        "Не удалось сопоставить страны из данных с контурной картой — дополните словарь "
+                        "`COUNTRY_TO_ISO3` в `app.py` или проверьте написание как в Natural Earth."
+                    )
+            elif has_layer_file and not has_stats:
+                st.caption(
+                    "Нет строк по регионам и странам с числом участников больше нуля для выбранных фильтров."
+                )
+    
+        _section_anchor("yamap-vo-districts")
+        st.subheader("Районы Вологодской области")
+        vo_geo_file = VOLOGDA_DISTRICTS_GEOJSON_FILE.is_file()
+        if not vo_geo_file:
+            st.caption(
+                "Нет локального файла **config/vologda_districts.geojson** — добавьте GeoJSON районов ВО "
+                "(пример источника: [Russia_geojson_OSM](https://github.com/timurkanaz/Russia_geojson_OSM), "
+                "каталог **Regions / SZFO**, файл с названием Вологодской области и суффиксом Vologda region) или свой слой "
+                "с полем **`district`** в свойствах каждого полигона."
+            )
+        else:
+            fc_vo = _yandex_vo_district_feature_collection(geo_vm, path)
+            vo_feats = fc_vo.get("features") if isinstance(fc_vo, dict) else []
+            if isinstance(vo_feats, list) and vo_feats:
+                html_vo = _yandex_maps_choropleth_html(
+                    api_key,
+                    fc_vo,
+                    start_lat=float(default_lat),
+                    start_lon=float(default_lon),
+                    start_zoom=max(6, min(10, default_zoom)),
+                    map_dom_id="yamap-choro-vo",
+                    json_script_id="yamap-choro-vo-data",
+                )
+                components.html(html_vo, height=720, scrolling=False)
+                st.caption(
+                    "Контуры районов: данные **© OpenStreetMap** ([ODbL](https://www.openstreetmap.org/copyright))."
+                )
+            else:
+                st.caption(
+                    "Файл **vologda_districts.geojson** загружен, но в нём нет полигонов с полем `district`."
+                )
+    
+        st.caption("Картографические данные © Яндекс")
+    else:
         st.warning(
             "Чтобы показать карты Яндекса, задайте ключ API: блок **`[yandex_maps]`** с полем **`api_key`** "
             "в `.streamlit/secrets.toml` или переменную окружения **YANDEX_MAPS_API_KEY**."
@@ -2963,151 +3108,90 @@ def page_vm_geography() -> None:
             "[yandex_maps]\napi_key = \"ваш_ключ\"\n\n# или: export YANDEX_MAPS_API_KEY=...\n",
             language="toml",
         )
-        return
 
-    pts: list[dict[str, Any]] = list(geo_vm.get("map_points") or [])
-    cities_any = geo_vm.get("cities") or []
-
-    default_lat = 59.218
-    default_lon = 39.884
-    default_zoom = 6
-    start_lat = default_lat
-    start_lon = default_lon
-    start_zoom_i = default_zoom
-    if pts:
-        cen, zf = _scatter_mapbox_viewport_geo(pd.DataFrame(pts))
-        start_lat = float(cen["lat"])
-        start_lon = float(cen["lon"])
-        start_zoom_i = int(np.clip(round(zf), 3, 12))
-
-    _section_anchor("yamap-cities")
-    st.subheader("Города участников")
+    _section_anchor("yamap-vo-by-event")
+    st.subheader("Вологодская область: участники по событиям")
+    y_show = html.escape(str(year_pick))
+    sp_show = html.escape(str(sport_pick))
+    st.markdown(
+        f"<p style=\"margin:0 0 6px 0;color:{VM_TEXT};font-size:0.9rem\">"
+        f"Выбрано (плашки в начале страницы): год <strong>{y_show}</strong>, вид спорта <strong>{sp_show}</strong></p>",
+        unsafe_allow_html=True,
+    )
     st.caption(
-        "**Вологда** и **Череповец** — голубые маркеры (как заливка ВО на карте регионов); в суммировании участников "
-        "**по полигону района** по точке города они не участвуют (см. карту районов ниже). Остальные города — красные точки."
+        "Выделите строку **события** в таблице — ниже список **уникальных участников из Вологодской области** по району "
+        "(город и район из справочника, как в блоке «Районы ВО» выше)."
     )
-    if cities_any and not pts:
-        st.caption(
-            "Не удалось поставить точки на карту — для канонических названий городов нет координат в справочнике."
-        )
-    elif not cities_any:
-        st.caption("Нет городов для выбранных фильтров.")
-
-    _enrich_map_points_vo_blue_capital(pts)
-    html_map = _yandex_maps_cities_html(
-        api_key,
-        pts,
-        start_lat=start_lat,
-        start_lon=start_lon,
-        start_zoom=start_zoom_i,
-    )
-    components.html(html_map, height=720, scrolling=False)
-
-    _section_anchor("yamap-regions")
-    st.subheader("Регионы и страны")
-
-    geo_rf_chk = _load_russia_regions_geojson_prepared()
-    geo_world_chk, _wix = _load_world_countries_geojson_and_iso_alias_index()
-    if geo_rf_chk is None:
-        st.caption(
-            "Не загружается файл контурной карты регионов России (`config/russia_regions.geojson`)."
-        )
-    if geo_world_chk is None:
-        st.caption(
-            "Не загружается файл границ стран (`config/countries_ne110m.geojson`). "
-            "Файл GeoJSON стран — см. подсказки в этом блоке или в документации репозитория (`config/`)."
-        )
-
-    fc_choro: dict[str, Any] = _yandex_choropleth_feature_collection(geo_vm)
-    reg_rows_vm = geo_vm.get("regions") or []
-    cc_rows_vm = geo_vm.get("countries") or []
-    part_by_norm_vm = _regions_stats_to_norm_participants(reg_rows_vm)
-    part_iso_vm = _foreign_countries_iso_participants(cc_rows_vm)
-    chor_feats = fc_choro.get("features") if isinstance(fc_choro, dict) else []
-    if not isinstance(chor_feats, list):
-        chor_feats = []
-
-    if chor_feats:
-        ch_lat = start_lat if pts else 58.55
-        ch_lon = start_lon if pts else 43.82
-        ch_zoom = int(np.clip(round(start_zoom_i if pts else 3.95), 2, 11))
-        html_choro = _yandex_maps_choropleth_html(
-            api_key,
-            fc_choro,
-            start_lat=ch_lat,
-            start_lon=ch_lon,
-            start_zoom=ch_zoom,
-            map_dom_id="yamap-choro-rf",
-            json_script_id="yamap-choro-rf-data",
-        )
-        components.html(html_choro, height=720, scrolling=False)
+    ev_pick_rows = mq.query_competitions_for_geography_event_picker(path, year=year_val, sport=sport_val)
+    if not ev_pick_rows:
+        yr_s = str(year_val) if year_val is not None else "все годы"
+        sp_s = str(sport_val) if sport_val else "все виды"
+        st.info(f"Нет соревнований с результатами для выбранных фильтров (**{yr_s}**, **{sp_s}**).")
     else:
-        has_layer_file = geo_rf_chk is not None or geo_world_chk is not None
-        has_stats = bool(part_by_norm_vm or part_iso_vm)
-        if has_layer_file and has_stats:
-            if geo_rf_chk is not None and part_by_norm_vm:
-                rf_feats_rf = geo_rf_chk.get("features") if isinstance(geo_rf_chk, dict) else None
-                rf_match = False
-                if feats_rf_list := (rf_feats_rf if isinstance(rf_feats_rf, list) else None):
-                    for f_try in feats_rf_list:
-                        if not isinstance(f_try, dict):
-                            continue
-                        pr_try = f_try.get("properties")
-                        nn_try = ""
-                        if isinstance(pr_try, dict):
-                            nn_try = str(pr_try.get("norm_name") or "")
-                        pv_try = part_by_norm_vm.get(nn_try, 0) if nn_try else 0
-                        if pv_try > 0:
-                            rf_match = True
-                            break
-                if not rf_match:
-                    st.caption(
-                        "Не удалось сопоставить названия регионов из данных с полигонами карты России "
-                        "(алиасы см. в `config/region_centers.json`)."
-                    )
-            if geo_world_chk is not None and part_iso_vm:
-                st.caption(
-                    "Не удалось сопоставить страны из данных с контурной картой — дополните словарь "
-                    "`COUNTRY_TO_ISO3` в `app.py` или проверьте написание как в Natural Earth."
-                )
-        elif has_layer_file and not has_stats:
-            st.caption(
-                "Нет строк по регионам и странам с числом участников больше нуля для выбранных фильтров."
-            )
-
-    _section_anchor("yamap-vo-districts")
-    st.subheader("Районы Вологодской области")
-    vo_geo_file = VOLOGDA_DISTRICTS_GEOJSON_FILE.is_file()
-    if not vo_geo_file:
-        st.caption(
-            "Нет локального файла **config/vologda_districts.geojson** — добавьте GeoJSON районов ВО "
-            "(пример источника: [Russia_geojson_OSM](https://github.com/timurkanaz/Russia_geojson_OSM), "
-            "каталог **Regions / SZFO**, файл с названием Вологодской области и суффиксом Vologda region) или свой слой "
-            "с полем **`district`** в свойствах каждого полигона."
+        df_ev = pd.DataFrame(
+            [
+                {
+                    "competition_id": int(r["competition_id"]),
+                    "Дата": str(r.get("date_raw") or "—"),
+                    "Событие": str(r.get("event_label") or "—"),
+                    "Вид спорта": str(r.get("sport") or "—"),
+                    "Участников": int(r.get("participants") or 0),
+                }
+                for r in ev_pick_rows
+            ]
         )
-    else:
-        fc_vo = _yandex_vo_district_feature_collection(geo_vm, path)
-        vo_feats = fc_vo.get("features") if isinstance(fc_vo, dict) else []
-        if isinstance(vo_feats, list) and vo_feats:
-            html_vo = _yandex_maps_choropleth_html(
-                api_key,
-                fc_vo,
-                start_lat=float(default_lat),
-                start_lon=float(default_lon),
-                start_zoom=max(6, min(10, default_zoom)),
-                map_dom_id="yamap-choro-vo",
-                json_script_id="yamap-choro-vo-data",
-            )
-            components.html(html_vo, height=720, scrolling=False)
+        display_cols = ["Дата", "Событие", "Вид спорта", "Участников"]
+        st.caption("Выделите строку события — таблица по районам обновится.")
+        ev_key = f"geo_vo_event_rows_{year_val}_{sport_val or 'all'}"
+        ev_ht = min(420, 74 + len(df_ev) * 36)
+        ev_sel = st.dataframe(
+            df_ev[display_cols],
+            use_container_width=True,
+            hide_index=True,
+            on_select="rerun",
+            selection_mode="single-row",
+            key=ev_key,
+            height=ev_ht,
+        )
+        ev_idx: int | None = None
+        if ev_sel.selection.rows:
+            ev_idx = int(ev_sel.selection.rows[0])
+        if ev_idx is None:
+            ev_idx = 0
+        sel_cid = int(df_ev.iloc[ev_idx]["competition_id"])
+        sel_title = str(df_ev.iloc[ev_idx]["Событие"] or f"#{sel_cid}")
+        sel_date = str(df_ev.iloc[ev_idx]["Дата"] or "—")
+
+        st.markdown(
+            f'<p style="color:{VM_TEXT};font-weight:600;margin:12px 0 6px 0;">'
+            f"{html.escape(sel_date)} · {html.escape(sel_title)}</p>",
+            unsafe_allow_html=True,
+        )
+        br = mq.query_vm_vologda_rayons_for_competition(path, sel_cid)
+        if not br:
             st.caption(
-                "Контуры районов: данные **© OpenStreetMap** ([ODbL](https://www.openstreetmap.org/copyright))."
+                "Нет участников с профилем **Вологодской области** по этому событию (или не удалось сопоставить город с районом)."
             )
         else:
-            st.caption(
-                "Файл **vologda_districts.geojson** загружен, но в нём нет полигонов с полем `district`."
+            df_br = pd.DataFrame(br)
+            df_show = df_br.rename(
+                columns={
+                    "district": "Район",
+                    "participants_m": "Участников М",
+                    "participants_f": "Участников Ж",
+                    "participants": "Участников всего",
+                }
             )
-
-    st.caption("Картографические данные © Яндекс")
+            st.dataframe(
+                df_show[["Район", "Участников М", "Участников Ж", "Участников всего"]],
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Участников М": st.column_config.NumberColumn(format="%d"),
+                    "Участников Ж": st.column_config.NumberColumn(format="%d"),
+                    "Участников всего": st.column_config.NumberColumn(format="%d"),
+                },
+            )
 
 
 def page_vm_records() -> None:

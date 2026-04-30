@@ -7269,6 +7269,142 @@ def query_vm_geography_page(
     }
 
 
+def query_competitions_for_geography_event_picker(
+    db_path: Path | str,
+    year: int | None,
+    sport: str | None,
+) -> list[dict[str, Any]]:
+    """
+    Соревнования с хотя бы одним финишём (profile_id), под фильтры год/вид спорта.
+    По одной строке на competition_id.
+    """
+    w, params = _build_interesting_facts_where(year, sport)
+    title_expr = (
+        "COALESCE(NULLIF(TRIM(c.title_short), ''), NULLIF(TRIM(c.title), ''), '')"
+        if _table_has_column(db_path, "competitions", "title_short")
+        else "COALESCE(NULLIF(TRIM(c.title), ''), '')"
+    )
+    rows = q_all(
+        db_path,
+        f"""
+        SELECT
+            c.id AS competition_id,
+            COALESCE(NULLIF(TRIM(c.date), ''), '') AS date_raw,
+            {title_expr} AS event_label,
+            COALESCE(NULLIF(TRIM(c.sport), ''), '') AS sport,
+            COUNT(DISTINCT r.profile_id) AS participants
+        FROM competitions c
+        INNER JOIN results r ON r.competition_id = c.id AND r.profile_id IS NOT NULL
+        WHERE {w}
+        GROUP BY c.id
+        ORDER BY
+            (CASE WHEN c.date IS NULL OR TRIM(COALESCE(c.date, '')) = '' THEN 1 ELSE 0 END),
+            c.date DESC,
+            c.id DESC
+        """,
+        tuple(params),
+    )
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        out.append(
+            {
+                "competition_id": int(r["competition_id"]),
+                "date_raw": str(r.get("date_raw") or ""),
+                "event_label": str(r.get("event_label") or "").strip() or f"#{int(r['competition_id'])}",
+                "sport": str(r.get("sport") or ""),
+                "participants": int(r.get("participants") or 0),
+            }
+        )
+    return out
+
+
+def query_vm_vologda_rayons_for_competition(
+    db_path: Path | str,
+    competition_id: int,
+) -> list[dict[str, Any]]:
+    """
+    Уникальные участники события (competition_id), чей профиль относится к Вологодской области,
+    в разрезе района — та же привязка города→району, что и на странице географии.
+
+    Колонки: district, participants (_m/_f для известных полов, participants — всего уникальных).
+    """
+    rows = q_all(
+        db_path,
+        """
+        SELECT DISTINCT
+            r.profile_id AS profile_id,
+            COALESCE(NULLIF(TRIM(p.city), ''), '—') AS city,
+            COALESCE(NULLIF(TRIM(p.region), ''), '—') AS region,
+            COALESCE(NULLIF(TRIM(p.country), ''), '—') AS country,
+            LOWER(TRIM(COALESCE(p.gender, ''))) AS gender_code
+        FROM results r
+        INNER JOIN profiles p ON p.id = r.profile_id
+        WHERE r.competition_id = ? AND r.profile_id IS NOT NULL
+        """,
+        (int(competition_id),),
+    )
+    vo_ray_idx = load_vologda_rayon_resolve_index(db_path)
+    city_rules = load_city_alias_rules()
+    vm_region_rules = load_region_alias_rules()
+    vo_region_tokens = {
+        _norm_alias_token("Вологодская область"),
+        _norm_alias_token("Вологодская Область"),
+    }
+    by_key: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        pid_raw = r.get("profile_id")
+        if pid_raw is None:
+            continue
+        try:
+            pid_i = int(pid_raw)
+        except (TypeError, ValueError):
+            continue
+        raw_region = str(r.get("region") or "")
+        geo = resolve_city_geo_by_alias_rules(r.get("city"), raw_region or None, r.get("country"), city_rules)
+        region_from_city = _clean_geo_label(geo.get("region_label"), _clean_geo_label(raw_region))
+        _, reg_ui = normalize_region_by_alias_rules(region_from_city, vm_region_rules)
+        eff_region = reg_ui if reg_ui != "—" else region_from_city
+        if _norm_alias_token(eff_region) not in vo_region_tokens:
+            continue
+        district_raw = _clean_geo_label(geo.get("rayon_label"), "Не указан")
+        dk, dist_ui = resolve_vologda_rayon_with_index(district_raw, vo_ray_idx)
+        cur = by_key.get(dk)
+        if cur is None:
+            by_key[dk] = {
+                "district": dist_ui,
+                "m": set(),
+                "f": set(),
+                "other": set(),
+            }
+            cur = by_key[dk]
+        g = str(r.get("gender_code") or "").strip().lower()
+        if g == "m":
+            cur["m"].add(pid_i)
+        elif g == "f":
+            cur["f"].add(pid_i)
+        else:
+            cur["other"].add(pid_i)
+
+    out_rows: list[dict[str, Any]] = []
+    for _dk, cur in by_key.items():
+        m_ids = cur["m"]
+        f_ids = cur["f"]
+        o_ids = cur["other"]
+        tot_set = m_ids | f_ids | o_ids
+        out_rows.append(
+            {
+                "district": str(cur["district"]),
+                "participants_m": len(m_ids),
+                "participants_f": len(f_ids),
+                "participants": len(tot_set),
+            }
+        )
+    out_rows.sort(
+        key=lambda x: (-int(x["participants"]), str(x["district"])),
+    )
+    return out_rows
+
+
 def is_team_scoring_enabled(cup_id: int, year: int) -> bool:
     """Новый контур расчёта team_scoring включён только для cup_id=54 и year=2026."""
     return int(cup_id) == 54 and int(year) == 2026

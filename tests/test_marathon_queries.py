@@ -481,6 +481,17 @@ def test_vm_geography_page_queries(sample_db: Path) -> None:
     assert isinstance(out.get("vologda_districts"), list)
 
 
+def test_geography_event_picker_and_vo_rayons_for_competition(sample_db: Path) -> None:
+    rows = mq.query_competitions_for_geography_event_picker(sample_db, year=None, sport=None)
+    assert len(rows) >= 1
+    assert "competition_id" in rows[0]
+    cid = int(rows[0]["competition_id"])
+    br = mq.query_vm_vologda_rayons_for_competition(sample_db, cid)
+    assert isinstance(br, list)
+    yr = mq.query_competitions_for_geography_event_picker(sample_db, year=2024, sport="run")
+    assert any(r["competition_id"] == 1 for r in yr)
+
+
 def test_interesting_facts_starts_per_participant_counts(sample_db: Path) -> None:
     row = mq.query_interesting_facts_starts_per_participant(sample_db, year=None, sport=None)
     assert int(row["starts_total"]) == 4
