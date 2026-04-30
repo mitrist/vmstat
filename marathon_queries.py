@@ -33,6 +33,7 @@ DEFAULT_NORM_CITY_ALIAS_FILE = (
 DEFAULT_NORM_REGION_ALIAS_FILE = (
     Path(__file__).resolve().parent / "city-master" / "city-master" / "norm_region.csv"
 )
+DEFAULT_NORM_DISTANCES_CSV = Path(__file__).resolve().parent / "бд" / "norm_distances.csv"
 DEFAULT_CITY_NORMALIZATION_CHUNK = 1000
 DEFAULT_STAGES_FILE = Path(__file__).resolve().parent / ".cursor" / "etapy.yaml"
 LEGACY_STAGES_FILE = Path(__file__).resolve().parent / ".cursor" / "etapi.md"
@@ -1737,6 +1738,316 @@ def ensure_team_scoring_schema(db_path: Path | str | None = None) -> None:
         c.commit()
 
 
+def norm_distances_csv_path() -> Path:
+    """Путь к CSV нормализованного километража (переменная MARATHON_NORM_DISTANCES_CSV — опционально)."""
+    return Path(os.environ.get("MARATHON_NORM_DISTANCES_CSV", str(DEFAULT_NORM_DISTANCES_CSV)))
+
+
+_NORM_DISTANCES_TABLE_DDL = """
+CREATE TABLE IF NOT EXISTS norm_distances (
+    id INTEGER PRIMARY KEY,
+    competition_id INTEGER NOT NULL,
+    title_short TEXT,
+    title TEXT,
+    name TEXT NOT NULL,
+    distance_km REAL NOT NULL,
+    UNIQUE(competition_id, name)
+);
+"""
+
+
+def ensure_norm_distances_schema_on_conn(conn: sqlite3.Connection) -> None:
+    """Создаёт таблицу norm_distances, если её нет (без импорта CSV)."""
+
+    conn.executescript(_NORM_DISTANCES_TABLE_DDL)
+
+
+def _join_norm_distances_rd(
+    r_alias: str = "r",
+    d_alias: str = "d",
+    nd_alias: str = "nd",
+) -> str:
+    """LEFT JOIN norm_distances по результату и строке distances (competition_id + имя дистанции)."""
+    return (
+        f"LEFT JOIN norm_distances {nd_alias} ON {nd_alias}.competition_id = {r_alias}.competition_id "
+        f"AND LOWER(TRIM(COALESCE({nd_alias}.name, ''))) = LOWER(TRIM(COALESCE({d_alias}.name, '')))"
+    )
+
+
+def _join_norm_distances_d(
+    d_alias: str = "d",
+    nd_alias: str = "nd",
+) -> str:
+    """LEFT JOIN norm_distances только по строке distances (competition_id + name)."""
+    return (
+        f"LEFT JOIN norm_distances {nd_alias} ON {nd_alias}.competition_id = {d_alias}.competition_id "
+        f"AND LOWER(TRIM(COALESCE({nd_alias}.name, ''))) = LOWER(TRIM(COALESCE({d_alias}.name, '')))"
+    )
+
+
+def _scalar_norm_distance_km(d_alias: str = "d", nd_alias: str = "nd") -> str:
+    return f"ROUND(COALESCE({nd_alias}.distance_km, {d_alias}.distance_km, 0), 2)"
+
+
+def _sum_finish_norm_km_case_expr(
+    r_alias: str = "r",
+    d_alias: str = "d",
+    nd_alias: str = "nd",
+) -> str:
+    return (
+        f"CASE WHEN COALESCE({r_alias}.dnf, 0) = 0 THEN "
+        f"COALESCE({nd_alias}.distance_km, {d_alias}.distance_km, 0) ELSE 0 END"
+    )
+
+
+def _import_norm_distances_rows_from_csv(conn: sqlite3.Connection, csv_path: Path) -> int:
+    """Загрузка строк из CSV в таблицу norm_distances. Возвращает число вставленных строк."""
+    if not csv_path.is_file():
+        return 0
+    n = 0
+    with csv_path.open(newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f, delimiter=";")
+        for row in reader:
+            if not row:
+                continue
+            try:
+                rid = int(str(row.get("id") or "").strip())
+            except (TypeError, ValueError):
+                continue
+            try:
+                cid = int(str(row.get("competition_id") or "").strip())
+            except (TypeError, ValueError):
+                continue
+            if cid <= 0:
+                continue
+            name = _norm_str(row.get("name")).strip()
+            if not name:
+                continue
+            raw_km = row.get("distance_km")
+            if raw_km is None:
+                continue
+            try:
+                km = float(str(raw_km).strip().replace(",", "."))
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(km) or km < 0:
+                continue
+            title_short = _norm_str(row.get("title_short"))
+            title = _norm_str(row.get("title"))
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO norm_distances
+                    (id, competition_id, title_short, title, name, distance_km)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (rid, cid, title_short, title, name, km),
+            )
+            n += 1
+    return n
+
+
+def ensure_norm_distances_schema(db_path: Path | str | None = None) -> None:
+    """
+    Таблица norm_distances: нормализованный километраж по паре (competition_id, name дистанции).
+    При пустой таблице — первичная загрузка из norm_distances.csv (если файл есть).
+    """
+    path = Path(db_path) if db_path is not None else DEFAULT_DB
+    if not path.is_file():
+        return
+    with connect(path) as c:
+        ensure_norm_distances_schema_on_conn(c)
+        cnt = int(c.execute("SELECT COUNT(*) AS n FROM norm_distances").fetchone()["n"])
+        if cnt == 0:
+            csvp = norm_distances_csv_path()
+            if csvp.is_file():
+                _import_norm_distances_rows_from_csv(c, csvp)
+        c.commit()
+
+
+def query_norm_distances_all(db_path: Path | str) -> list[dict[str, Any]]:
+    """Все строки справочника norm_distances (для админ-редактора)."""
+    ensure_norm_distances_schema(db_path)
+    return q_all(
+        db_path,
+        """
+        SELECT id, competition_id, title_short, title, name, distance_km
+        FROM norm_distances
+        ORDER BY competition_id, name
+        """,
+    )
+
+
+def _norm_optional_row_id(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    try:
+        iv = int(value)
+    except (TypeError, ValueError):
+        return None
+    return iv if iv > 0 else None
+
+
+def save_norm_distances_admin_rows(
+    db_path: Path | str,
+    rows: list[dict[str, Any]],
+) -> list[str]:
+    """
+    Полная запись справочника из редактора: обновление/вставка по строкам, удаление отсутствующих id.
+    """
+    ensure_norm_distances_schema(db_path)
+    dbp = Path(db_path)
+    errs: list[str] = []
+
+    validated: list[dict[str, Any]] = []
+    pair_seen: set[tuple[int, str]] = set()
+    for i, raw in enumerate(rows, start=1):
+        comp = _norm_sql_int_optional(raw.get("competition_id"))
+        if comp is None or comp <= 0:
+            if _norm_str(raw.get("name")).strip() or raw.get("distance_km") not in (None, ""):
+                errs.append(f"Строка {i}: неверный competition_id.")
+            continue
+        name = _norm_str(raw.get("name")).strip()
+        if not name:
+            continue
+        km = _parse_optional_distance_km(raw.get("distance_km"))
+        if km is None:
+            errs.append(f"Строка {i} (competition_id={comp}, name={name!r}): неверный distance_km.")
+            continue
+        pair = (comp, name.casefold())
+        if pair in pair_seen:
+            errs.append(f"Строка {i}: дубликат (competition_id={comp}, name={name!r}).")
+            continue
+        pair_seen.add(pair)
+        rid = _norm_optional_row_id(raw.get("id"))
+        validated.append(
+            {
+                "id": rid,
+                "competition_id": comp,
+                "title_short": _norm_str(raw.get("title_short")),
+                "title": _norm_str(raw.get("title")),
+                "name": name,
+                "distance_km": float(km),
+            }
+        )
+
+    if errs:
+        return errs
+
+    with connect(dbp) as conn:
+        cur_ids = [
+            int(r["id"])
+            for r in conn.execute("SELECT id FROM norm_distances").fetchall()
+            if r["id"] is not None
+        ]
+        touched: set[int] = set()
+
+        for v in validated:
+            rid = v["id"]
+            ts = v["title_short"]
+            tl = v["title"]
+            comp = v["competition_id"]
+            name = v["name"]
+            km = v["distance_km"]
+
+            try:
+                if rid is not None:
+                    row = conn.execute(
+                        "SELECT id FROM norm_distances WHERE id = ? LIMIT 1", (rid,)
+                    ).fetchone()
+                    if row:
+                        conn.execute(
+                            """
+                            UPDATE norm_distances SET
+                                competition_id = ?,
+                                title_short = ?,
+                                title = ?,
+                                name = ?,
+                                distance_km = ?
+                            WHERE id = ?
+                            """,
+                            (comp, ts, tl, name, km, rid),
+                        )
+                    else:
+                        conn.execute(
+                            """
+                            INSERT INTO norm_distances
+                                (id, competition_id, title_short, title, name, distance_km)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                            """,
+                            (rid, comp, ts, tl, name, km),
+                        )
+                    touched.add(rid)
+                else:
+                    cur = conn.execute(
+                        """
+                        INSERT INTO norm_distances
+                            (competition_id, title_short, title, name, distance_km)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (comp, ts, tl, name, km),
+                    )
+                    new_id = int(cur.lastrowid)
+                    touched.add(new_id)
+            except sqlite3.IntegrityError as ex:
+                errs.append(f"competition_id={comp}, name={name!r}: {ex}")
+                continue
+
+        if errs:
+            conn.rollback()
+            return errs
+
+        for oid in cur_ids:
+            if oid not in touched:
+                conn.execute("DELETE FROM norm_distances WHERE id = ?", (oid,))
+
+        conn.commit()
+
+    return []
+
+
+def query_profile_norm_km_total(
+    db_path: Path | str,
+    pid: int,
+    years: list[int] | None = None,
+    sports: list[str] | None = None,
+) -> float:
+    """
+    Суммарный километраж финишей участника по справочнику norm_distances
+    (сопоставление: competition_id + имя дистанции как в distances.name).
+    Если строки в norm_distances нет — берётся distances.distance_km.
+    """
+    ensure_norm_distances_schema(db_path)
+    where: list[str] = ["r.profile_id = ?", "COALESCE(r.dnf, 0) = 0"]
+    params: list[Any] = [pid]
+    if years:
+        where.append("c.year IN (" + ",".join("?" * len(years)) + ")")
+        params.extend(years)
+    if sports:
+        where.append("c.sport IN (" + ",".join("?" * len(sports)) + ")")
+        params.extend(sports)
+    wsql = " AND ".join(where)
+    row = q_one(
+        db_path,
+        f"""
+        SELECT COALESCE(SUM({_sum_finish_norm_km_case_expr()}), 0) AS total_km
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        LEFT JOIN distances d ON d.id = r.distance_id
+        {_join_norm_distances_rd()}
+        WHERE {wsql}
+        """,
+        tuple(params),
+    )
+    if not row:
+        return 0.0
+    try:
+        return float(row.get("total_km") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def load_stage_index_map(path: Path | str | None = None) -> dict[int, int]:
     """Парсит карту этапов из .cursor/etapi.md (форматы `Этап 1 id 298` или `1:298`)."""
     p = Path(path) if path is not None else DEFAULT_STAGES_FILE
@@ -1850,6 +2161,7 @@ def compute_team_scoring_for_cup_year(
     Правила: лучшая строка участника в этапе, бонус 50+ = +15, cap очков не выше 1 места.
     """
     ensure_team_scoring_schema(db_path)
+    ensure_norm_distances_schema(db_path)
     stage_ix_map = stage_map if stage_map is not None else load_stage_index_map()
     if not stage_ix_map:
         return {"stage_rows": 0, "member_rows": 0, "team_rows": 0}
@@ -1868,12 +2180,14 @@ def compute_team_scoring_for_cup_year(
             r.distance_id,
             d.distance_km,
             d.name AS distance_name,
+            {_scalar_norm_distance_km()} AS norm_distance_km,
             r.place_abs,
             r.place_gender
         FROM results r
         INNER JOIN competitions c ON c.id = r.competition_id AND c.year = ?
         LEFT JOIN profiles p ON p.id = r.profile_id
         LEFT JOIN distances d ON d.id = r.distance_id
+        {_join_norm_distances_rd()}
         WHERE COALESCE(r.dnf, 0) = 0
           AND r.profile_id IS NOT NULL
           AND TRIM(COALESCE(r.team, '')) != ''
@@ -1888,7 +2202,9 @@ def compute_team_scoring_for_cup_year(
         if comp_id not in stage_ix_map:
             continue
         stage_idx = int(stage_ix_map[comp_id])
-        km = _resolve_distance_km(r.get("distance_km"), r.get("distance_name"))
+        km = _resolve_distance_km(r.get("norm_distance_km"), r.get("distance_name"))
+        if float(km) <= 0:
+            km = _resolve_distance_km(r.get("distance_km"), r.get("distance_name"))
         place_for_score = r.get("place_gender")
         if place_for_score is None:
             place_for_score = r.get("place_abs")
@@ -2324,18 +2640,21 @@ def query_distinct_years(db_path: Path | str) -> list[int]:
 
 
 def query_season_metrics(db_path: Path | str, year: int) -> dict[str, Any] | None:
+    ensure_norm_distances_schema(db_path)
     return q_one(
         db_path,
-        """
+        f"""
         SELECT
           COUNT(DISTINCT c.id) AS events,
           COUNT(CASE WHEN r.dnf = 0 THEN 1 END) AS finishes,
           COUNT(DISTINCT CASE WHEN r.dnf = 0 AND r.profile_id IS NOT NULL
                               THEN r.profile_id END) AS unique_athletes,
-          ROUND(COALESCE(SUM(CASE WHEN r.dnf = 0 THEN d.distance_km ELSE 0 END), 0), 1) AS total_km
+          ROUND(COALESCE(SUM(CASE WHEN r.dnf = 0 THEN d.distance_km ELSE 0 END), 0), 1) AS total_km,
+          ROUND(COALESCE(SUM(CASE WHEN r.dnf = 0 THEN COALESCE(nd.distance_km, d.distance_km, 0) ELSE 0 END), 0), 1) AS norm_distance_km_total
         FROM competitions c
         LEFT JOIN results r ON r.competition_id = c.id
         LEFT JOIN distances d ON d.id = r.distance_id
+        {_join_norm_distances_rd()}
         WHERE c.year = ?
         """,
         (year,),
@@ -2621,18 +2940,21 @@ def query_competitions_top(db_path: Path | str, limit: int = 20) -> list[dict[st
 
 
 def query_avg_finish_by_sport_distance(db_path: Path | str, limit: int = 30) -> list[dict[str, Any]]:
+    ensure_norm_distances_schema(db_path)
     return q_all(
         db_path,
         f"""
         SELECT c.sport AS вид,
                d.name AS дистанция,
                ROUND(d.distance_km, 1) AS км,
+               {_scalar_norm_distance_km()} AS norm_distance_km,
                COUNT(r.id) AS финишей,
                MIN(r.finish_time) AS лучшее,
                TIME(ROUND(AVG(r.finish_time_sec)), 'unixepoch') AS среднее
         FROM results r
         JOIN distances d ON d.id = r.distance_id
         JOIN competitions c ON c.id = r.competition_id
+        {_join_norm_distances_rd()}
         WHERE r.dnf = 0 AND r.finish_time_sec IS NOT NULL
           AND d.distance_km > 0
         GROUP BY c.sport, d.id
@@ -2678,13 +3000,15 @@ def query_competition_header(db_path: Path | str, comp_id: int) -> list[dict[str
 
 
 def query_competition_distances(db_path: Path | str, comp_id: int) -> list[dict[str, Any]]:
+    ensure_norm_distances_schema(db_path)
     return q_all(
         db_path,
-        """
-        SELECT d.id, d.name, d.distance_km AS км, d.is_relay AS эстафета,
+        f"""
+        SELECT d.id, d.name, d.distance_km AS км, {_scalar_norm_distance_km()} AS norm_distance_km, d.is_relay AS эстафета,
                COUNT(r.id) AS финишёров
         FROM distances d
         LEFT JOIN results r ON r.distance_id = d.id AND r.dnf = 0
+        {_join_norm_distances_d()}
         WHERE d.competition_id = ?
         GROUP BY d.id
         """,
@@ -2693,16 +3017,19 @@ def query_competition_distances(db_path: Path | str, comp_id: int) -> list[dict[
 
 
 def query_competition_top10(db_path: Path | str, comp_id: int, limit: int = 30) -> list[dict[str, Any]]:
+    ensure_norm_distances_schema(db_path)
     return q_all(
         db_path,
         f"""
         SELECT r.place_abs AS место,
                p.last_name || ' ' || p.first_name AS участник,
                p.city AS город, r.group_name AS группа,
-               r.finish_time AS время, d.name AS дистанция
+               r.finish_time AS время, d.name AS дистанция,
+               {_scalar_norm_distance_km()} AS norm_distance_km
         FROM results r
         LEFT JOIN profiles p ON p.id = r.profile_id
         JOIN distances d ON d.id = r.distance_id
+        {_join_norm_distances_rd()}
         WHERE r.competition_id = ? AND r.place_abs <= 10 AND r.dnf = 0
         ORDER BY d.id, r.place_abs
         LIMIT {int(limit)}
@@ -3548,12 +3875,14 @@ def query_profile_cup_team_member_competition_rows(
     через ``map_profile_cup_points_by_title_distance`` (только текст из **raw**), иначе
     снова схлопывается в один этап.
     """
+    ensure_norm_distances_schema(db_path)
     return q_all(
         db_path,
-        """
+        f"""
         SELECT
             c.title AS событие,
             COALESCE(NULLIF(TRIM(d.name), ''), '') AS дистанция,
+            {_scalar_norm_distance_km()} AS norm_distance_km,
             r.place_abs AS место_абс,
             r.competition_id AS competition_id,
             (
@@ -3579,6 +3908,7 @@ def query_profile_cup_team_member_competition_rows(
           ON cc.competition_id = r.competition_id AND cc.cup_id = ?
         INNER JOIN competitions c ON c.id = r.competition_id AND c.year = ?
         INNER JOIN distances d ON d.id = r.distance_id AND d.competition_id = c.id
+        {_join_norm_distances_rd()}
         WHERE r.profile_id = ?
           AND COALESCE(r.dnf, 0) = 0
         ORDER BY c.date ASC, c.id ASC, d.id ASC
@@ -4075,11 +4405,13 @@ def query_profile_row(db_path: Path | str, pid: int) -> dict[str, Any] | None:
 
 
 def query_profile_results_history(db_path: Path | str, pid: int) -> list[dict[str, Any]]:
+    ensure_norm_distances_schema(db_path)
     return q_all(
         db_path,
-        """
+        f"""
         SELECT c.year AS год, c.title AS событие, c.sport AS вид,
                d.name AS дистанция, ROUND(d.distance_km,1) AS км,
+               {_scalar_norm_distance_km()} AS norm_distance_km,
                r.finish_time AS время,
                r.place_abs AS место_абс,
                r.place_gender AS место_пол,
@@ -4087,6 +4419,7 @@ def query_profile_results_history(db_path: Path | str, pid: int) -> list[dict[st
         FROM results r
         JOIN competitions c ON c.id = r.competition_id
         JOIN distances d ON d.id = r.distance_id
+        {_join_norm_distances_rd()}
         WHERE r.profile_id = ? AND r.dnf = 0
         ORDER BY c.date DESC
         """,
@@ -4164,11 +4497,13 @@ def query_profile_participation_years(db_path: Path | str, pid: int) -> list[int
 def query_profile_results_history_for_year(
     db_path: Path | str, pid: int, year: int
 ) -> list[dict[str, Any]]:
+    ensure_norm_distances_schema(db_path)
     return q_all(
         db_path,
-        """
+        f"""
         SELECT c.year AS год, c.title AS событие, c.sport AS вид,
                d.name AS дистанция, ROUND(d.distance_km,1) AS км,
+               {_scalar_norm_distance_km()} AS norm_distance_km,
                r.finish_time AS время,
                r.place_abs AS место_абс,
                r.place_gender AS место_пол,
@@ -4176,6 +4511,7 @@ def query_profile_results_history_for_year(
         FROM results r
         JOIN competitions c ON c.id = r.competition_id
         JOIN distances d ON d.id = r.distance_id
+        {_join_norm_distances_rd()}
         WHERE r.profile_id = ? AND r.dnf = 0 AND c.year = ?
         ORDER BY c.date DESC
         """,
@@ -4210,9 +4546,10 @@ def query_profile_cup_rows_for_year(
 
 def query_profile_kpi_all_time(db_path: Path | str, pid: int) -> dict[str, Any]:
     """KPI участника за все годы по таблице results."""
+    ensure_norm_distances_schema(db_path)
     row = q_one(
         db_path,
-        """
+        f"""
         SELECT
             COUNT(*) AS starts_total,
             SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN 1 ELSE 0 END) AS finishes_total,
@@ -4221,6 +4558,7 @@ def query_profile_kpi_all_time(db_path: Path | str, pid: int) -> dict[str, Any]:
             COUNT(DISTINCT c.year) AS active_years,
             COUNT(DISTINCT CASE WHEN COALESCE(r.dnf, 0) = 0 THEN r.distance_id END) AS distances_distinct,
             ROUND(COALESCE(SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN d.distance_km ELSE 0 END), 0), 1) AS km_total,
+            ROUND(COALESCE(SUM({_sum_finish_norm_km_case_expr()}), 0), 1) AS norm_distance_km_total,
             MIN(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN r.finish_time_sec END) AS best_finish_time_sec,
             SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 AND COALESCE(r.place_abs, 999999) = 1 THEN 1 ELSE 0 END) AS first_places,
             SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 AND COALESCE(r.place_abs, 999999) = 2 THEN 1 ELSE 0 END) AS second_places,
@@ -4228,6 +4566,7 @@ def query_profile_kpi_all_time(db_path: Path | str, pid: int) -> dict[str, Any]:
         FROM results r
         INNER JOIN competitions c ON c.id = r.competition_id
         LEFT JOIN distances d ON d.id = r.distance_id
+        {_join_norm_distances_rd()}
         WHERE r.profile_id = ?
         """,
         (pid,),
@@ -4237,9 +4576,10 @@ def query_profile_kpi_all_time(db_path: Path | str, pid: int) -> dict[str, Any]:
 
 def query_profile_kpi_year(db_path: Path | str, pid: int, year: int) -> dict[str, Any]:
     """KPI участника за конкретный год по таблице results."""
+    ensure_norm_distances_schema(db_path)
     row = q_one(
         db_path,
-        """
+        f"""
         SELECT
             COUNT(*) AS starts_total,
             SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN 1 ELSE 0 END) AS finishes_total,
@@ -4247,6 +4587,7 @@ def query_profile_kpi_year(db_path: Path | str, pid: int, year: int) -> dict[str
             COUNT(DISTINCT c.id) AS events_distinct,
             COUNT(DISTINCT CASE WHEN COALESCE(r.dnf, 0) = 0 THEN r.distance_id END) AS distances_distinct,
             ROUND(COALESCE(SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN d.distance_km ELSE 0 END), 0), 1) AS km_total,
+            ROUND(COALESCE(SUM({_sum_finish_norm_km_case_expr()}), 0), 1) AS norm_distance_km_total,
             MIN(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN r.finish_time_sec END) AS best_finish_time_sec,
             SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 AND COALESCE(r.place_abs, 999999) = 1 THEN 1 ELSE 0 END) AS first_places,
             SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 AND COALESCE(r.place_abs, 999999) = 2 THEN 1 ELSE 0 END) AS second_places,
@@ -4254,6 +4595,7 @@ def query_profile_kpi_year(db_path: Path | str, pid: int, year: int) -> dict[str
         FROM results r
         INNER JOIN competitions c ON c.id = r.competition_id
         LEFT JOIN distances d ON d.id = r.distance_id
+        {_join_norm_distances_rd()}
         WHERE r.profile_id = ? AND c.year = ?
         """,
         (pid, year),
@@ -4263,15 +4605,17 @@ def query_profile_kpi_year(db_path: Path | str, pid: int, year: int) -> dict[str
 
 def query_profile_yearly_trends(db_path: Path | str, pid: int) -> list[dict[str, Any]]:
     """Динамика участника по годам: старты, финиши, dnf, км, среднее время."""
+    ensure_norm_distances_schema(db_path)
     return q_all(
         db_path,
-        """
+        f"""
         SELECT
             c.year AS year,
             COUNT(*) AS starts,
             SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN 1 ELSE 0 END) AS finishes,
             SUM(CASE WHEN COALESCE(r.dnf, 0) != 0 THEN 1 ELSE 0 END) AS dnf,
             ROUND(COALESCE(SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN d.distance_km ELSE 0 END), 0), 1) AS km_total,
+            ROUND(COALESCE(SUM({_sum_finish_norm_km_case_expr()}), 0), 1) AS norm_distance_km_total,
             ROUND(AVG(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN r.finish_time_sec END), 1) AS avg_finish_time_sec,
             ROUND(
                 100.0 * SUM(CASE WHEN COALESCE(r.dnf, 0) != 0 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0),
@@ -4280,6 +4624,7 @@ def query_profile_yearly_trends(db_path: Path | str, pid: int) -> list[dict[str,
         FROM results r
         INNER JOIN competitions c ON c.id = r.competition_id
         LEFT JOIN distances d ON d.id = r.distance_id
+        {_join_norm_distances_rd()}
         WHERE r.profile_id = ? AND c.year IS NOT NULL
         GROUP BY c.year
         ORDER BY c.year
@@ -4312,6 +4657,7 @@ def query_profile_events_table(
     if not include_dnf:
         where.append("COALESCE(r.dnf, 0) = 0")
     wsql = " AND ".join(where)
+    ensure_norm_distances_schema(db_path)
     return q_all(
         db_path,
         f"""
@@ -4322,6 +4668,7 @@ def query_profile_events_table(
             c.sport AS вид,
             COALESCE(d.name, '') AS дистанция,
             ROUND(COALESCE(d.distance_km, 0), 2) AS км,
+            {_scalar_norm_distance_km()} AS norm_distance_km,
             COALESCE(r.finish_time, '') AS время,
             r.finish_time_sec AS время_сек,
             r.place_abs AS место_абс,
@@ -4332,6 +4679,7 @@ def query_profile_events_table(
         FROM results r
         INNER JOIN competitions c ON c.id = r.competition_id
         LEFT JOIN distances d ON d.id = r.distance_id
+        {_join_norm_distances_rd()}
         WHERE {wsql}
         ORDER BY c.date DESC, c.id DESC, r.id DESC
         LIMIT {int(limit)}
@@ -4369,6 +4717,7 @@ def query_profile_event_series_rows(
     if not include_dnf:
         where.append("COALESCE(r.dnf, 0) = 0")
     wsql = " AND ".join(where)
+    ensure_norm_distances_schema(db_path)
     rows = q_all(
         db_path,
         f"""
@@ -4377,6 +4726,8 @@ def query_profile_event_series_rows(
             c.title AS Событие,
             COALESCE(c.sport, '') AS вид,
             COALESCE(d.name, '') AS Дистанция,
+            ROUND(COALESCE(d.distance_km, 0), 2) AS км,
+            {_scalar_norm_distance_km()} AS norm_distance_km,
             COALESCE(r.finish_time, '') AS время,
             r.place_abs AS место_абс,
             r.place_gender AS место_пол,
@@ -4386,6 +4737,7 @@ def query_profile_event_series_rows(
         FROM results r
         INNER JOIN competitions c ON c.id = r.competition_id
         LEFT JOIN distances d ON d.id = r.distance_id
+        {_join_norm_distances_rd()}
         WHERE {wsql}
         ORDER BY c.date DESC, c.id DESC, r.id DESC
         LIMIT {int(limit)}
@@ -4406,6 +4758,7 @@ def query_profile_personal_bests(
     top_n: int = 1000,
 ) -> list[dict[str, Any]]:
     """PB по нормализованным дистанциям (через справочник алиасов)."""
+    ensure_norm_distances_schema(db_path)
     where = "r.profile_id = ? AND COALESCE(r.dnf, 0) = 0 AND r.finish_time_sec IS NOT NULL"
     params: list[Any] = [pid]
     if year is not None:
@@ -4420,12 +4773,14 @@ def query_profile_personal_bests(
             c.title AS event_title,
             c.sport AS sport,
             COALESCE(d.name, '') AS distance_name,
+            {_scalar_norm_distance_km()} AS norm_distance_km,
             r.finish_time AS finish_time,
             r.finish_time_sec AS finish_time_sec,
             r.place_abs AS place_abs
         FROM results r
         INNER JOIN competitions c ON c.id = r.competition_id
         LEFT JOIN distances d ON d.id = r.distance_id
+        {_join_norm_distances_rd()}
         WHERE {where}
         ORDER BY r.finish_time_sec ASC, c.date ASC, c.id ASC
         LIMIT {int(top_n)}
@@ -5117,6 +5472,7 @@ def query_team_kpi_extended(
     year: int | None = None,
 ) -> dict[str, Any] | None:
     """Расширенные KPI команды: участники, старты, финиши, DNF, километраж, годы."""
+    ensure_norm_distances_schema(db_path)
     t = team_name.strip()
     if not t:
         return None
@@ -5134,10 +5490,12 @@ def query_team_kpi_extended(
             SUM(CASE WHEN COALESCE(r.dnf, 0) != 0 THEN 1 ELSE 0 END) AS dnf_total,
             COUNT(DISTINCT CASE WHEN r.profile_id IS NOT NULL THEN r.profile_id END) AS participants_distinct,
             ROUND(COALESCE(SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN d.distance_km ELSE 0 END), 0), 1) AS km_total,
+            ROUND(COALESCE(SUM({_sum_finish_norm_km_case_expr()}), 0), 1) AS norm_distance_km_total,
             COUNT(DISTINCT c.year) AS active_years_count
         FROM results r
         INNER JOIN competitions c ON c.id = r.competition_id
         LEFT JOIN distances d ON d.id = r.distance_id
+        {_join_norm_distances_rd()}
         WHERE TRIM(COALESCE(r.team, '')) = ? {year_sql}
         """,
         tuple(params),
@@ -5167,6 +5525,7 @@ def query_team_kpi_extended(
         "finishes_total": int(row.get("finishes_total") or 0),
         "dnf_total": int(row.get("dnf_total") or 0),
         "km_total": float(row.get("km_total") or 0.0),
+        "norm_distance_km_total": float(row.get("norm_distance_km_total") or 0.0),
         "active_years_count": int(row.get("active_years_count") or 0),
         "active_years_list": years,
     }
@@ -5178,6 +5537,7 @@ def query_team_roster_stats(
     year: int | None = None,
 ) -> list[dict[str, Any]]:
     """Состав команды с базовой статистикой по участникам."""
+    ensure_norm_distances_schema(db_path)
     t = team_name.strip()
     params: list[Any] = [t]
     year_sql = ""
@@ -5197,10 +5557,12 @@ def query_team_roster_stats(
             SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN 1 ELSE 0 END) AS finishes_total,
             SUM(CASE WHEN COALESCE(r.dnf, 0) != 0 THEN 1 ELSE 0 END) AS dnf_total,
             ROUND(COALESCE(SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN d.distance_km ELSE 0 END), 0), 1) AS km_total,
+            ROUND(COALESCE(SUM({_sum_finish_norm_km_case_expr()}), 0), 1) AS norm_distance_km_total,
             MIN(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN r.place_abs END) AS best_place_abs
         FROM results r
         LEFT JOIN competitions c ON c.id = r.competition_id
         LEFT JOIN distances d ON d.id = r.distance_id
+        {_join_norm_distances_rd()}
         LEFT JOIN profiles p ON p.id = r.profile_id
         WHERE TRIM(COALESCE(r.team, '')) = ? {year_sql}
         GROUP BY p.id, athlete, gender, age, city
@@ -5270,12 +5632,19 @@ def query_team_sport_distance_slices(
     year: int | None = None,
 ) -> dict[str, list[dict[str, Any]]]:
     """Срезы команды по виду спорта и дистанциям."""
+    ensure_norm_distances_schema(db_path)
     t = team_name.strip()
     params: list[Any] = [t]
     year_sql = ""
     if year is not None:
         year_sql = " AND c.year = ?"
         params.append(int(year))
+    norm_k_sum = (
+        "ROUND(COALESCE(SUM(" + _sum_finish_norm_km_case_expr() + "), 0), 1)"
+    )
+    km_sum = (
+        "ROUND(COALESCE(SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN d.distance_km ELSE 0 END), 0), 1)"
+    )
     by_sport = q_all(
         db_path,
         f"""
@@ -5283,10 +5652,12 @@ def query_team_sport_distance_slices(
             COALESCE(c.sport, '') AS sport,
             COUNT(*) AS starts,
             SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN 1 ELSE 0 END) AS finishes,
-            ROUND(COALESCE(SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN d.distance_km ELSE 0 END), 0), 1) AS km_total
+            {km_sum} AS km_total,
+            {norm_k_sum} AS norm_distance_km_total
         FROM results r
         INNER JOIN competitions c ON c.id = r.competition_id
         LEFT JOIN distances d ON d.id = r.distance_id
+        {_join_norm_distances_rd()}
         WHERE TRIM(COALESCE(r.team, '')) = ? {year_sql}
         GROUP BY COALESCE(c.sport, '')
         ORDER BY starts DESC, sport
@@ -5299,14 +5670,16 @@ def query_team_sport_distance_slices(
         SELECT
             COALESCE(d.name, '—') AS distance,
             ROUND(COALESCE(d.distance_km, 0), 2) AS distance_km,
+            {_scalar_norm_distance_km()} AS norm_distance_km,
             COUNT(*) AS starts,
             SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN 1 ELSE 0 END) AS finishes
         FROM results r
         INNER JOIN competitions c ON c.id = r.competition_id
         LEFT JOIN distances d ON d.id = r.distance_id
+        {_join_norm_distances_rd()}
         WHERE TRIM(COALESCE(r.team, '')) = ? {year_sql}
-        GROUP BY distance, distance_km
-        ORDER BY starts DESC, distance_km DESC, distance
+        GROUP BY COALESCE(d.name, '—'), ROUND(COALESCE(d.distance_km, 0), 2), {_scalar_norm_distance_km()}
+        ORDER BY starts DESC, distance_km DESC, norm_distance_km DESC, distance
         """,
         tuple(params),
     )
@@ -5391,18 +5764,20 @@ def query_team_geography(
 
 def query_team_yearly_trends(db_path: Path | str, team_name: str) -> list[dict[str, Any]]:
     """Годовой тренд команды: старты, финиши, DNF, километраж, DNF%."""
+    ensure_norm_distances_schema(db_path)
     t = team_name.strip()
     if not t:
         return []
     return q_all(
         db_path,
-        """
+        f"""
         SELECT
             c.year AS year,
             COUNT(*) AS starts,
             SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN 1 ELSE 0 END) AS finishes,
             SUM(CASE WHEN COALESCE(r.dnf, 0) != 0 THEN 1 ELSE 0 END) AS dnf,
             ROUND(COALESCE(SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN d.distance_km ELSE 0 END), 0), 1) AS km_total,
+            ROUND(COALESCE(SUM({_sum_finish_norm_km_case_expr()}), 0), 1) AS norm_distance_km_total,
             ROUND(
                 100.0 * SUM(CASE WHEN COALESCE(r.dnf, 0) != 0 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0),
                 1
@@ -5410,6 +5785,7 @@ def query_team_yearly_trends(db_path: Path | str, team_name: str) -> list[dict[s
         FROM results r
         INNER JOIN competitions c ON c.id = r.competition_id
         LEFT JOIN distances d ON d.id = r.distance_id
+        {_join_norm_distances_rd()}
         WHERE TRIM(COALESCE(r.team, '')) = ? AND c.year IS NOT NULL
         GROUP BY c.year
         ORDER BY c.year
@@ -5424,6 +5800,7 @@ def query_team_data_quality(
     year: int | None = None,
 ) -> list[dict[str, Any]]:
     """Диагностика качества данных команды (admin-only в UI)."""
+    ensure_norm_distances_schema(db_path)
     t = team_name.strip()
     if not t:
         return []
@@ -5444,10 +5821,12 @@ def query_team_data_quality(
             SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 AND r.place_gender IS NULL THEN 1 ELSE 0 END) AS missing_place_gender,
             SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 AND r.place_group IS NULL THEN 1 ELSE 0 END) AS missing_place_group,
             SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 AND (d.distance_km IS NULL OR d.distance_km <= 0) THEN 1 ELSE 0 END) AS bad_distance_km,
+            SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 AND (COALESCE(nd.distance_km, d.distance_km) IS NULL OR COALESCE(nd.distance_km, d.distance_km) <= 0) THEN 1 ELSE 0 END) AS bad_norm_distance_km,
             SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 AND (r.finish_time_sec IS NULL OR r.finish_time_sec <= 0) THEN 1 ELSE 0 END) AS bad_finish_time_sec
         FROM results r
         INNER JOIN competitions c ON c.id = r.competition_id
         LEFT JOIN distances d ON d.id = r.distance_id
+        {_join_norm_distances_rd()}
         WHERE TRIM(COALESCE(r.team, '')) = ? {year_sql}
         """,
         tuple(params),
@@ -5461,6 +5840,7 @@ def query_team_data_quality(
         {"метрика": "Финиши без place_gender", "значение": int(row.get("missing_place_gender") or 0)},
         {"метрика": "Финиши без place_group", "значение": int(row.get("missing_place_group") or 0)},
         {"метрика": "Финиши с некорректной distance_km", "значение": int(row.get("bad_distance_km") or 0)},
+        {"метрика": "Финиши без нормализованного км (norm)", "значение": int(row.get("bad_norm_distance_km") or 0)},
         {"метрика": "Финиши без finish_time_sec", "значение": int(row.get("bad_finish_time_sec") or 0)},
     ]
     return checks
@@ -5775,6 +6155,7 @@ def query_interesting_facts_loyal_participants(
     limit: int = 10,
 ) -> list[dict[str, Any]]:
     """Самые преданные участники: максимум активных лет и стартов."""
+    ensure_norm_distances_schema(db_path)
     w, params = _build_interesting_facts_where(year, sport)
     params = list(params) + [max(1, int(min_starts))]
     return q_all(
@@ -5786,10 +6167,12 @@ def query_interesting_facts_loyal_participants(
             COUNT(DISTINCT c.year) AS active_years,
             COUNT(*) AS starts,
             SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN 1 ELSE 0 END) AS finishes,
-            ROUND(COALESCE(SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN d.distance_km ELSE 0 END), 0), 1) AS km_total
+            ROUND(COALESCE(SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN d.distance_km ELSE 0 END), 0), 1) AS km_total,
+            ROUND(COALESCE(SUM({_sum_finish_norm_km_case_expr()}), 0), 1) AS norm_distance_km_total
         FROM results r
         INNER JOIN competitions c ON c.id = r.competition_id
         LEFT JOIN distances d ON d.id = r.distance_id
+        {_join_norm_distances_rd()}
         LEFT JOIN profiles p ON p.id = r.profile_id
         WHERE r.profile_id IS NOT NULL AND {w}
         GROUP BY r.profile_id, participant
@@ -5884,6 +6267,7 @@ def query_interesting_facts_km_leaders(
     limit: int = 10,
 ) -> list[dict[str, Any]]:
     """Лидеры по суммарному километражу (по финишам)."""
+    ensure_norm_distances_schema(db_path)
     w, params = _build_interesting_facts_where(year, sport)
     params = list(params) + [max(1, int(min_starts))]
     return q_all(
@@ -5894,16 +6278,62 @@ def query_interesting_facts_km_leaders(
             TRIM(COALESCE(p.last_name, '') || ' ' || COALESCE(p.first_name, '')) AS participant,
             COUNT(*) AS starts,
             SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN 1 ELSE 0 END) AS finishes,
-            ROUND(COALESCE(SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN d.distance_km ELSE 0 END), 0), 1) AS km_total
+            ROUND(COALESCE(SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN d.distance_km ELSE 0 END), 0), 1) AS km_total,
+            ROUND(COALESCE(SUM({_sum_finish_norm_km_case_expr()}), 0), 1) AS norm_distance_km_total
         FROM results r
         INNER JOIN competitions c ON c.id = r.competition_id
         LEFT JOIN distances d ON d.id = r.distance_id
+        {_join_norm_distances_rd()}
         LEFT JOIN profiles p ON p.id = r.profile_id
         WHERE r.profile_id IS NOT NULL AND {w}
         GROUP BY r.profile_id, participant
         HAVING COUNT(*) >= ?
-        ORDER BY km_total DESC, finishes DESC, participant
+        ORDER BY km_total DESC, norm_distance_km_total DESC, finishes DESC, participant
         LIMIT {int(limit)}
+        """,
+        tuple(params),
+    )
+
+
+def query_interesting_facts_km_leaders_by_gender(
+    db_path: Path | str,
+    year: int | None = None,
+    sport: str | None = None,
+    gender_code: str = "m",
+    min_starts: int = 1,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Топ участников по суммарному км (норма + fallback) среди указанного пола (m/f)."""
+    gc = str(gender_code or "").strip().casefold()
+    if gc not in ("m", "f"):
+        return []
+    ensure_norm_distances_schema(db_path)
+    w, wparams = _build_interesting_facts_where(year, sport)
+    ms = max(1, int(min_starts))
+    params: list[Any] = [gc, *list(wparams), ms]
+    lim = max(1, int(limit))
+    return q_all(
+        db_path,
+        f"""
+        SELECT
+            r.profile_id AS profile_id,
+            TRIM(COALESCE(p.last_name, '') || ' ' || COALESCE(p.first_name, '')) AS participant,
+            COUNT(*) AS starts,
+            SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN 1 ELSE 0 END) AS finishes,
+            ROUND(COALESCE(SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN d.distance_km ELSE 0 END), 0), 1) AS km_total,
+            ROUND(COALESCE(SUM({_sum_finish_norm_km_case_expr()}), 0), 1) AS norm_distance_km_total
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        INNER JOIN profiles p ON p.id = r.profile_id
+        LEFT JOIN distances d ON d.id = r.distance_id
+        {_join_norm_distances_rd()}
+        WHERE r.profile_id IS NOT NULL
+          AND LOWER(TRIM(COALESCE(p.gender, ''))) = ?
+          AND {w}
+        GROUP BY r.profile_id, participant
+        HAVING COUNT(*) >= ?
+        ORDER BY norm_distance_km_total DESC, km_total DESC, finishes DESC, participant
+        LIMIT {lim}
         """,
         tuple(params),
     )
@@ -5916,6 +6346,7 @@ def query_interesting_facts_distance_frequency(
     limit: int = 10,
 ) -> list[dict[str, Any]]:
     """Топ дистанций по числу стартов и участников."""
+    ensure_norm_distances_schema(db_path)
     w, params = _build_interesting_facts_where(year, sport)
     return q_all(
         db_path,
@@ -5923,14 +6354,18 @@ def query_interesting_facts_distance_frequency(
         SELECT
             COALESCE(NULLIF(TRIM(d.name), ''), '—') AS distance,
             ROUND(COALESCE(d.distance_km, 0), 2) AS distance_km,
+            {_scalar_norm_distance_km()} AS norm_distance_km,
             COUNT(*) AS starts,
             COUNT(DISTINCT CASE WHEN r.profile_id IS NOT NULL THEN r.profile_id END) AS participants
         FROM results r
         INNER JOIN competitions c ON c.id = r.competition_id
         LEFT JOIN distances d ON d.id = r.distance_id
+        {_join_norm_distances_rd()}
         WHERE {w}
-        GROUP BY distance, distance_km
-        ORDER BY starts DESC, participants DESC, distance_km DESC, distance
+        GROUP BY distance,
+                 ROUND(COALESCE(d.distance_km, 0), 2),
+                 {_scalar_norm_distance_km()}
+        ORDER BY starts DESC, participants DESC, distance_km DESC, norm_distance_km DESC, distance
         LIMIT {int(limit)}
         """,
         tuple(params),
@@ -5952,17 +6387,20 @@ def query_interesting_facts_km_by_sport(
         where_parts.append("c.sport = ?")
         params.append(str(sport).strip())
     where_sql = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+    ensure_norm_distances_schema(db_path)
     return q_all(
         db_path,
         f"""
         SELECT
             COALESCE(NULLIF(TRIM(c.sport), ''), 'unknown') AS sport,
             ROUND(COALESCE(SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN d.distance_km ELSE 0 END), 0), 1) AS km_total,
+            ROUND(COALESCE(SUM({_sum_finish_norm_km_case_expr()}), 0), 1) AS norm_distance_km_total,
             COUNT(*) AS starts,
             SUM(CASE WHEN COALESCE(r.dnf, 0) = 0 THEN 1 ELSE 0 END) AS finishes
         FROM competitions c
         LEFT JOIN results r ON r.competition_id = c.id
         LEFT JOIN distances d ON d.id = r.distance_id
+        {_join_norm_distances_rd()}
         {where_sql}
         GROUP BY COALESCE(NULLIF(TRIM(c.sport), ''), 'unknown')
         ORDER BY km_total DESC, starts DESC, COALESCE(NULLIF(TRIM(c.sport), ''), 'unknown')

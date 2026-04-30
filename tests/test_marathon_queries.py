@@ -165,6 +165,7 @@ def test_season_metrics(sample_db: Path) -> None:
     assert m["finishes"] == 2
     assert m["unique_athletes"] == 2
     assert m["total_km"] == 84.0
+    assert float(m["norm_distance_km_total"]) == 84.0
 
 
 def test_profile_row_and_history(sample_db: Path) -> None:
@@ -190,6 +191,25 @@ def test_profile_row_and_history(sample_db: Path) -> None:
     assert "Контрольный" in (petr_row.get("событие") or "")
     c23 = mq.query_profile_cup_rows_for_year(sample_db, 100, 2023)
     assert len(c23) == 1 and c23[0]["очков"] == 50.0
+
+
+def test_profile_norm_km_total(sample_db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    bogus_csv = sample_db.with_name(sample_db.stem + "_no_norm_distances.csv")
+    monkeypatch.setenv("MARATHON_NORM_DISTANCES_CSV", str(bogus_csv))
+    mq.ensure_norm_distances_schema(sample_db)
+    with sqlite3.connect(sample_db) as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO norm_distances
+              (id, competition_id, title_short, title, name, distance_km)
+            VALUES (90001, 1, '', '', '42 km', 99.9)
+            """
+        )
+        conn.commit()
+    total = mq.query_profile_norm_km_total(sample_db, 100, years=None, sports=None)
+    assert abs(total - (99.9 + 21.0)) < 1e-6
+    y2024 = mq.query_profile_norm_km_total(sample_db, 100, years=[2024], sports=None)
+    assert abs(y2024 - 99.9) < 1e-6
 
 
 def test_profile_search_by_id(sample_db: Path) -> None:
@@ -856,6 +876,19 @@ def test_interesting_facts_queries(sample_db: Path) -> None:
     assert len(km) > 0
     assert km[0]["participant"] == "Testov Ivan"
     assert float(km[0]["km_total"]) >= 52.0
+    assert float(km[0]["norm_distance_km_total"]) >= 52.0
+
+    km_m = mq.query_interesting_facts_km_leaders_by_gender(
+        sample_db, year=2024, sport=None, gender_code="m", min_starts=1, limit=10
+    )
+    km_f = mq.query_interesting_facts_km_leaders_by_gender(
+        sample_db, year=2024, sport=None, gender_code="f", min_starts=1, limit=10
+    )
+    assert km_m and km_m[0]["participant"] == "Testov Ivan"
+    assert isinstance(km_f, list)
+    assert mq.query_interesting_facts_km_leaders_by_gender(
+        sample_db, year=2024, sport=None, gender_code="x", min_starts=1, limit=10
+    ) == []
 
     freq = mq.query_interesting_facts_distance_frequency(sample_db, year=2024, sport="run", limit=10)
     assert len(freq) >= 1
@@ -863,7 +896,9 @@ def test_interesting_facts_queries(sample_db: Path) -> None:
 
     km_by_sport = mq.query_interesting_facts_km_by_sport(sample_db, year=2024)
     sport_map = {r["sport"]: float(r["km_total"] or 0) for r in km_by_sport}
+    norm_map = {r["sport"]: float(r["norm_distance_km_total"] or 0) for r in km_by_sport}
     assert sport_map["run"] >= 84.0
+    assert norm_map["run"] >= 84.0
     assert sport_map["bike"] >= 40.0
     assert sport_map["ski"] >= 10.0
 

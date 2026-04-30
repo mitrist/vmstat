@@ -203,16 +203,24 @@ def compute_run_cup_2026(
         conn.commit()
         return 0, 0
 
+    import marathon_queries as mq
+
+    mq.ensure_norm_distances_schema_on_conn(conn)
+
     cur = conn.execute(
         """
         SELECT r.id AS result_id, r.profile_id, r.competition_id, r.distance_id,
                r.place_abs, r.place_gender,
-               COALESCE(d.distance_km, 0) AS distance_km, d.name AS dist_name
+               COALESCE(d.distance_km, 0) AS distance_km, d.name AS dist_name,
+               ROUND(COALESCE(nd.distance_km, d.distance_km, 0), 2) AS norm_distance_km
         FROM results r
         INNER JOIN cup_competitions cc
           ON cc.competition_id = r.competition_id AND cc.cup_id = ?
         INNER JOIN competitions c ON c.id = r.competition_id AND c.year = ?
         INNER JOIN distances d ON d.id = r.distance_id AND d.competition_id = c.id
+        LEFT JOIN norm_distances nd
+          ON nd.competition_id = r.competition_id
+         AND LOWER(TRIM(COALESCE(nd.name, ''))) = LOWER(TRIM(COALESCE(d.name, '')))
         WHERE COALESCE(r.dnf, 0) = 0
           AND COALESCE(r.is_relay, 0) = 0
           AND r.profile_id IS NOT NULL
@@ -221,12 +229,14 @@ def compute_run_cup_2026(
     )
     n_fin = 0
     for row in cur.fetchall():
-        rid, pid, comp_id, dist_id, pabs, pgen, dkm, dname = row
+        rid, pid, comp_id, dist_id, pabs, pgen, dkm, dname, norm_km = row
         comp_id = int(comp_id)
         stage = stage_by_comp.get(comp_id)
         if stage is None:
             continue
-        km = _km_from_distance_row(dkm, dname)
+        km = _km_from_distance_row(norm_km, dname)
+        if km is None:
+            km = _km_from_distance_row(dkm, dname)
         pl = _place_for_score(pgen, pabs)
         if km is None:
             pts, lab = 0, "no_distance_km"

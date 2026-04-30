@@ -558,6 +558,10 @@ def _facts_prepare_df(rows: list[dict[str, Any]]) -> pd.DataFrame:
         return df
     if "km_total" in df.columns:
         df["km_total"] = pd.to_numeric(df["km_total"], errors="coerce").fillna(0.0).round(1)
+    if "norm_distance_km_total" in df.columns:
+        df["norm_distance_km_total"] = (
+            pd.to_numeric(df["norm_distance_km_total"], errors="coerce").fillna(0.0).round(1)
+        )
     if "profile_id" in df.columns:
         pid_num = pd.to_numeric(df["profile_id"], errors="coerce")
         df["profile_id"] = pid_num.map(
@@ -569,6 +573,7 @@ def _facts_prepare_df(rows: list[dict[str, Any]]) -> pd.DataFrame:
         "starts": "Стартовал всего",
         "finishes": "Финишировал всего",
         "km_total": "Пройдено километров",
+        "norm_distance_km_total": "Пройдено км",
         "finish_rate_pct": "Процент финишей",
         "sports_count": "Видов спорта",
         "sports_list": "Виды спорта",
@@ -585,7 +590,16 @@ def _facts_prepare_df(rows: list[dict[str, Any]]) -> pd.DataFrame:
         "sport": "Вид спорта",
         "profile_id": "profile_id",
     }
-    return df.rename(columns=rename_map)
+    out = df.rename(columns=rename_map)
+    if "norm_distance_km_total" in df.columns and "km_total" in df.columns:
+        col_fix: dict[str, str] = {}
+        if "Пройдено километров" in out.columns:
+            col_fix["Пройдено километров"] = "Км из БД (сумма)"
+        if "Пройдено км" in out.columns:
+            col_fix["Пройдено км"] = "Пройдено км (норма)"
+        if col_fix:
+            out = out.rename(columns=col_fix)
+    return out
 
 
 def _facts_table(rows: list[dict[str, Any]], key: str) -> None:
@@ -1561,8 +1575,11 @@ def page_interesting_facts() -> None:
     finishers = mq.query_interesting_facts_finish_rate(
         path, year=year_val, sport=sport_val, min_starts=int(min_starts), limit=100
     )
-    km_leaders = mq.query_interesting_facts_km_leaders(
-        path, year=year_val, sport=sport_val, min_starts=int(min_starts), limit=100
+    km_leaders_m = mq.query_interesting_facts_km_leaders_by_gender(
+        path, year=year_val, sport=sport_val, gender_code="m", min_starts=int(min_starts), limit=10
+    )
+    km_leaders_f = mq.query_interesting_facts_km_leaders_by_gender(
+        path, year=year_val, sport=sport_val, gender_code="f", min_starts=int(min_starts), limit=10
     )
     universals = mq.query_interesting_facts_universal_participants(
         path, year=year_val, sport=sport_val, min_starts=int(min_starts), limit=100
@@ -1742,10 +1759,15 @@ def page_interesting_facts() -> None:
 
     f3, f4 = st.columns(2)
     with f3:
-        st.markdown("**Лидеры по километражу**")
-        st.caption("Суммарный километраж по финишам.")
-        _facts_table(km_leaders, key="facts_table_km")
+        st.markdown("**Топ-10 по пройденному расстоянию (мужчины)**")
+        st.caption("Сумма км по нормализованному справочнику событие×дистанция (финиши); столбец «Км из БД» — из таблицы distances.")
+        _facts_table(km_leaders_m, key="facts_table_km_male")
     with f4:
+        st.markdown("**Топ-10 по пройденному расстоянию (женщины)**")
+        st.caption("Те же правила, что и для мужчин.")
+        _facts_table(km_leaders_f, key="facts_table_km_female")
+
+    with st.container():
         st.markdown("**Универсалы по видам спорта**")
         st.caption("Чем больше покрытие видов спорта, тем выше место.")
         _facts_table(universals, key="facts_table_universals")
@@ -3976,6 +3998,9 @@ def show_participant_dashboard(path: Path, pid: int) -> None:
         if (not kpi_df.empty and {"статус", "км"}.issubset(kpi_df.columns))
         else 0.0
     )
+    norm_km_total = mq.query_profile_norm_km_total(
+        path, pid, years=years_for_query, sports=sports_for_query
+    )
     stat_first_profile = (
         int((pd.to_numeric(kpi_df.get("место_абс"), errors="coerce") == 1).sum()) if not kpi_df.empty else 0
     )
@@ -4009,8 +4034,15 @@ def show_participant_dashboard(path: Path, pid: int) -> None:
         metric_plaque("Вторых мест", stat_second_profile)
     with k10:
         metric_plaque("Третьих мест", stat_third_profile)
+    km_row = st.columns(5, gap="small")
+    with km_row[0]:
+        metric_plaque("Общий километраж", int(round(norm_km_total)))
     st.markdown(
-        f'<p style="color:{VM_MUTED};font-size:0.85rem;margin:6px 0 10px 0;">'
+        f'<p style="color:{VM_MUTED};font-size:0.85rem;margin:4px 0 8px 0;">'
+        f"«Общий километраж» — сумма по справочнику <b>norm_distances</b> (файл <code>бд/norm_distances.csv</code> "
+        f"при первом запуске); сопоставление по <b>competition_id</b> и названию дистанции. "
+        f"Карточка «Км» — километраж из таблицы <b>distances</b> в БД.</p>"
+        f'<p style="color:{VM_MUTED};font-size:0.85rem;margin:0 0 10px 0;">'
         f"Годы активности (raw): <b>{html.escape(ay_text)}</b></p>",
         unsafe_allow_html=True,
     )
@@ -4889,6 +4921,84 @@ def page_admin() -> None:
         else:
             st.success("Справочник сохранён.")
             st.rerun()
+
+    _section_anchor("admin-norm-distances")
+    st.subheader("Нормализованный километраж (событие × дистанция)")
+    st.caption(
+        "Используется в KPI участника («Общий километраж»): для каждого финиша подбирается строка по "
+        "**competition_id** и имени дистанции (**distances.name**). Если совпадения нет — учитывается "
+        "**distances.distance_km** из базы."
+    )
+    nd_csv = mq.norm_distances_csv_path()
+    st.markdown("Исходный CSV (начальное наполнение при пустой таблице):", unsafe_allow_html=True)
+    st.code(str(nd_csv), language=None)
+    if require_db(path):
+        mq.ensure_norm_distances_schema(path)
+        nd_rows = mq.query_norm_distances_all(path)
+        df_nd = pd.DataFrame(nd_rows)
+        if df_nd.empty:
+            st.warning(
+                "Таблица **norm_distances** пуста. Положите **бд/norm_distances.csv** рядом с приложением "
+                "(или задайте **MARATHON_NORM_DISTANCES_CSV**) и откройте страницу снова для импорта."
+            )
+        else:
+            for col in ("id", "competition_id"):
+                if col in df_nd.columns:
+                    df_nd[col] = pd.to_numeric(df_nd[col], errors="coerce").astype("Int64")
+            if "distance_km" in df_nd.columns:
+                df_nd["distance_km"] = pd.to_numeric(df_nd["distance_km"], errors="coerce")
+            df_nd = df_nd[["id", "competition_id", "title_short", "title", "name", "distance_km"]]
+            nd_cc: dict[str, Any] = {
+                "id": st.column_config.NumberColumn(
+                    "id",
+                    help="Пусто — новая строка (авто id).",
+                    min_value=1,
+                    step=1,
+                    format="%d",
+                ),
+                "competition_id": st.column_config.NumberColumn(
+                    "competition_id",
+                    min_value=1,
+                    step=1,
+                    format="%d",
+                ),
+                "title_short": st.column_config.TextColumn("Кратко"),
+                "title": st.column_config.TextColumn("Событие"),
+                "name": st.column_config.TextColumn("Дистанция (как в distances.name)"),
+                "distance_km": st.column_config.NumberColumn(
+                    "distance_km",
+                    min_value=0.0,
+                    format="%.6g",
+                    step=0.001,
+                ),
+            }
+            edited_nd = st.data_editor(
+                df_nd,
+                use_container_width=True,
+                hide_index=True,
+                num_rows="dynamic",
+                key="admin_norm_distances_editor",
+                column_config=nd_cc,
+            )
+            c_nd1, c_nd2 = st.columns([1, 3])
+            with c_nd1:
+                save_nd = st.button("Сохранить norm_distances", key="admin_save_norm_distances", type="primary")
+            with c_nd2:
+                st.caption(
+                    "Удалённые в редакторе строки будут удалены из таблицы после сохранения. "
+                    "Пара (competition_id, name) должна быть уникальна."
+                )
+            if save_nd:
+                rec_nd = edited_nd.to_dict(orient="records")
+                errs_nd = mq.save_norm_distances_admin_rows(path, rec_nd)
+                if errs_nd:
+                    for e in errs_nd[:50]:
+                        st.error(e)
+                    if len(errs_nd) > 50:
+                        st.error(f"… ещё {len(errs_nd) - 50} сообщений.")
+                else:
+                    st.success(f"Сохранено строк: **{len(rec_nd)}**.")
+                    st.rerun()
 
     _section_anchor("admin-city-aliases")
     st.subheader("Справочник алиасов городов")
