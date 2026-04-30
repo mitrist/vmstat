@@ -21,9 +21,9 @@ ssh-key-1776086100805
 *.sqlite3
 *.db-shm
 *.db-wal
-.streamlit/secrets.toml
 .env
 .env.*
+.streamlit/_secrets.backup.toml
 
 # Бинарники / офис / временные
 *.apk
