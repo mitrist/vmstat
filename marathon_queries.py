@@ -34,6 +34,10 @@ DEFAULT_NORM_REGION_ALIAS_FILE = (
     Path(__file__).resolve().parent / "city-master" / "city-master" / "norm_region.csv"
 )
 DEFAULT_NORM_DISTANCES_CSV = Path(__file__).resolve().parent / "бд" / "norm_distances.csv"
+DEFAULT_VO_DISTRICT_ALIASES_CSV = Path(__file__).resolve().parent / "бд" / "vo_district_aliases.csv"
+DEFAULT_VOLOGDA_DISTRICTS_GEOJSON = (
+    Path(__file__).resolve().parent / "config" / "vologda_districts.geojson"
+)
 DEFAULT_CITY_NORMALIZATION_CHUNK = 1000
 DEFAULT_STAGES_FILE = Path(__file__).resolve().parent / ".cursor" / "etapy.yaml"
 LEGACY_STAGES_FILE = Path(__file__).resolve().parent / ".cursor" / "etapi.md"
@@ -2005,6 +2009,411 @@ def save_norm_distances_admin_rows(
         conn.commit()
 
     return []
+
+
+def vo_district_aliases_csv_path() -> Path:
+    return Path(os.environ.get("MARATHON_VO_DISTRICT_ALIASES_CSV", str(DEFAULT_VO_DISTRICT_ALIASES_CSV)))
+
+
+def vologda_rayon_geojson_path() -> Path:
+    raw = os.environ.get("VOLOGDA_DISTRICTS_GEOJSON", "").strip()
+    return Path(raw) if raw else DEFAULT_VOLOGDA_DISTRICTS_GEOJSON
+
+
+def _geojson_distinct_vo_district_names() -> list[str]:
+    p = vologda_rayon_geojson_path()
+    if not p.is_file():
+        return []
+    try:
+        geo = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    feats = geo.get("features") if isinstance(geo, dict) else None
+    if not isinstance(feats, list):
+        return []
+    names: set[str] = set()
+    for f in feats:
+        if not isinstance(f, dict):
+            continue
+        pr = f.get("properties")
+        if not isinstance(pr, dict):
+            continue
+        d = str(pr.get("district") or "").strip()
+        if d:
+            names.add(d)
+    return sorted(names)
+
+
+def _distinct_vologda_rayons_from_norm_city_csv() -> list[str]:
+    vo_tokens = {
+        _norm_alias_token("Вологодская область"),
+        _norm_alias_token("Вологодская Область"),
+    }
+    out: set[str] = set()
+    for rec in _load_norm_city_csv_rules():
+        rg = _norm_alias_token(str(rec.get("region") or ""))
+        if rg not in vo_tokens:
+            continue
+        ry = str(rec.get("rayon") or "").strip()
+        if ry:
+            out.add(ry)
+    return sorted(out)
+
+
+def _import_vo_district_aliases_from_csv(conn: sqlite3.Connection, csv_path: Path) -> int:
+    """Импорт из CSV (;). Пустые geojson/norm допускаются. Возвращает число вставленных строк."""
+    if not csv_path.is_file():
+        return 0
+    n = 0
+    txt = csv_path.read_text(encoding="utf-8-sig", errors="ignore")
+    for row in csv.DictReader(txt.splitlines(), delimiter=";"):
+        if not row:
+            continue
+        gj = _norm_str(row.get("geojson_district")).strip()
+        nc = _norm_str(row.get("norm_city_rayon")).strip()
+        ck = _norm_str(row.get("canonical_key")).strip()
+        ui = _norm_str(row.get("ui_label")).strip()
+        active = 1
+        raw_act = row.get("active")
+        if raw_act is not None and str(raw_act).strip() != "":
+            ls = str(raw_act).strip().lower()
+            if ls in ("0", "false", "no", "нет", "off"):
+                active = 0
+        if not ck or not ui:
+            continue
+        if not gj and not nc:
+            continue
+        try:
+            conn.execute(
+                """
+                INSERT INTO vo_district_aliases (geojson_district, norm_city_rayon, canonical_key, ui_label, active)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (gj or None, nc or None, ck, ui, active),
+            )
+            n += 1
+        except sqlite3.IntegrityError:
+            continue
+    return n
+
+
+def _bootstrap_vo_district_aliases_seed(conn: sqlite3.Connection) -> None:
+    """
+    Автозаполнение при пустой таблице: полигоны из GeoJSON и привязка «Район» из norm_city.csv.
+    canonical_key генерируется как нормализованный GEOJSON-дистрикт без пробелов.
+    """
+    for dn in _geojson_distinct_vo_district_names():
+        ck = "_".join(_norm_alias_token(dn).split())
+        ck = ck[:240] if len(ck) > 240 else ck
+        if not ck.strip():
+            continue
+        try:
+            conn.execute(
+                """
+                INSERT INTO vo_district_aliases (geojson_district, norm_city_rayon, canonical_key, ui_label, active)
+                VALUES (?, ?, ?, ?, 1)
+                """,
+                (dn, None, ck, dn),
+            )
+        except sqlite3.IntegrityError:
+            pass
+    rayon_list = _distinct_vologda_rayons_from_norm_city_csv()
+    gj_rows = conn.execute(
+        "SELECT id, geojson_district FROM vo_district_aliases WHERE geojson_district IS NOT NULL"
+    ).fetchall()
+    for rn in rayon_list:
+        nk_r = _norm_alias_token(rn)
+        nk_plus = _norm_alias_token(rn + " район")
+        for gr in gj_rows:
+            gj = str(gr["geojson_district"] or "").strip()
+            if not gj:
+                continue
+            ng = _norm_alias_token(gj)
+            if ng == nk_r or ng == nk_plus:
+                conn.execute(
+                    """
+                    UPDATE vo_district_aliases SET norm_city_rayon = COALESCE(norm_city_rayon, ?)
+                    WHERE id = ? AND (norm_city_rayon IS NULL OR TRIM(norm_city_rayon) = '')
+                    """,
+                    (rn, int(gr["id"])),
+                )
+                break
+
+
+def ensure_vo_district_aliases_schema(db_path: Path | str | None = None) -> None:
+    path = Path(db_path) if db_path is not None else DEFAULT_DB
+    if not path.is_file():
+        return
+    csvp = vo_district_aliases_csv_path()
+    with connect(path) as c:
+        c.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS vo_district_aliases (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                geojson_district TEXT,
+                norm_city_rayon TEXT,
+                canonical_key TEXT NOT NULL UNIQUE,
+                ui_label TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE INDEX IF NOT EXISTS idx_voda_active ON vo_district_aliases(active);
+            """
+        )
+        cnt = int(c.execute("SELECT COUNT(*) AS n FROM vo_district_aliases").fetchone()["n"])
+        if cnt == 0:
+            csv_n = _import_vo_district_aliases_from_csv(c, csvp)
+            if csv_n <= 0:
+                _bootstrap_vo_district_aliases_seed(c)
+        c.commit()
+
+
+def query_vo_district_aliases_all(db_path: Path | str) -> list[dict[str, Any]]:
+    ensure_vo_district_aliases_schema(db_path)
+    return q_all(
+        db_path,
+        """
+        SELECT id, geojson_district, norm_city_rayon, canonical_key, ui_label, active
+        FROM vo_district_aliases
+        ORDER BY canonical_key COLLATE NOCASE, id
+        """,
+    )
+
+
+def validate_vo_district_aliases_admin_rows(rows: list[dict[str, Any]]) -> list[str]:
+    errs: list[str] = []
+    seen_ck: dict[str, int] = {}
+    seen_gj: dict[str, int] = {}
+    seen_nc: dict[str, int] = {}
+
+    def line_num(i: int) -> str:
+        return f"Строка {i}"
+
+    for i, raw in enumerate(rows, start=1):
+        gj = _norm_str(raw.get("geojson_district")).strip()
+        nc = _norm_str(raw.get("norm_city_rayon")).strip()
+        ck = _norm_str(raw.get("canonical_key")).strip()
+        ui = _norm_str(raw.get("ui_label")).strip()
+        act = bool(raw.get("active", True))
+
+        if not ck and not ui and not gj and not nc and raw.get("id") is None:
+            continue
+        if not ck or not ui:
+            errs.append(f"{line_num(i)}: укажите **canonical_key** и **Название для UI**.")
+            continue
+        if gj and gj in seen_gj and seen_gj[gj] != i:
+            errs.append(f"{line_num(i)}: дубликат **Район (GeoJSON)** {gj!r}.")
+        if gj:
+            seen_gj[gj] = i
+        if nc and nc in seen_nc and seen_nc[nc] != i:
+            errs.append(f"{line_num(i)}: дубликат **Район (norm_city.csv)** {nc!r}.")
+        if nc:
+            seen_nc[nc] = i
+        ckn = ck.casefold()
+        if ckn in seen_ck and seen_ck[ckn] != i:
+            errs.append(f"{line_num(i)}: дубликат **canonical_key** {ck!r}.")
+        seen_ck[ckn] = i
+        if not act:
+            continue
+        if not gj and not nc:
+            errs.append(
+                f"{line_num(i)}: для активной строки задайте хотя бы один из районов "
+                "(GeoJSON или norm_city)."
+            )
+
+    return errs
+
+
+def save_vo_district_aliases_admin_rows(db_path: Path | str, rows: list[dict[str, Any]]) -> list[str]:
+    ensure_vo_district_aliases_schema(db_path)
+    dbp = Path(db_path)
+    errs = validate_vo_district_aliases_admin_rows(rows)
+    if errs:
+        return errs
+
+    validated: list[dict[str, Any]] = []
+    for raw in rows:
+        gj = _norm_str(raw.get("geojson_district")).strip()
+        nc = _norm_str(raw.get("norm_city_rayon")).strip()
+        ck = _norm_str(raw.get("canonical_key")).strip()
+        ui = _norm_str(raw.get("ui_label")).strip()
+        if not ck and not ui and not gj and not nc:
+            continue
+        if not ck or not ui:
+            continue
+        active = bool(raw.get("active", True))
+        if active and not gj and not nc:
+            continue
+        if not active and not gj and not nc:
+            continue
+
+        validated.append(
+            {
+                "id": _norm_optional_row_id(raw.get("id")),
+                "geojson_district": gj or "",
+                "norm_city_rayon": nc or "",
+                "canonical_key": ck,
+                "ui_label": ui,
+                "active": 1 if active else 0,
+            }
+        )
+
+    with connect(dbp) as conn:
+        cur_ids = [
+            int(r["id"])
+            for r in conn.execute("SELECT id FROM vo_district_aliases").fetchall()
+            if r["id"] is not None
+        ]
+        touched: set[int] = set()
+        try:
+            for v in validated:
+                rid = v["id"]
+                gj = v["geojson_district"]
+                nc = v["norm_city_rayon"]
+                ck = v["canonical_key"]
+                ui = v["ui_label"]
+                active = int(v["active"])
+
+                gj_sql = gj if gj else None
+                nc_sql = nc if nc else None
+
+                if rid is not None:
+                    exists = conn.execute(
+                        "SELECT id FROM vo_district_aliases WHERE id = ? LIMIT 1", (rid,)
+                    ).fetchone()
+                    if exists:
+                        conn.execute(
+                            """
+                            UPDATE vo_district_aliases SET
+                                geojson_district = ?, norm_city_rayon = ?, canonical_key = ?, ui_label = ?, active = ?
+                            WHERE id = ?
+                            """,
+                            (gj_sql, nc_sql, ck, ui, active, rid),
+                        )
+                        touched.add(rid)
+                    else:
+                        conn.execute(
+                            """
+                            INSERT INTO vo_district_aliases (id, geojson_district, norm_city_rayon, canonical_key, ui_label, active)
+                            VALUES (?, ?, ?, ?, ?, ?)
+                            """,
+                            (rid, gj_sql, nc_sql, ck, ui, active),
+                        )
+                        touched.add(rid)
+                else:
+                    cur = conn.execute(
+                        """
+                        INSERT INTO vo_district_aliases (geojson_district, norm_city_rayon, canonical_key, ui_label, active)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (gj_sql, nc_sql, ck, ui, active),
+                    )
+                    touched.add(int(cur.lastrowid))
+        except sqlite3.IntegrityError as ex:
+            conn.rollback()
+            errs.append(str(ex))
+            return errs
+
+        for oid in cur_ids:
+            if oid not in touched:
+                conn.execute("DELETE FROM vo_district_aliases WHERE id = ?", (oid,))
+
+        conn.commit()
+
+    return []
+
+
+def load_vologda_rayon_resolve_index(db_path: Path | str | None = None) -> dict[str, tuple[str, str]]:
+    """
+    Нормализованный ключ входной строки (GeoJSON district, rayon из CSV, уже канонический key)
+    → (ключ агрегации = norm(canonical_key), подпись для UI).
+    """
+    path = Path(db_path) if db_path is not None else DEFAULT_DB
+    if not path.is_file():
+        return {}
+    ensure_vo_district_aliases_schema(path)
+    rows = q_all(
+        path,
+        """
+        SELECT geojson_district, norm_city_rayon, canonical_key, ui_label
+        FROM vo_district_aliases
+        WHERE COALESCE(active, 1) = 1 AND TRIM(IFNULL(canonical_key, '')) <> ''
+             AND TRIM(IFNULL(ui_label, '')) <> ''
+        ORDER BY id
+        """,
+    )
+    inp: dict[str, tuple[str, str]] = {}
+
+    def add(norm_inp: str, canonical_key_raw: str, ui: str) -> None:
+        k = _norm_alias_token(norm_inp)
+        if not k:
+            return
+        ckn = _norm_alias_token(canonical_key_raw)
+        ul = ui.strip()
+        if not ul:
+            return
+        if k in inp:
+            prev = inp[k]
+            if prev[0] != ckn:
+                pass
+            return
+        inp[k] = (ckn, ul)
+
+    for r in rows:
+        ck = str(r.get("canonical_key") or "").strip()
+        ui = str(r.get("ui_label") or "").strip()
+        if not ck or not ui:
+            continue
+        ckn_full = _norm_alias_token(ck)
+        gj = _norm_str(r.get("geojson_district")).strip()
+        nc = _norm_str(r.get("norm_city_rayon")).strip()
+
+        add(ck, ck, ui)
+        if ui:
+            add(ui, ck, ui)
+        if gj:
+            add(gj, ck, ui)
+        if nc:
+            add(nc, ck, ui)
+            add(nc + " район", ck, ui)
+
+    return inp
+
+
+def resolve_vologda_rayon_with_index(
+    raw: str | None,
+    index: dict[str, tuple[str, str]],
+) -> tuple[str, str]:
+    """
+    Вход: сырая строка района (поле rayon в правилах города или district из GeoJSON).
+    Выход: (нормализованный ключ агрегации, строка для UI).
+    Если справочник пуст — fallback к _norm_alias_token сырья и clean label.
+    """
+    cl = _clean_geo_label(raw, "")
+    if not cl or _is_missing_geo_label(cl):
+        nu = _norm_alias_token("не указан")
+        return (nu, "Не указан")
+
+    nk = _norm_alias_token(cl)
+    if not index:
+        return (nk, cl)
+
+    if nk in index:
+        return index[nk]
+    nk_raion = _norm_alias_token(cl + " район")
+    if nk_raion in index:
+        return index[nk_raion]
+
+    stripped = nk.replace(" район", "").strip()
+    if stripped and stripped in index:
+        return index[stripped]
+
+    stripped2 = nk
+    while stripped2.endswith(" р-н"):
+        stripped2 = stripped2[: -len(" р-н")].strip()
+    if stripped2 and stripped2 in index:
+        return index[stripped2]
+
+    return (nk, cl)
 
 
 def query_profile_norm_km_total(
@@ -6666,6 +7075,7 @@ def query_vm_geography_page(
     Счётчик — уникальные ``profile_id`` по стартам под выбранными фильтрами; участники без (m)/(f)
     в сумме входят в общие счётчики, но не в колонки М/Ж.
     """
+    vo_ray_idx = load_vologda_rayon_resolve_index(db_path)
     w, params = _build_interesting_facts_where(year, sport)
 
     raw_city_rows = q_all(
@@ -6779,12 +7189,12 @@ def query_vm_geography_page(
 
         eff_region = region_by_key.get(key, region_from_city)
         if _norm_alias_token(eff_region) in vo_region_tokens:
-            district = _clean_geo_label(geo.get("rayon_label"), "Не указан")
-            dk = _norm_alias_token(district) or district.casefold()
+            district_raw = _clean_geo_label(geo.get("rayon_label"), "Не указан")
+            dk, dist_ui = resolve_vologda_rayon_with_index(district_raw, vo_ray_idx)
             dcur = vo_district_agg.get(dk)
             if dcur is None:
                 vo_district_agg[dk] = {
-                    "district": district,
+                    "district": dist_ui,
                     "participants": participants,
                     "starts": starts,
                     "participants_m": pm,

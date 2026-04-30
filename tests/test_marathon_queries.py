@@ -434,6 +434,44 @@ def test_team_extended_queries(sample_db: Path) -> None:
     assert q_map["DNF"] == 1
 
 
+def test_resolve_vologda_rayon_missing_label() -> None:
+    dk, ui = mq.resolve_vologda_rayon_with_index("", {})
+    assert ui == "Не указан"
+    dk2, ui2 = mq.resolve_vologda_rayon_with_index("Кирилловский район", {})
+    assert dk2 == mq._norm_alias_token("кирилловский район")
+
+
+def test_vo_district_aliases_save_and_resolve(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    db = tmp_path / "vo_alias.db"
+    db.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(mq, "_bootstrap_vo_district_aliases_seed", lambda c: None)
+    monkeypatch.setattr(mq, "_import_vo_district_aliases_from_csv", lambda c, p: 0)
+
+    mq.ensure_vo_district_aliases_schema(db)
+    assert (
+        mq.save_vo_district_aliases_admin_rows(
+            db,
+            [
+                {
+                    "geojson_district": "Тестовский район",
+                    "norm_city_rayon": "Тестовский",
+                    "canonical_key": "vo_test_raion",
+                    "ui_label": "Тестовский муниципальный район",
+                    "active": True,
+                }
+            ],
+        )
+        == []
+    )
+    idx = mq.load_vologda_rayon_resolve_index(db)
+    dk, ui = mq.resolve_vologda_rayon_with_index("Тестовский", idx)
+    assert dk == mq._norm_alias_token("vo_test_raion")
+    assert ui == "Тестовский муниципальный район"
+    dk2, _ = mq.resolve_vologda_rayon_with_index("Тестовский район", idx)
+    assert dk2 == dk
+
+
 def test_vm_geography_page_queries(sample_db: Path) -> None:
     out = mq.query_vm_geography_page(sample_db, year=None, sport=None)
     assert isinstance(out["regions"], list)

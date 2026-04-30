@@ -7,7 +7,8 @@ MVP-дашборд marathon.db (Streamlit).
   pip install -r requirements.txt
   streamlit run app.py
 
-Путь к БД: переменная MARATHON_DB или поле [marathon] path в .streamlit/secrets.toml
+Путь к БД: переменная MARATHON_DB или поле [marathon] path в .streamlit/secrets.toml.
+Ключ Яндекс.Карт (страница «География ВМ»): [yandex_maps] api_key или YANDEX_MAPS_API_KEY.
 """
 
 from __future__ import annotations
@@ -18,9 +19,10 @@ import datetime
 import math
 import json
 from collections.abc import Mapping
+from copy import deepcopy
 from io import BytesIO
 import tomllib
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin
 from typing import Any
 import html
 import os
@@ -47,6 +49,7 @@ FAVICON_ASSET = APP_DIR / "assets" / "vologdamarafon.png"
 REGION_CENTERS_FILE = APP_DIR / "config" / "region_centers.json"
 RUSSIA_REGIONS_GEOJSON_FILE = APP_DIR / "config" / "russia_regions.geojson"
 WORLD_COUNTRIES_GEOJSON_FILE = APP_DIR / "config" / "countries_ne110m.geojson"
+VOLOGDA_DISTRICTS_GEOJSON_FILE = APP_DIR / "config" / "vologda_districts.geojson"
 FAVICON_ATTACHED = Path(
     r"C:\Users\Pavlov DA\.cursor\projects\c-Projects-vm-stat\assets\c__Projects_vm_stat_favicon-32x32.png"
 )
@@ -97,10 +100,10 @@ SECTION_SUBMENUS: dict[str, list[tuple[str, str]]] = {
         ("facts-charts", "Графики"),
     ],
     "География ВМ": [
-        ("geo-top-cities", "Топ городов"),
-        ("geo-map", "Карта"),
-        ("geo-map-regions", "Регионы и страны"),
-        ("geo-tables", "Таблицы"),
+        ("yamap-tables", "Таблицы"),
+        ("yamap-cities", "Города"),
+        ("yamap-regions", "Регионы и страны"),
+        ("yamap-vo-districts", "Районы Вологодской области"),
     ],
     "События": [
         ("event-list", "События"),
@@ -268,6 +271,7 @@ _RUSSIA_REGION_CENTER_CACHE: dict[str, tuple[float, float]] | None = None
 _RUSSIA_REGION_ALIAS_TO_CANONICAL_CACHE: dict[str, str] | None = None
 _RUSSIA_REGIONS_GEOJSON_CACHE: dict[str, Any] | None = None
 _WORLD_COUNTRIES_GEO_AND_ISO_INDEX_CACHE: tuple[dict[str, Any], dict[str, str]] | None = None
+_VOLOGDA_DISTRICTS_GEOJSON_CACHE: dict[str, Any] | None = None
 
 
 def _country_to_iso3(country: str | None) -> str | None:
@@ -361,6 +365,22 @@ def _region_to_canonical(region: str | None) -> str | None:
     if not key:
         return None
     return _load_region_alias_to_canonical_map().get(key)
+
+
+def _load_vologda_districts_geojson() -> dict[str, Any] | None:
+    """Полигоны муниципальных районов ВО (OSM), файл `config/vologda_districts.geojson`."""
+    global _VOLOGDA_DISTRICTS_GEOJSON_CACHE
+    if _VOLOGDA_DISTRICTS_GEOJSON_CACHE is not None:
+        return _VOLOGDA_DISTRICTS_GEOJSON_CACHE
+    try:
+        geo = json.loads(VOLOGDA_DISTRICTS_GEOJSON_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    feats = geo.get("features")
+    if not isinstance(feats, list):
+        return None
+    _VOLOGDA_DISTRICTS_GEOJSON_CACHE = geo
+    return geo
 
 
 def _load_russia_regions_geojson_prepared() -> dict[str, Any] | None:
@@ -626,6 +646,36 @@ def db_path() -> Path:
     except Exception:
         pass
     return DEFAULT_DB
+
+
+def _resolve_yandex_maps_api_key() -> str | None:
+    """Ключ JS API Яндекс.Карт: [yandex_maps] api_key в secrets или YANDEX_MAPS_API_KEY."""
+    try:
+        if hasattr(st, "secrets") and st.secrets:
+            try:
+                yx = st.secrets["yandex_maps"]
+            except Exception:
+                yx = None
+            # Вложенные секции TOML в Streamlit могут быть не dict — читаем как mapping-подобный объект.
+            if yx is not None:
+                for kk in ("api_key", "apikey", "API_KEY"):
+                    v = None
+                    try:
+                        v = yx[kk]
+                    except Exception:
+                        if hasattr(yx, "get"):
+                            try:
+                                v = yx.get(kk)
+                            except Exception:
+                                v = None
+                    if v:
+                        s = str(v).strip()
+                        if s:
+                            return s
+    except Exception:
+        pass
+    ev = os.environ.get("YANDEX_MAPS_API_KEY", "").strip()
+    return ev or None
 
 
 def page_icon_path() -> str | None:
@@ -1071,6 +1121,8 @@ def _sidebar_read_page_from_url() -> str | None:
     for title, alias in PAGE_ALIASES.items():
         if key == alias:
             return title
+    if key == "yandex-maps":
+        return "География ВМ"
     if key == "interesting-facts":
         return "Интересные факты"
     return None
@@ -1965,57 +2017,413 @@ def _geo_rf_norm_is_vologda_oblast(norm_name: str | None) -> bool:
     return norm_name == _norm_geo_token("Вологодская область")
 
 
-def page_vm_geography() -> None:
-    st.header("География ВМ")
-    path = db_path()
-    if not require_db(path):
-        return
+# Заливка ВО на Яндекс-слое (как _VO_RF_BLUE_COLORSCALE)
+_VO_RF_BLUE_FILL_HEX = "#d6ebfa"
+# Обводка голубых точек городов-центров ВО (Вологда, Череповец) на карте участников
+_VO_CAPITAL_CITY_DOT_STROKE_HEX = "#2980b9"
 
-    years_all = mq.query_distinct_years(path)
-    sports_all = mq.query_distinct_sports(path)
 
-    year_options = ["Все"] + [str(y) for y in years_all]
-    year_pick = (
-        st.pills(
-            "Год",
-            options=year_options,
-            selection_mode="single",
-            default="Все",
-            key="geo_vm_pills_year",
-        )
-        if year_options
-        else "Все"
+def _geo_city_capital_vo_blue_marker(city_display: str | None) -> bool:
+    """
+    Два крупнейших центра области: канонические UI-имена «Вологда», «Череповец»
+    (в т.ч. с приставкой «г.» в сыром виде — снимает _norm_city_token).
+    Исключаются из суммирования по полигонам районов и рисуются голубым, как заливка ВО на хороплете.
+    """
+    nk = mq._norm_city_token(str(city_display or "").strip())
+    if not nk:
+        return False
+    return nk == mq._norm_city_token("Вологда") or nk == mq._norm_city_token("Череповец")
+
+
+def _enrich_map_points_vo_blue_capital(pts: list[Any]) -> None:
+    """Помечает точки vo_blue для слоя Яндекса и единообразной логики карт."""
+    for p in pts:
+        if not isinstance(p, dict):
+            continue
+        if _geo_city_capital_vo_blue_marker(p.get("city")):
+            p["vo_blue"] = True
+
+
+def _parse_rgb_triplet(s: str) -> tuple[int, int, int]:
+    m = re.match(
+        r"^\s*rgb\s*\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)\s*$",
+        str(s).strip(),
+        re.I,
     )
-    year_val: int | None = None if year_pick == "Все" else int(year_pick)
+    if not m:
+        raise ValueError(f"not rgb(): {s!r}")
+    return int(m.group(1)), int(m.group(2)), int(m.group(3))
 
-    sport_options = ["Все"] + sports_all
-    sport_pick = (
-        st.pills(
-            "Вид спорта",
-            options=sport_options,
-            selection_mode="single",
-            default="Все",
-            key="geo_vm_pills_sport",
-        )
-        if sport_options
-        else "Все"
+
+def _interpolate_rgb_colorscale(
+    stops: list[tuple[float, tuple[int, int, int]]],
+    t: float,
+) -> tuple[int, int, int]:
+    """t в [0,1], stops отсортированы по первому элементу пар (t_boundary, rgb)."""
+    if not stops:
+        return (200, 220, 200)
+    t = float(np.clip(t, 0.0, 1.0))
+    if t <= stops[0][0]:
+        return stops[0][1]
+    if t >= stops[-1][0]:
+        return stops[-1][1]
+    for i in range(len(stops) - 1):
+        t0, c0 = stops[i]
+        t1, c1 = stops[i + 1]
+        if t0 <= t <= t1 and t1 > t0:
+            u = (t - t0) / (t1 - t0)
+            rr = int(round(c0[0] * (1 - u) + c1[0] * u))
+            gg = int(round(c0[1] * (1 - u) + c1[1] * u))
+            bb = int(round(c0[2] * (1 - u) + c1[2] * u))
+            return rr, gg, bb
+    return stops[-1][1]
+
+
+def _geo_choro_green_fill_hex_for_participants(n: int) -> str:
+    """Тот же визуальный градиент, что хороплет Plotly по числу участников."""
+    tl = _geo_choro_green_t_bracket_line(int(n))
+    u = _geo_choro_green_t_visual(tl)
+    parsed: list[tuple[float, tuple[int, int, int]]] = []
+    for a, col in _GEO_CHORO_FILL_COLORSCALE:
+        parsed.append((float(a), _parse_rgb_triplet(str(col))))
+    rr, gg, bb = _interpolate_rgb_colorscale(parsed, u)
+    rr = max(0, min(255, rr))
+    gg = max(0, min(255, gg))
+    bb = max(0, min(255, bb))
+    return f"#{rr:02x}{gg:02x}{bb:02x}"
+
+
+def _yandex_choropleth_feature_collection(geo_vm: Mapping[str, Any]) -> dict[str, Any]:
+    """GeoJSON FeatureCollection со стилями в properties (хороплет регионов для Яндекс.Карт)."""
+    features: list[dict[str, Any]] = []
+    reg_rows = geo_vm.get("regions") or []
+    cc_rows = geo_vm.get("countries") or []
+    part_by_norm = _regions_stats_to_norm_participants(reg_rows)
+    part_iso_foreign = _foreign_countries_iso_participants(cc_rows)
+
+    geo_rf = _load_russia_regions_geojson_prepared()
+    feats_rf_list = geo_rf.get("features") if isinstance(geo_rf, dict) else None
+    if feats_rf_list and isinstance(feats_rf_list, list) and part_by_norm:
+        for f in feats_rf_list:
+            if not isinstance(f, dict):
+                continue
+            props_rf = f.get("properties")
+            nn = ""
+            dn = ""
+            if isinstance(props_rf, dict):
+                nn = str(props_rf.get("norm_name") or "")
+                dn = str(props_rf.get("name") or nn)
+            try:
+                pv = int(part_by_norm.get(nn, 0)) if nn else 0
+            except (TypeError, ValueError):
+                pv = 0
+            if pv <= 0:
+                continue
+            geom = f.get("geometry")
+            if not isinstance(geom, dict):
+                continue
+            is_vo = _geo_rf_norm_is_vologda_oblast(nn)
+            fill_hex = _VO_RF_BLUE_FILL_HEX if is_vo else _geo_choro_green_fill_hex_for_participants(pv)
+            features.append(
+                {
+                    "type": "Feature",
+                    "properties": {
+                        "fill": fill_hex,
+                        "fillOpacity": 0.74,
+                        "stroke": "#6b8574",
+                        "strokeWidth": 1,
+                        "hintTitle": dn,
+                        "participants": pv,
+                    },
+                    "geometry": deepcopy(geom),
+                }
+            )
+
+    geo_world, _ix = _load_world_countries_geojson_and_iso_alias_index()
+    if isinstance(geo_world, dict):
+        feats_w_raw = geo_world.get("features")
+        if isinstance(feats_w_raw, list):
+            iso_label_rf: dict[str, str] = {}
+            iso_feature: dict[str, dict[str, Any]] = {}
+            for f_w in feats_w_raw:
+                if not isinstance(f_w, dict):
+                    continue
+                p_w = f_w.get("properties")
+                if not isinstance(p_w, dict):
+                    continue
+                iso_m = str(p_w.get("iso_match") or "").strip()
+                if not iso_m or iso_m in iso_label_rf:
+                    continue
+                lab = (
+                    p_w.get("NAME_RU")
+                    or p_w.get("NAME_EN")
+                    or p_w.get("ADMIN")
+                    or p_w.get("NAME")
+                    or iso_m
+                )
+                iso_label_rf[iso_m] = str(lab)
+                iso_feature[iso_m] = f_w
+
+            iso_on_map = set(iso_label_rf.keys())
+            for iso, pv_raw in sorted(part_iso_foreign.items()):
+                iso_k = str(iso).strip()
+                try:
+                    pv = int(pv_raw)
+                except (TypeError, ValueError):
+                    continue
+                if pv <= 0 or iso_k not in iso_on_map:
+                    continue
+                f_geo = iso_feature.get(iso_k)
+                if not f_geo:
+                    continue
+                geom = f_geo.get("geometry")
+                if not isinstance(geom, dict):
+                    continue
+                fill_hex = _geo_choro_green_fill_hex_for_participants(pv)
+                features.append(
+                    {
+                        "type": "Feature",
+                        "properties": {
+                            "fill": fill_hex,
+                            "fillOpacity": 0.74,
+                            "stroke": "#6b8574",
+                            "strokeWidth": 1,
+                            "hintTitle": iso_label_rf.get(iso_k) or iso_k,
+                            "participants": pv,
+                        },
+                        "geometry": deepcopy(geom),
+                    }
+                )
+
+    return {"type": "FeatureCollection", "features": features}
+
+
+def _vo_approx_bbox_contains(lon: float, lat: float) -> bool:
+    """Грубый прямоугольник по Вологодской области (отсекает чужие города без тяжёлого расчёта)."""
+    return 34.85 <= lon <= 48.95 and 58.72 <= lat <= 61.55
+
+
+def _point_in_lonlat_ring(ring: Any, lon: float, lat: float) -> bool:
+    """Замкнутое кольцо GeoJSON [lon,lat] — даже‑нечётное число пересечений луча (ray casting)."""
+    if not isinstance(ring, list) or len(ring) < 3:
+        return False
+    inside = False
+    j = len(ring) - 1
+    for i in range(len(ring)):
+        pi = ring[i]
+        pj = ring[j]
+        if not isinstance(pi, (list, tuple)) or not isinstance(pj, (list, tuple)) or len(pi) < 2 or len(pj) < 2:
+            j = i
+            continue
+        xi = float(pi[0])
+        yi = float(pi[1])
+        xj = float(pj[0])
+        yj = float(pj[1])
+        denom = (yj - yi) + 1e-21
+        if (yi > lat) != (yj > lat) and lon < (xj - xi) * (lat - yi) / denom + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+def _point_in_polygon_rings(coords: Any, lon: float, lat: float) -> bool:
+    """GeoJSON Polygon: coordinates = [ exterior, hole1, ... ]."""
+    if not isinstance(coords, list) or not coords:
+        return False
+    exterior = coords[0]
+    if not isinstance(exterior, list) or not _point_in_lonlat_ring(exterior, lon, lat):
+        return False
+    for hole_idx in range(1, len(coords)):
+        hi = coords[hole_idx]
+        if isinstance(hi, list) and _point_in_lonlat_ring(hi, lon, lat):
+            return False
+    return True
+
+
+def _point_in_geojson_geometry(geom: Mapping[str, Any], lon: float, lat: float) -> bool:
+    gt = str(geom.get("type") or "")
+    coo = geom.get("coordinates")
+    if gt == "Polygon" and isinstance(coo, list):
+        return _point_in_polygon_rings(coo, lon, lat)
+    if gt == "MultiPolygon" and isinstance(coo, list):
+        for poly in coo:
+            if isinstance(poly, list) and _point_in_polygon_rings(poly, lon, lat):
+                return True
+        return False
+    return False
+
+
+def _vo_district_counts_from_map_points_pip(
+    feats_in: list[dict[str, Any]],
+    map_points: list[Any],
+    rayon_resolve_index: dict[str, tuple[str, str]] | None = None,
+) -> dict[str, int]:
+    """Сумма участников по городам (`map_points`), попавшая в полигон района ВО."""
+    idx = rayon_resolve_index or {}
+    feats_index: list[tuple[str, str, dict[str, Any]]] = []
+    for f in feats_in:
+        if not isinstance(f, dict):
+            continue
+        geom = f.get("geometry")
+        if not isinstance(geom, dict):
+            continue
+        pr = f.get("properties")
+        if not isinstance(pr, dict):
+            pr = {}
+        poly_name = mq._clean_geo_label(str(pr.get("district") or ""), fallback="")
+        if not poly_name:
+            continue
+        nk = mq.resolve_vologda_rayon_with_index(poly_name, idx)[0]
+        if not nk:
+            continue
+        feats_index.append((nk, poly_name, geom))
+
+    out: dict[str, int] = {}
+    if not feats_index:
+        return out
+
+    for pt in map_points:
+        if not isinstance(pt, dict):
+            continue
+        try:
+            la = float(pt.get("lat"))
+            lo = float(pt.get("lon"))
+        except (TypeError, ValueError):
+            continue
+        try:
+            pw = int(pt.get("participants") or 0)
+        except (TypeError, ValueError):
+            pw = 0
+        if pw <= 0 or not _vo_approx_bbox_contains(lo, la):
+            continue
+        if _geo_city_capital_vo_blue_marker(pt.get("city")):
+            continue
+        for nk, _pname, gdict in feats_index:
+            try:
+                if _point_in_geojson_geometry(gdict, lo, la):
+                    out[nk] = out.get(nk, 0) + pw
+                    break
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
+def _yandex_vo_district_feature_collection(
+    geo_vm: Mapping[str, Any],
+    db_path: Path | str,
+) -> dict[str, Any]:
+    """Районы Вологодской области: полигоны из config + участники (PIP по map_points или vologda_districts)."""
+    geo = _load_vologda_districts_geojson()
+    idx = mq.load_vologda_rayon_resolve_index(db_path) if mq.db_exists(db_path) else {}
+    if not geo:
+        return {"type": "FeatureCollection", "features": []}
+    feats_in = geo.get("features")
+    if not isinstance(feats_in, list):
+        return {"type": "FeatureCollection", "features": []}
+
+    counts_text: dict[str, int] = {}
+    label_for: dict[str, str] = {}
+    for r in geo_vm.get("vologda_districts") or []:
+        if not isinstance(r, dict):
+            continue
+        d = mq._clean_geo_label(str(r.get("district") or ""), fallback="")
+        if not d:
+            continue
+        k_agg, d_lab = mq.resolve_vologda_rayon_with_index(d, idx)
+        if not k_agg:
+            continue
+        try:
+            p = int(r.get("participants") or 0)
+        except (TypeError, ValueError):
+            p = 0
+        counts_text[k_agg] = counts_text.get(k_agg, 0) + p
+        label_for[k_agg] = d_lab
+
+    mpts_raw = geo_vm.get("map_points") or []
+    map_points_list = [x for x in mpts_raw if isinstance(x, dict)]
+
+    counts_pip = _vo_district_counts_from_map_points_pip(
+        [x for x in feats_in if isinstance(x, dict)],
+        map_points_list,
+        rayon_resolve_index=idx,
     )
-    sport_val: str | None = None if sport_pick == "Все" else str(sport_pick).strip()
+    # Таблица «районы ВО» (агрегат по полю района в справочниках) — основной источник чисел для карты;
+    # PIP по центрам городов только дополняет районы без строки в таблице (нет совпадения alias/район или 0 в данных).
+    for ff in feats_in:
+        if not isinstance(ff, dict):
+            continue
+        pr_ff = ff.get("properties")
+        if not isinstance(pr_ff, dict):
+            continue
+        pn_ff = mq._clean_geo_label(str(pr_ff.get("district") or ""), fallback="")
+        if pn_ff:
+            kn_ff, pn_ui = mq.resolve_vologda_rayon_with_index(pn_ff, idx)
+            if kn_ff:
+                label_for.setdefault(kn_ff, pn_ui)
 
-    with st.spinner("Загрузка таблиц и карт…"):
-        _page_vm_geography_body(path, year_val, sport_val)
+    poly_nk_set: set[str] = set()
+    for pf in feats_in:
+        if not isinstance(pf, dict):
+            continue
+        prp = pf.get("properties")
+        if not isinstance(prp, dict):
+            prp = {}
+        pnm = mq._clean_geo_label(str(prp.get("district") or ""), fallback="")
+        if pnm:
+            knp, _ = mq.resolve_vologda_rayon_with_index(pnm, idx)
+            if knp:
+                poly_nk_set.add(knp)
+
+    merge_keys = set(counts_text) | set(counts_pip) | poly_nk_set
+    counts: dict[str, int] = {}
+    for nk in merge_keys:
+        ct = int(counts_text.get(nk, 0))
+        cp = int(counts_pip.get(nk, 0))
+        counts[nk] = ct if ct > 0 else cp
+
+    features: list[dict[str, Any]] = []
+    for f in feats_in:
+        if not isinstance(f, dict):
+            continue
+        pr0 = f.get("properties")
+        if not isinstance(pr0, dict):
+            pr0 = {}
+        poly_name = mq._clean_geo_label(str(pr0.get("district") or ""), fallback="")
+        if not poly_name:
+            continue
+        nk, poly_ui = mq.resolve_vologda_rayon_with_index(poly_name, idx)
+        pv = int(counts.get(nk, 0))
+        title = label_for.get(nk) or poly_ui
+        geom = f.get("geometry")
+        if not isinstance(geom, dict):
+            continue
+        fill_hex = _geo_choro_green_fill_hex_for_participants(max(0, pv))
+        features.append(
+            {
+                "type": "Feature",
+                "properties": {
+                    "fill": fill_hex,
+                    "fillOpacity": 0.74,
+                    "stroke": "#6b8574",
+                    "strokeWidth": 1,
+                    "hintTitle": title,
+                    "participants": pv,
+                },
+                "geometry": deepcopy(geom),
+            }
+        )
+    return {"type": "FeatureCollection", "features": features}
 
 
-def _page_vm_geography_body(path: Path, year_val: int | None, sport_val: str | None) -> None:
-    geo_vm = mq.query_vm_geography_page(path, year=year_val, sport=sport_val)
-
+def _render_geo_vm_data_tables(geo_vm: Mapping[str, Any], *, widget_key_prefix: str) -> None:
+    """Таблицы и диаграмма по районам ВО (раздел «География ВМ»)."""
     cities_all = geo_vm.get("cities") or []
-    _section_anchor("geo-top-cities")
+    _section_anchor("yamap-tables")
     st.subheader("Топ городов")
     st.caption("Первые **30** городов по числу уникальных участников (учитывается нормализация городов из справочника). Строку можно отфильтровать подстрокой.")
     needle = st.text_input(
         "Фильтр по названию города",
-        key="geo_vm_city_needle",
+        key=f"{widget_key_prefix}_city_needle",
         placeholder="Например: Вологда",
         label_visibility="collapsed",
     )
@@ -2071,7 +2479,6 @@ def _page_vm_geography_body(path: Path, year_val: int | None, sport_val: str | N
     else:
         st.caption("Нет данных для выбранных фильтров.")
 
-    _section_anchor("geo-tables")
     st.subheader("Количество участников по регионам")
     reg_rows = geo_vm.get("regions") or []
     if reg_rows:
@@ -2215,253 +2622,450 @@ def _page_vm_geography_body(path: Path, year_val: int | None, sport_val: str | N
     else:
         st.caption("Нет данных по районам Вологодской области для выбранных фильтров.")
 
-    _section_anchor("geo-map")
+
+def _yandex_maps_cities_html(
+    api_key: str,
+    points: list[dict[str, Any]],
+    *,
+    start_lat: float,
+    start_lon: float,
+    start_zoom: int,
+) -> str:
+    """Полная HTML-страница со встроенной картой API 2.1 для iframe components.html."""
+    qk = quote(str(api_key).strip(), safe="")
+    api_url = f"https://api-maps.yandex.ru/2.1/?apikey={qk}&lang=ru_RU"
+    src_esc = html.escape(api_url, quote=True)
+    pts_raw = json.dumps(points, ensure_ascii=False)
+    pts_safe = pts_raw.replace("</script>", "<\\/script>")
+    zm = max(3, min(15, int(start_zoom)))
+    # JS без f-string, чтобы не экранировать фигурные скобки
+    lat_j = repr(float(start_lat))
+    lon_j = repr(float(start_lon))
+    zm_j = str(zm)
+    script_body = """ymaps.ready(function () {
+  var map = new ymaps.Map('vm-yandex-map-root', {
+    center: [""" + lat_j + ", " + lon_j + """],
+    zoom: """ + zm_j + """,
+    controls: ['zoomControl', 'fullscreenControl', 'typeSelector']
+  });
+  var el = document.getElementById('vm-yamap-points-json');
+  var points = [];
+  try { points = JSON.parse(el ? el.textContent : '[]'); } catch (e2) { points = []; }
+  var col = new ymaps.GeoObjectCollection();
+  function escHtml(s) {
+    return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+  var CityDotRed = null;
+  var CityDotBlueVo = null;
+  try {
+    CityDotRed = ymaps.templateLayoutFactory.createClass(
+      '<div style="width:9px;height:9px;background:#c62828;border-radius:50%;' +
+        'border:1px solid #fff;box-sizing:border-box;cursor:pointer;' +
+        'box-shadow:0 1px 2px rgba(0,0,0,.35);transform:translate(-50%,-50%);"></div>'
+    );
+    CityDotBlueVo = ymaps.templateLayoutFactory.createClass(
+      '<div style="width:9px;height:9px;background:#d6ebfa;border-radius:50%;' +
+        'border:1px solid #2980b9;box-sizing:border-box;cursor:pointer;' +
+        'box-shadow:0 1px 2px rgba(0,0,0,.35);transform:translate(-50%,-50%);"></div>'
+    );
+  } catch (eDot) {
+    CityDotRed = null;
+    CityDotBlueVo = null;
+  }
+  for (var i = 0; i < points.length; i++) {
+    var p = points[i];
+    var voBlue = p.vo_blue === true || p.vo_blue === 1;
+    var layoutCls = voBlue ? CityDotBlueVo : CityDotRed;
+    var pmOpts = layoutCls ? {
+      iconLayout: layoutCls,
+      iconOffset: [0, 0],
+      iconShape: { type: 'Circle', coordinates: [0, 0], radius: 10 }
+    } : (voBlue
+      ? { preset: 'islands#circleDotIcon', iconColor: '#2980b9' }
+      : { preset: 'islands#redCircleDotIcon', iconColor: '#c62828' });
+    var pm = new ymaps.Placemark([p.lat, p.lon], {
+      balloonContentHeader: escHtml(p.city),
+      balloonContentBody: 'Участников: ' + String(p.participants),
+      hintContent: escHtml(p.city) + ' — ' + String(p.participants)
+    }, pmOpts);
+    col.add(pm);
+  }
+  map.geoObjects.add(col);
+  if (points.length > 0) {
+    var b = col.getBounds();
+    if (b) {
+      var pr = map.setBounds(b, { checkZoomRange: true, zoomMargin: 52 });
+      if (pr && typeof pr.catch === 'function') {
+        pr.catch(function () {
+          map.setCenter([""" + lat_j + ", " + lon_j + """], """ + zm_j + """);
+        });
+      }
+    }
+  }
+});
+"""
+    return (
+        '<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8"/>'
+        '<meta name="viewport" content="width=device-width, initial-scale=1"/>'
+        "<style>"
+        "html,body{margin:0;padding:0;height:100%;width:100%;}"
+        "#vm-yandex-map-root{width:100%;height:698px;min-height:560px;}"
+        "</style>"
+        f'<script src="{src_esc}" type="text/javascript"></script>'
+        "</head><body>"
+        '<div id="vm-yandex-map-root"></div>'
+        f'<script type="application/json" id="vm-yamap-points-json">{pts_safe}</script>'
+        f'<script type="text/javascript">{script_body}</script>'
+        "</body></html>"
+    )
+
+
+def _yandex_maps_choropleth_html(
+    api_key: str,
+    feature_collection: Mapping[str, Any],
+    *,
+    start_lat: float,
+    start_lon: float,
+    start_zoom: int,
+    map_dom_id: str = "vm-yandex-map-choro",
+    json_script_id: str = "vm-yamap-choro-json",
+) -> str:
+    """Карта API 2.1: полигоны регионов РФ и зарубежных стран по тому же смыслу, что Choroplethmapbox."""
+    if not re.fullmatch(r"[a-zA-Z][a-zA-Z0-9_-]{0,72}", map_dom_id):
+        map_dom_id = "vm-yandex-map-choro"
+    if not re.fullmatch(r"[a-zA-Z][a-zA-Z0-9_-]{0,72}", json_script_id):
+        json_script_id = "vm-yamap-choro-json"
+    qk = quote(str(api_key).strip(), safe="")
+    api_url = f"https://api-maps.yandex.ru/2.1/?apikey={qk}&lang=ru_RU"
+    src_esc = html.escape(api_url, quote=True)
+    fc_any: Any = dict(feature_collection) if not isinstance(feature_collection, dict) else feature_collection
+    fc_raw = json.dumps(fc_any, ensure_ascii=False)
+    fc_safe = fc_raw.replace("</script>", "<\\/script>")
+    zm = max(2, min(12, int(start_zoom)))
+    lat_j = repr(float(start_lat))
+    lon_j = repr(float(start_lon))
+    zm_j = str(zm)
+    mid_js = json.dumps(map_dom_id)
+    jid_js = json.dumps(json_script_id)
+    css_map = (
+        "html,body{margin:0;padding:0;height:100%;width:100%;}#"
+        + map_dom_id
+        + "{width:100%;height:698px;min-height:560px;}"
+    )
+    script_body = """ymaps.ready(function () {
+  var map = new ymaps.Map(""" + mid_js + """, {
+    center: [""" + lat_j + ", " + lon_j + """],
+    zoom: """ + zm_j + """,
+    controls: ['zoomControl', 'fullscreenControl', 'typeSelector']
+  });
+  var el = document.getElementById(""" + jid_js + """);
+  var fc = { type: 'FeatureCollection', features: [] };
+  try { fc = JSON.parse(el ? el.textContent : '{}'); } catch (e0) { fc = { type: 'FeatureCollection', features: [] }; }
+  function escHtml(s) {
+    return String(s == null ? '' : s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+  function addPolygonRings(ringsLonLat, pr) {
+    var yandexRings = ringsLonLat.map(function (ring) {
+      return ring.map(function (c) { return [c[1], c[0]]; });
+    });
+    map.geoObjects.add(new ymaps.Polygon(yandexRings, {
+      balloonContentHeader: escHtml(pr.hintTitle),
+      balloonContentBody: 'Участников: ' + String(pr.participants),
+      hintContent: escHtml(pr.hintTitle) + ' — ' + String(pr.participants)
+    }, {
+      fillColor: pr.fill,
+      fillOpacity: pr.fillOpacity != null ? pr.fillOpacity : 0.74,
+      strokeColor: pr.stroke || '#6b8574',
+      strokeWidth: pr.strokeWidth != null ? pr.strokeWidth : 1
+    }));
+  }
+  function ringCentroidLonLat(ring) {
+    if (!ring || ring.length < 3) return null;
+    var n = ring.length;
+    var end = n;
+    var aa = ring[0], zz = ring[n - 1];
+    if (aa && zz && aa.length > 1 && zz.length > 1 &&
+        Math.abs(Number(aa[0]) - Number(zz[0])) < 1e-10 &&
+        Math.abs(Number(aa[1]) - Number(zz[1])) < 1e-10) {
+      end = n - 1;
+    }
+    var sx = 0, sy = 0, kk = 0;
+    var ij = 0;
+    for (ij = 0; ij < end; ij++) {
+      var c = ring[ij];
+      if (!c || c.length < 2) continue;
+      sx += Number(c[0]); sy += Number(c[1]); kk++;
+    }
+    if (!kk) return null;
+    return [sx / kk, sy / kk];
+  }
+  function ringBBoxMetric(ring) {
+    if (!ring || ring.length < 2) return 0;
+    var mnX = Infinity, mnY = Infinity, mxX = -Infinity, mxY = -Infinity;
+    var ij = 0;
+    for (ij = 0; ij < ring.length; ij++) {
+      var c = ring[ij];
+      if (!c || c.length < 2) continue;
+      var x = Number(c[0]), y = Number(c[1]);
+      if (x < mnX) mnX = x; if (x > mxX) mxX = x;
+      if (y < mnY) mnY = y; if (y > mxY) mxY = y;
+    }
+    if (!isFinite(mxX) || !isFinite(mxY)) return 0;
+    return Math.abs((mxX - mnX) * (mxY - mnY));
+  }
+  function geometryCentroidLonLat(g) {
+    if (!g) return null;
+    if (g.type === 'Polygon' && g.coordinates && g.coordinates[0]) {
+      return ringCentroidLonLat(g.coordinates[0]);
+    }
+    if (g.type === 'MultiPolygon' && g.coordinates && g.coordinates.length) {
+      var best = null;
+      var bestM = -1;
+      var pj = 0;
+      for (pj = 0; pj < g.coordinates.length; pj++) {
+        var part = g.coordinates[pj];
+        if (!part || !part[0]) continue;
+        var ext = part[0];
+        var m = ringBBoxMetric(ext);
+        if (m > bestM) {
+          bestM = m;
+          best = ringCentroidLonLat(ext);
+        }
+      }
+      return best;
+    }
+    return null;
+  }
+  var feats = fc.features || [];
+  var fi = 0;
+  for (fi = 0; fi < feats.length; fi++) {
+    var f = feats[fi];
+    if (!f || !f.geometry || !f.properties) { continue; }
+    var g = f.geometry;
+    var pr = f.properties;
+    if (!pr.fill) { continue; }
+    if (g.type === 'Polygon') {
+      addPolygonRings(g.coordinates, pr);
+    } else if (g.type === 'MultiPolygon') {
+      var mp = g.coordinates;
+      var pj = 0;
+      for (pj = 0; pj < mp.length; pj++) {
+        addPolygonRings(mp[pj], pr);
+      }
+    }
+  }
+  var ChoroValueLabel = null;
+  try {
+    ChoroValueLabel = ymaps.templateLayoutFactory.createClass(
+      '<div style="font:700 12px/1.1 system-ui,-apple-system,Segoe UI,sans-serif;' +
+        'color:#14422a;text-align:center;pointer-events:none;white-space:nowrap;' +
+        'text-shadow:1px 0 0 #fff,-1px 0 0 #fff,0 1px 0 #fff,0 -1px 0 #fff,' +
+        '0 0 3px rgba(255,255,255,.9);">$[properties.iconContent]</div>'
+    );
+  } catch (eLbl) {
+    ChoroValueLabel = null;
+  }
+  if (ChoroValueLabel) { for (fi = 0; fi < feats.length; fi++) {
+    var f2 = feats[fi];
+    if (!f2 || !f2.geometry || !f2.properties) { continue; }
+    var g2 = f2.geometry;
+    var pr2 = f2.properties;
+    if (!pr2.fill) { continue; }
+    var nv = Number(pr2.participants);
+    if (!isFinite(nv) || nv <= 0) { continue; }
+    var cll = geometryCentroidLonLat(g2);
+    if (!cll) { continue; }
+    map.geoObjects.add(new ymaps.Placemark([cll[1], cll[0]], {
+      iconContent: String(Math.round(nv))
+    }, {
+      iconLayout: ChoroValueLabel,
+      iconOffset: [0, 0],
+      hasBalloon: false,
+      hasHint: false,
+      zIndex: 900
+    }));
+  } }
+  if (feats.length > 0) {
+    var b = map.geoObjects.getBounds();
+    if (b) {
+      var prb = map.setBounds(b, { checkZoomRange: true, zoomMargin: 52 });
+      if (prb && typeof prb.catch === 'function') {
+        prb.catch(function () {
+          map.setCenter([""" + lat_j + ", " + lon_j + """], """ + zm_j + """);
+        });
+      }
+    }
+  }
+});
+"""
+    return (
+        '<!DOCTYPE html><html lang="ru"><head><meta charset="utf-8"/>'
+        '<meta name="viewport" content="width=device-width, initial-scale=1"/>'
+        f"<style>{css_map}</style>"
+        f'<script src="{src_esc}" type="text/javascript"></script>'
+        "</head><body>"
+        f'<div id="{map_dom_id}"></div>'
+        f'<script type="application/json" id="{json_script_id}">{fc_safe}</script>'
+        f'<script type="text/javascript">{script_body}</script>'
+        "</body></html>"
+    )
+
+
+def page_vm_geography() -> None:
+    st.header("География ВМ")
+    path = db_path()
+    if not require_db(path):
+        return
+
+    years_all = mq.query_distinct_years(path)
+    sports_all = mq.query_distinct_sports(path)
+
+    year_options = ["Все"] + [str(y) for y in years_all]
+    year_pick = (
+        st.pills(
+            "Год",
+            options=year_options,
+            selection_mode="single",
+            default="Все",
+            key="yamap_pills_year",
+        )
+        if year_options
+        else "Все"
+    )
+    year_val: int | None = None if year_pick == "Все" else int(year_pick)
+
+    sport_options = ["Все"] + sports_all
+    sport_pick = (
+        st.pills(
+            "Вид спорта",
+            options=sport_options,
+            selection_mode="single",
+            default="Все",
+            key="yamap_pills_sport",
+        )
+        if sport_options
+        else "Все"
+    )
+    sport_val: str | None = None if sport_pick == "Все" else str(sport_pick).strip()
+
+    with st.spinner("Загрузка данных…"):
+        geo_vm = mq.query_vm_geography_page(path, year=year_val, sport=sport_val)
+
+    _render_geo_vm_data_tables(geo_vm, widget_key_prefix="yamap_geo")
+
+    api_key = _resolve_yandex_maps_api_key()
+    if not api_key:
+        st.warning(
+            "Чтобы показать карты Яндекса, задайте ключ API: блок **`[yandex_maps]`** с полем **`api_key`** "
+            "в `.streamlit/secrets.toml` или переменную окружения **YANDEX_MAPS_API_KEY**."
+        )
+        st.code(
+            "[yandex_maps]\napi_key = \"ваш_ключ\"\n\n# или: export YANDEX_MAPS_API_KEY=...\n",
+            language="toml",
+        )
+        return
+
+    pts: list[dict[str, Any]] = list(geo_vm.get("map_points") or [])
+    cities_any = geo_vm.get("cities") or []
+
+    default_lat = 59.218
+    default_lon = 39.884
+    default_zoom = 6
+    start_lat = default_lat
+    start_lon = default_lon
+    start_zoom_i = default_zoom
+    if pts:
+        cen, zf = _scatter_mapbox_viewport_geo(pd.DataFrame(pts))
+        start_lat = float(cen["lat"])
+        start_lon = float(cen["lon"])
+        start_zoom_i = int(np.clip(round(zf), 3, 12))
+
+    _section_anchor("yamap-cities")
     st.subheader("Города участников")
     st.caption(
-        "Размер круга — по числу уникальных участников в городе (цвет маркеров единый для контраста). "
-        "Подложка — **OpenStreetMap** © [OpenStreetMap contributors](https://www.openstreetmap.org/copyright)."
+        "**Вологда** и **Череповец** — голубые маркеры (как заливка ВО на карте регионов); в суммировании участников "
+        "**по полигону района** по точке города они не участвуют (см. карту районов ниже). Остальные города — красные точки."
     )
-    pts = geo_vm.get("map_points") or []
-    map_viewport_center: dict[str, float] | None = None
-    map_viewport_zoom: float | None = None
-    if not cities_all:
-        st.caption("Нет городов для выбранных фильтров.")
-    elif not pts:
+    if cities_any and not pts:
         st.caption(
             "Не удалось поставить точки на карту — для канонических названий городов нет координат в справочнике."
         )
-    else:
-        df_map = pd.DataFrame(pts).sort_values(by="participants", ascending=False)
-        df_geo = df_map.copy()
-        br = np.sqrt(np.maximum(1.0, df_geo["participants"].astype(float)))
-        df_geo["_r"] = br
-        bm = float(br.max()) if len(br) else 12.0
-        center_geo, zoom_geo = _scatter_mapbox_viewport_geo(df_geo)
-        map_viewport_center, map_viewport_zoom = center_geo, zoom_geo
-        # Один контрастный цвет на светлой OSM; размер задаёт вклад участников (см. _r).
-        _geo_marker_color = "#b71c1c"
-        fig_geo = px.scatter_mapbox(
-            df_geo,
-            lat="lat",
-            lon="lon",
-            size="_r",
-            hover_name="city",
-            labels={"city": "Город", "participants": "Участников", "_r": ""},
-            hover_data={"participants": True, "_r": False},
-            size_max=max(42.0, bm * 1.2),
-            mapbox_style="open-street-map",
-            zoom=zoom_geo,
-            center=center_geo,
-        )
-        fig_geo.update_traces(marker=dict(color=_geo_marker_color, opacity=0.5))
-        fig_geo.update_layout(
-            margin=dict(l=0, r=0, t=52, b=0),
-            height=680,
-            mapbox=dict(
-                style="open-street-map",
-                bearing=0,
-                pitch=0,
-            ),
-            showlegend=False,
-        )
-        st.plotly_chart(fig_geo, use_container_width=True)
+    elif not cities_any:
+        st.caption("Нет городов для выбранных фильтров.")
 
-    _section_anchor("geo-map-regions")
+    _enrich_map_points_vo_blue_capital(pts)
+    html_map = _yandex_maps_cities_html(
+        api_key,
+        pts,
+        start_lat=start_lat,
+        start_lon=start_lon,
+        start_zoom=start_zoom_i,
+    )
+    components.html(html_map, height=720, scrolling=False)
+
+    _section_anchor("yamap-regions")
     st.subheader("Регионы и страны")
 
-    part_by_norm = _regions_stats_to_norm_participants(reg_rows)
-    part_iso_foreign = _foreign_countries_iso_participants(cc_rows)
-
-    geo_rf = _load_russia_regions_geojson_prepared()
-    geo_world, _ = _load_world_countries_geojson_and_iso_alias_index()
-
-    if geo_rf is None:
+    geo_rf_chk = _load_russia_regions_geojson_prepared()
+    geo_world_chk, _wix = _load_world_countries_geojson_and_iso_alias_index()
+    if geo_rf_chk is None:
         st.caption(
             "Не загружается файл контурной карты регионов России (`config/russia_regions.geojson`)."
         )
-    if geo_world is None:
+    if geo_world_chk is None:
         st.caption(
             "Не загружается файл границ стран (`config/countries_ne110m.geojson`). "
-            "Скопируйте [ne_110m_admin_0_countries.geojson](https://github.com/nvkelso/natural-earth-vector/blob/master/geojson/ne_110m_admin_0_countries.geojson) в `config/`."
+            "Файл GeoJSON стран — см. подсказки в этом блоке или в документации репозитория (`config/`)."
         )
 
-    map_c = (
-        map_viewport_center
-        if map_viewport_center is not None
-        else dict(lat=58.55, lon=43.82)
-    )
-    map_z = map_viewport_zoom if map_viewport_zoom is not None else 3.85
+    fc_choro: dict[str, Any] = _yandex_choropleth_feature_collection(geo_vm)
+    reg_rows_vm = geo_vm.get("regions") or []
+    cc_rows_vm = geo_vm.get("countries") or []
+    part_by_norm_vm = _regions_stats_to_norm_participants(reg_rows_vm)
+    part_iso_vm = _foreign_countries_iso_participants(cc_rows_vm)
+    chor_feats = fc_choro.get("features") if isinstance(fc_choro, dict) else []
+    if not isinstance(chor_feats, list):
+        chor_feats = []
 
-    rf_green_locations: list[str] = []
-    rf_green_z: list[int] = []
-    rf_green_hover: list[str] = []
-    rf_vo_locations: list[str] = []
-    rf_vo_z: list[int] = []
-    rf_vo_hover: list[str] = []
-    feats_rf_list = geo_rf.get("features") if isinstance(geo_rf, dict) else None
-    if feats_rf_list and isinstance(feats_rf_list, list) and part_by_norm:
-        for f in feats_rf_list:
-            if not isinstance(f, dict):
-                continue
-            props = f.get("properties")
-            nn = ""
-            dn = ""
-            if isinstance(props, dict):
-                nn = str(props.get("norm_name") or "")
-                dn = str(props.get("name") or nn)
-            pv = part_by_norm.get(nn, 0) if nn else 0
-            if pv <= 0:
-                continue
-            if _geo_rf_norm_is_vologda_oblast(nn):
-                rf_vo_locations.append(nn)
-                rf_vo_z.append(pv)
-                rf_vo_hover.append(dn)
-            else:
-                rf_green_locations.append(nn)
-                rf_green_z.append(pv)
-                rf_green_hover.append(dn)
-
-    world_locations: list[str] = []
-    world_z: list[int] = []
-    world_hover: list[str] = []
-    if isinstance(geo_world, dict):
-        feats_w_raw = geo_world.get("features")
-        if isinstance(feats_w_raw, list):
-            iso_label_rf: dict[str, str] = {}
-            for f in feats_w_raw:
-                if not isinstance(f, dict):
-                    continue
-                props = f.get("properties")
-                if not isinstance(props, dict):
-                    continue
-                iso_m = str(props.get("iso_match") or "")
-                if not iso_m or iso_m in iso_label_rf:
-                    continue
-                lab = (
-                    props.get("NAME_RU")
-                    or props.get("NAME_EN")
-                    or props.get("ADMIN")
-                    or props.get("NAME")
-                    or iso_m
-                )
-                iso_label_rf[iso_m] = str(lab)
-
-            iso_on_map = set(iso_label_rf.keys())
-            for iso, pv in sorted(part_iso_foreign.items()):
-                if pv <= 0 or iso not in iso_on_map:
-                    continue
-                world_locations.append(iso)
-                world_z.append(pv)
-                world_hover.append(iso_label_rf.get(iso) or iso)
-
-    rf_green_z_br = _geo_choro_green_z_bracket_100_500(rf_green_z)
-    world_z_br = _geo_choro_green_z_bracket_100_500(world_z)
-    z_geo_max = 1.0
-    z_geo_min = 0.0
-
-    cb_green = _geo_choro_green_colorbar_bundle_bracket_100_500()
-
-    fig_reg = go.Figure()
-    want_rf_green = geo_rf is not None and bool(rf_green_locations)
-    want_rf_vo = geo_rf is not None and bool(rf_vo_locations)
-    want_world = geo_world is not None and bool(world_locations)
-    cb_on_rf_green_alone = bool(want_rf_green and not want_world)
-
-    if want_rf_green:
-        r_custom = [[hi, zp] for hi, zp in zip(rf_green_hover, rf_green_z)]
-        fig_reg.add_trace(
-            go.Choroplethmapbox(
-                geojson=geo_rf,
-                locations=rf_green_locations,
-                featureidkey="properties.norm_name",
-                z=rf_green_z_br,
-                zmin=z_geo_min,
-                zmax=z_geo_max,
-                colorscale=_GEO_CHORO_FILL_COLORSCALE,
-                autocolorscale=False,
-                marker_opacity=0.74,
-                showscale=cb_on_rf_green_alone,
-                colorbar=cb_green if cb_on_rf_green_alone else None,
-                customdata=r_custom,
-                hovertemplate=(
-                    "<b>%{customdata[0]}</b><br>Участников: %{customdata[1]}<extra></extra>"
-                ),
-                name="rf_regions_green",
-            )
+    if chor_feats:
+        ch_lat = start_lat if pts else 58.55
+        ch_lon = start_lon if pts else 43.82
+        ch_zoom = int(np.clip(round(start_zoom_i if pts else 3.95), 2, 11))
+        html_choro = _yandex_maps_choropleth_html(
+            api_key,
+            fc_choro,
+            start_lat=ch_lat,
+            start_lon=ch_lon,
+            start_zoom=ch_zoom,
+            map_dom_id="yamap-choro-rf",
+            json_script_id="yamap-choro-rf-data",
         )
-
-    if want_world:
-        w_custom = [[hi, zp] for hi, zp in zip(world_hover, world_z)]
-        fig_reg.add_trace(
-            go.Choroplethmapbox(
-                geojson=geo_world,
-                locations=world_locations,
-                featureidkey="properties.iso_match",
-                z=world_z_br,
-                zmin=z_geo_min,
-                zmax=z_geo_max,
-                colorscale=_GEO_CHORO_FILL_COLORSCALE,
-                autocolorscale=False,
-                marker_opacity=0.74,
-                showscale=True,
-                colorbar=cb_green,
-                customdata=w_custom,
-                hovertemplate=(
-                    "<b>%{customdata[0]}</b><br>Участников: %{customdata[1]}<extra></extra>"
-                ),
-                name="countries",
-            )
-        )
-
-    if want_rf_vo:
-        vo_pts = len(rf_vo_locations)
-        vo_custom = [[hi, zp] for hi, zp in zip(rf_vo_hover, rf_vo_z)]
-        fig_reg.add_trace(
-            go.Choroplethmapbox(
-                geojson=geo_rf,
-                locations=rf_vo_locations,
-                featureidkey="properties.norm_name",
-                z=[1.0] * vo_pts,
-                zmin=0.0,
-                zmax=1.0,
-                colorscale=_VO_RF_BLUE_COLORSCALE,
-                autocolorscale=False,
-                marker_opacity=0.74,
-                showscale=False,
-                customdata=vo_custom,
-                hovertemplate=(
-                    "<b>%{customdata[0]}</b><br>Участников: %{customdata[1]}<extra></extra>"
-                ),
-                name="vologda_oblast",
-            )
-        )
-
-    if len(fig_reg.data) > 0:
-        fig_reg.update_layout(
-            margin=dict(l=0, r=0, t=52, b=0),
-            height=680,
-            mapbox=dict(
-                style="open-street-map",
-                bearing=0,
-                pitch=0,
-                center=dict(lat=map_c["lat"], lon=map_c["lon"]),
-                zoom=map_z,
-            ),
-            showlegend=False,
-        )
-        st.plotly_chart(fig_reg, use_container_width=True)
+        components.html(html_choro, height=720, scrolling=False)
     else:
-        has_layer_file = geo_rf is not None or geo_world is not None
-        has_stats = bool(part_by_norm or part_iso_foreign)
+        has_layer_file = geo_rf_chk is not None or geo_world_chk is not None
+        has_stats = bool(part_by_norm_vm or part_iso_vm)
         if has_layer_file and has_stats:
-            if geo_rf is not None and part_by_norm and (
-                not rf_green_locations and not rf_vo_locations
-            ):
-                st.caption(
-                    "Не удалось сопоставить названия регионов с полигонами карты России "
-                    "(алиасы см. в `config/region_centers.json`)."
-                )
-            if geo_world is not None and part_iso_foreign and not world_locations:
+            if geo_rf_chk is not None and part_by_norm_vm:
+                rf_feats_rf = geo_rf_chk.get("features") if isinstance(geo_rf_chk, dict) else None
+                rf_match = False
+                if feats_rf_list := (rf_feats_rf if isinstance(rf_feats_rf, list) else None):
+                    for f_try in feats_rf_list:
+                        if not isinstance(f_try, dict):
+                            continue
+                        pr_try = f_try.get("properties")
+                        nn_try = ""
+                        if isinstance(pr_try, dict):
+                            nn_try = str(pr_try.get("norm_name") or "")
+                        pv_try = part_by_norm_vm.get(nn_try, 0) if nn_try else 0
+                        if pv_try > 0:
+                            rf_match = True
+                            break
+                if not rf_match:
+                    st.caption(
+                        "Не удалось сопоставить названия регионов из данных с полигонами карты России "
+                        "(алиасы см. в `config/region_centers.json`)."
+                    )
+            if geo_world_chk is not None and part_iso_vm:
                 st.caption(
                     "Не удалось сопоставить страны из данных с контурной картой — дополните словарь "
                     "`COUNTRY_TO_ISO3` в `app.py` или проверьте написание как в Natural Earth."
@@ -2470,6 +3074,40 @@ def _page_vm_geography_body(path: Path, year_val: int | None, sport_val: str | N
             st.caption(
                 "Нет строк по регионам и странам с числом участников больше нуля для выбранных фильтров."
             )
+
+    _section_anchor("yamap-vo-districts")
+    st.subheader("Районы Вологодской области")
+    vo_geo_file = VOLOGDA_DISTRICTS_GEOJSON_FILE.is_file()
+    if not vo_geo_file:
+        st.caption(
+            "Нет локального файла **config/vologda_districts.geojson** — добавьте GeoJSON районов ВО "
+            "(пример источника: [Russia_geojson_OSM](https://github.com/timurkanaz/Russia_geojson_OSM), "
+            "каталог **Regions / SZFO**, файл с названием Вологодской области и суффиксом Vologda region) или свой слой "
+            "с полем **`district`** в свойствах каждого полигона."
+        )
+    else:
+        fc_vo = _yandex_vo_district_feature_collection(geo_vm, path)
+        vo_feats = fc_vo.get("features") if isinstance(fc_vo, dict) else []
+        if isinstance(vo_feats, list) and vo_feats:
+            html_vo = _yandex_maps_choropleth_html(
+                api_key,
+                fc_vo,
+                start_lat=float(default_lat),
+                start_lon=float(default_lon),
+                start_zoom=max(6, min(10, default_zoom)),
+                map_dom_id="yamap-choro-vo",
+                json_script_id="yamap-choro-vo-data",
+            )
+            components.html(html_vo, height=720, scrolling=False)
+            st.caption(
+                "Контуры районов: данные **© OpenStreetMap** ([ODbL](https://www.openstreetmap.org/copyright))."
+            )
+        else:
+            st.caption(
+                "Файл **vologda_districts.geojson** загружен, но в нём нет полигонов с полем `district`."
+            )
+
+    st.caption("Картографические данные © Яндекс")
 
 
 def page_vm_records() -> None:
@@ -5108,6 +5746,93 @@ def page_admin() -> None:
         else:
             st.success("Справочник регионов сохранён (оверлей в city_aliases.json при необходимости).")
             st.rerun()
+
+    _section_anchor("admin-vo-district-aliases")
+    st.subheader("Справочник алиасов: районы Вологодской области")
+    st.caption(
+        "Привязывает подпись **district** в `config/vologda_districts.geojson` к колонке **Район** в "
+        "**norm_city.csv** и задаёт общий **canonical_key** и **Название для UI** для агрегатов и карты. "
+        "При первой инициализации пустой таблицы данные можно подставить из CSV (см. путь ниже) или они "
+        "заполняются автоматически из GeoJSON + эвристика по строкам VO в norm_city."
+    )
+    voda_csv = mq.vo_district_aliases_csv_path()
+    st.markdown("Начальный CSV для импорта в пустую таблицу БД:", unsafe_allow_html=True)
+    st.code(str(voda_csv), language=None)
+    voda_geo_hint = mq.vologda_rayon_geojson_path()
+    st.markdown("Файл полигонов (поле `district`):", unsafe_allow_html=True)
+    st.code(str(voda_geo_hint), language=None)
+    if require_db(path):
+        mq.ensure_vo_district_aliases_schema(path)
+        voda_rows = mq.query_vo_district_aliases_all(path)
+        df_voda = pd.DataFrame(voda_rows)
+        if df_voda.empty:
+            st.warning(
+                "Таблица **vo_district_aliases** пуста после инициализации — добавьте **бд/vo_district_aliases.csv** "
+                "или убедитесь, что на диске есть **vologda_districts.geojson** для автозаполнения."
+            )
+        else:
+            cols_voda = ["id", "geojson_district", "norm_city_rayon", "canonical_key", "ui_label", "active"]
+            for c in cols_voda:
+                if c not in df_voda.columns:
+                    if c == "id":
+                        df_voda[c] = pd.NA
+                    elif c == "active":
+                        df_voda[c] = True
+                    else:
+                        df_voda[c] = ""
+            if "id" in df_voda.columns:
+                df_voda["id"] = pd.to_numeric(df_voda["id"], errors="coerce").astype("Int64")
+            if "active" in df_voda.columns:
+                df_voda["active"] = df_voda["active"].astype(bool)
+            df_voda = df_voda[cols_voda]
+            voda_cc: dict[str, Any] = {
+                "id": st.column_config.NumberColumn(
+                    "id",
+                    help="Пустая ячейка — новая строка.",
+                    min_value=1,
+                    step=1,
+                    format="%d",
+                ),
+                "geojson_district": st.column_config.TextColumn(
+                    "Район (district в GeoJSON)", help="Как в properties.district у полигона."
+                ),
+                "norm_city_rayon": st.column_config.TextColumn(
+                    "Район (norm_city.csv)", help='Колонка «Район» для Вологодской области.'
+                ),
+                "canonical_key": st.column_config.TextColumn(
+                    "Канонический key", help="Общий внутренний ключ агрегации (латиница/подчёркивания удобны)."
+                ),
+                "ui_label": st.column_config.TextColumn("Название для UI"),
+                "active": st.column_config.CheckboxColumn("Активно"),
+            }
+            edited_voda = st.data_editor(
+                df_voda,
+                use_container_width=True,
+                hide_index=True,
+                num_rows="dynamic",
+                key="admin_vo_district_aliases_editor",
+                column_config=voda_cc,
+            )
+            c_va, c_vb = st.columns([1, 3])
+            with c_va:
+                save_voda = st.button("Сохранить районы ВО", key="admin_save_vo_district_aliases", type="primary")
+            with c_vb:
+                st.caption(
+                    "Активная строка должна иметь заполненный canonical_key и UI-название и хотя бы одно поле района. "
+                    "Удалённые из таблицы строки будут удалены из БД при сохранении."
+                )
+            if save_voda:
+                errs_voda = mq.save_vo_district_aliases_admin_rows(
+                    path, edited_voda.to_dict(orient="records")
+                )
+                if errs_voda:
+                    for e in errs_voda[:80]:
+                        st.error(e)
+                    if len(errs_voda) > 80:
+                        st.error(f"… ещё {len(errs_voda) - 80}.")
+                else:
+                    st.success(f"Сохранено строк: **{len(edited_voda)}**.")
+                    st.rerun()
 
     _section_anchor("admin-competitions")
     st.subheader("Таблица competitions")
