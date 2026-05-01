@@ -922,7 +922,7 @@ def inject_vm_styles() -> None:
             background: #e8f2f9 !important;
             border-color: {VM_ACCENT} !important;
         }}
-        /* Кубки — командное: иерархия team → member → события (HTML details) */
+        /* Кубки — иерархии в HTML details (командный зачёт: team → событие → участник) */
         .vm-cup-tree {{
             font-size: 0.92rem;
             border: 1px solid {VM_CARD_BORDER};
@@ -1071,6 +1071,137 @@ def inject_vm_styles() -> None:
         }}
         .vm-cup-tree table.vm-cup-ev td:nth-child(3),
         .vm-cup-tree table.vm-cup-ev td:nth-child(4) {{
+            white-space: nowrap;
+        }}
+        /* Командный зачёт: команда → событие → участник */
+        .vm-cup-tree details.vm-cup-event {{
+            margin-bottom: 10px;
+            border: 1px solid #cfd6de;
+            border-radius: 6px;
+            background: #fff;
+            overflow: hidden;
+            box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+        }}
+        .vm-cup-tree details.vm-cup-event:last-child {{ margin-bottom: 0; }}
+        .vm-cup-tree details.vm-cup-event > summary {{
+            list-style: none;
+            cursor: pointer;
+            display: grid;
+            grid-template-columns: 32px minmax(0,1fr) 88px 72px;
+            gap: 8px;
+            align-items: center;
+            padding: 9px 12px 9px 8px;
+            background: linear-gradient(180deg, #f8fafc 0%, #eef3f9 100%);
+            font-weight: 500;
+            font-size: 0.91rem;
+            border-bottom: 1px solid transparent;
+        }}
+        .vm-cup-tree details.vm-cup-event[open] > summary {{
+            border-bottom-color: #e2e6eb;
+        }}
+        .vm-cup-tree details.vm-cup-event > summary::-webkit-details-marker {{ display: none; }}
+        .vm-cup-tree details.vm-cup-event > summary::marker {{
+            content: "";
+        }}
+        .vm-cup-tree details.vm-cup-event:not([open]) > summary .vm-cup-caret-e::before {{
+            content: "▸";
+            color: {VM_ACCENT};
+            font-weight: 700;
+        }}
+        .vm-cup-tree details.vm-cup-event[open] > summary .vm-cup-caret-e::before {{
+            content: "▾";
+            color: {VM_ACCENT};
+            font-weight: 700;
+        }}
+        .vm-cup-tree details.vm-cup-event > summary:hover {{
+            background: linear-gradient(180deg, #f3f7fb 0%, #e6edf5 100%);
+        }}
+        .vm-cup-tree .vm-cup-event-body {{
+            padding: 8px 10px 10px 12px;
+            background: #fafbfc;
+            border-top: 1px solid #e8eaed;
+        }}
+        .vm-cup-tree details.vm-cup-ts-participant {{
+            margin-bottom: 8px;
+            border: 1px solid #e0e3e8;
+            border-radius: 5px;
+            overflow: hidden;
+            background: #fff;
+        }}
+        .vm-cup-tree details.vm-cup-ts-participant:last-child {{
+            margin-bottom: 0;
+        }}
+        .vm-cup-tree details.vm-cup-ts-participant > summary {{
+            list-style: none;
+            cursor: pointer;
+            display: grid;
+            grid-template-columns: minmax(0,1fr) 76px auto;
+            gap: 8px;
+            align-items: center;
+            padding: 8px 12px;
+            font-size: 0.88rem;
+        }}
+        .vm-cup-tree details.vm-cup-ts-participant.vm-cup-ts-top5 > summary {{
+            background: linear-gradient(90deg, #d4efda 0%, #dbf0e3 40%, #e8f5eb 100%) !important;
+            border-left: 4px solid #28a745;
+            font-weight: 500;
+        }}
+        .vm-cup-tree details.vm-cup-ts-participant:not(.vm-cup-ts-top5) > summary {{
+            background: #fff;
+            border-left: 4px solid #dee2e6;
+        }}
+        .vm-cup-tree details.vm-cup-ts-participant > summary::-webkit-details-marker {{ display: none; }}
+        .vm-cup-tree details.vm-cup-ts-participant > summary::marker {{
+            content: "";
+        }}
+        .vm-cup-tree details.vm-cup-ts-participant:not([open]) > summary .vm-cup-caret-m::before {{
+            content: "▸";
+            color: {VM_ACCENT};
+            font-weight: 700;
+            flex-shrink: 0;
+        }}
+        .vm-cup-tree details.vm-cup-ts-participant[open] > summary .vm-cup-caret-m::before {{
+            content: "▾";
+            color: {VM_ACCENT};
+            font-weight: 700;
+            flex-shrink: 0;
+        }}
+        .vm-cup-tree details.vm-cup-ts-participant > summary:hover {{
+            filter: brightness(0.985);
+        }}
+        .vm-cup-tree table.vm-cup-ts {{
+            width: calc(100% - 12px);
+            margin: 0 6px 8px 6px;
+            border-collapse: separate;
+            border-spacing: 0;
+            font-size: 0.83rem;
+            border-radius: 4px;
+            overflow: hidden;
+            border: 1px solid #dce0e5;
+        }}
+        .vm-cup-tree table.vm-cup-ts th {{
+            background: #e9edf2;
+            color: #2c3e50;
+            font-weight: 600;
+            text-align: left;
+            padding: 7px 10px;
+            border-bottom: 1px solid #dce0e5;
+        }}
+        .vm-cup-tree table.vm-cup-ts td {{
+            padding: 7px 10px;
+            border-bottom: 1px solid #eef0f2;
+            vertical-align: top;
+        }}
+        .vm-cup-tree table.vm-cup-ts tbody tr {{
+            background: #fff;
+        }}
+        .vm-cup-tree details.vm-cup-ts-participant.vm-cup-ts-top5 table.vm-cup-ts tbody tr {{
+            background: #f3faf5;
+        }}
+        .vm-cup-tree table.vm-cup-ts td:nth-last-child(-n+2),
+        .vm-cup-tree table.vm-cup-ts td:nth-child(2),
+        .vm-cup-tree table.vm-cup-ts td:nth-child(3) {{
+            font-variant-numeric: tabular-nums;
             white-space: nowrap;
         }}
         </style>
@@ -4006,6 +4137,30 @@ def _excel_download_button_png_or_fallback(
     )
 
 
+def _team_scoring_stage_rows_mark_event_top5(stage_rows: list[dict[str, Any]]) -> None:
+    """Помечает строки, вошедшие в топ‑5 результатов команды на этом competition_id (в зачёт события)."""
+    from collections import defaultdict
+
+    by_team_ev: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
+    for r in stage_rows:
+        tn = str(r.get("команда") or "").strip()
+        cid = r.get("competition_id")
+        if not tn or cid is None:
+            continue
+        by_team_ev[(tn, int(cid))].append(r)
+    for lst in by_team_ev.values():
+        lst.sort(
+            key=lambda x: (
+                -int(x.get("очков_в_командный") or 0),
+                int(x.get("profile_id") or 0),
+            )
+        )
+        top_pids = {int(x.get("profile_id") or 0) for x in lst[:5]}
+        for r in lst:
+            pid = int(r.get("profile_id") or 0)
+            r["в_топ5_события"] = "да" if pid in top_pids else ""
+
+
 def _cup_team_flat_excel_team_scoring_v1(
     cup_title: str,
     cup_id: int,
@@ -4056,13 +4211,17 @@ def _cup_team_flat_excel_team_scoring_v1(
                     "Наименование кубка": cup_title,
                     "Место команды": tpl,
                     "Команда": team_name,
-                    "Очки команды (топ‑5, итог)": tpts,
+                    "Очки команды (сумма по событиям)": tpts,
                     "Место участника в команде": rk,
-                    "В топ‑5 участников команды": "Да" if rk <= 5 else "Нет",
+                    "В топ‑5 хотя бы одного события": "Да"
+                    if int(mr.get("очков_7из8") or 0) > 0
+                    else "Нет",
                     "profile_id": mr.get("profile_id"),
                     "Участник": mr.get("участник"),
-                    "Очки 7 из 8 этапов": mr.get("очков_7из8"),
-                    "Очки по всем этапам": mr.get("очков_всего"),
+                    "Очки в командный (топ‑5 на событиях)": mr.get("очков_7из8"),
+                    "Сумма очков по всем событиям (все результаты)": mr.get(
+                        "очков_всего"
+                    ),
                     "Этапы (JSON)": scj if scj is not None else "",
                 }
             )
@@ -4097,8 +4256,11 @@ def _cup_team_stage_rows_excel_team_scoring_v1(
         ua = str(sr.get("участник") or "")
         return (tm, ua, st)
 
+    stage_wrk = [dict(x) for x in stage_rows]
+    _team_scoring_stage_rows_mark_event_top5(stage_wrk)
+
     out_rows: list[dict[str, Any]] = []
-    for sr in sorted(stage_rows, key=_stage_sort_key):
+    for sr in sorted(stage_wrk, key=_stage_sort_key):
         tn = str(sr.get("команда") or "").strip()
         bonus_txt = str(sr.get("комментарий") or "").strip()
         ev = sr.get("событие")
@@ -4118,7 +4280,10 @@ def _cup_team_stage_rows_excel_team_scoring_v1(
                 "Очки базовые": sr.get("очков_база"),
                 "Очки бонус": sr.get("очков_бонус"),
                 "Очков в командный зачёт": sr.get("очков_в_командный"),
+                "В топ‑5 этого события": sr.get("в_топ5_события") or "",
                 "Комментарий (бонус 50+)": bonus_txt,
+                "Дистанция": sr.get("дистанция"),
+                "Время": sr.get("время"),
             }
         )
     if not out_rows:
@@ -4138,7 +4303,10 @@ def _cup_team_stage_rows_excel_team_scoring_v1(
                 "Очки базовые",
                 "Очки бонус",
                 "Очков в командный зачёт",
+                "В топ‑5 этого события",
                 "Комментарий (бонус 50+)",
+                "Дистанция",
+                "Время",
             ]
         )
     return pd.DataFrame(out_rows)
@@ -4363,6 +4531,316 @@ def _cup_team_hierarchy_html(
     return "".join(parts)
 
 
+def _individual_finish_lines_points_table(
+    db_path: Path,
+    profile_id: int,
+    cup_id: int,
+    year: int,
+    lines: list[dict[str, Any]],
+    stage_ix_map: dict[int, int] | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    """По финишам (или запасному списку) — строки этап/дистанция/событие/место/очки и сумма для сводки."""
+    enriched: list[dict[str, Any]] = []
+    for ln in lines:
+        el = dict(ln)
+        if el.get("competition_id") is None:
+            cix = mq.parse_profile_cup_raw_competition_id(el.get("raw"))
+            if cix is not None:
+                el["competition_id"] = cix
+        enriched.append(el)
+    pts_by_cid = mq.map_profile_cup_points_by_competition_id(
+        db_path, profile_id, cup_id, year
+    )
+    pts_by_td = mq.map_profile_cup_points_by_title_distance(
+        db_path, profile_id, cup_id, year
+    )
+    assign_pts = (
+        mq.assign_profile_cup_points_to_result_lines(
+            db_path, profile_id, cup_id, year, enriched
+        )
+        if enriched and all(el.get("competition_id") is not None for el in enriched)
+        else None
+    )
+    ix = stage_ix_map if stage_ix_map is not None else mq.load_stage_index_map()
+    inner: list[dict[str, Any]] = []
+    total_pts = 0
+    for i, line in enumerate(enriched):
+        el = dict(line)
+        ev = (el.get("событие") or "").strip()
+        if not ev:
+            ev = mq.parse_profile_cup_raw_event_title(el.get("raw"))
+        if not ev:
+            ev = "—"
+        pts = _cup_row_points_int(el.get("очков"))
+        if (
+            pts is None
+            and assign_pts is not None
+            and i < len(assign_pts)
+            and assign_pts[i] is not None
+        ):
+            pts = assign_pts[i]
+        if pts is None:
+            pts = _cup_resolve_team_event_points(el, pts_by_cid, pts_by_td)
+        place = el.get("место_абс")
+        place_s = str(place).strip() if place is not None and str(place).strip() != "" else "—"
+        dist = (el.get("дистанция") or "").strip() or "—"
+        stage_disp = "—"
+        cid_ev = el.get("competition_id")
+        if cid_ev is not None and ix:
+            try:
+                cix_ev = int(cid_ev)
+                if cix_ev in ix:
+                    stage_disp = str(ix[cix_ev])
+            except (TypeError, ValueError):
+                pass
+        pts_disp = str(pts) if pts is not None else "—"
+        ftime = str(el.get("время") or "").strip() or "—"
+        inner.append(
+            {
+                "этап": stage_disp,
+                "дистанция": dist,
+                "событие": ev,
+                "место_абс": place_s,
+                "время": ftime,
+                "очки": pts_disp,
+                "_pts_int": int(pts) if pts is not None else None,
+            }
+        )
+        if pts is not None:
+            total_pts += int(pts)
+    return inner, total_pts
+
+
+def _cup_individual_championship_hierarchy_html(
+    db_path: Path,
+    cup_id: int,
+    year: int,
+    filtered_detail_rows: list[dict[str, Any]],
+) -> str:
+    """Личное первенство: участник → сумма очков; разбивка по всем финишам в событиях кубка (results), без привязки к команде."""
+    from collections import defaultdict
+
+    pcr_by_pid: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    names: dict[int, str] = {}
+    for row in filtered_detail_rows:
+        pid_raw = row.get("profile_id")
+        if pid_raw is None:
+            continue
+        try:
+            pid = int(pid_raw)
+        except (TypeError, ValueError):
+            continue
+        nm = str(row.get("участник") or "").strip()
+        if nm:
+            names[pid] = nm
+        pcr_by_pid[pid].append(row)
+
+    st_ix = mq.load_stage_index_map()
+    agg: list[tuple[int, str, int, list[dict[str, Any]]]] = []
+    for pid, p_rows in pcr_by_pid.items():
+        name = names.get(pid) or (str(p_rows[0].get("участник") or "").strip() if p_rows else "") or f"id {pid}"
+
+        finish_lines = mq.query_profile_cup_finishes_for_participant(db_path, pid, cup_id, year)
+        if finish_lines:
+            inner_raw, total = _individual_finish_lines_points_table(
+                db_path, pid, cup_id, year, finish_lines, stage_ix_map=st_ix
+            )
+        else:
+            pcr_member = mq.query_profile_cup_results_lines_for_member(db_path, pid, cup_id, year)
+            if not pcr_member and p_rows:
+                pcr_member = []
+                for r in p_rows:
+                    cid = mq.parse_profile_cup_raw_competition_id(r.get("raw"))
+                    pcr_member.append(
+                        {
+                            "событие": (
+                                str(r.get("событие") or "").strip()
+                                or mq.parse_profile_cup_raw_event_title(r.get("raw"))
+                                or "—"
+                            ),
+                            "дистанция": str(r.get("дистанция") or "").strip(),
+                            "место_абс": (
+                                r.get("cup_place_abs")
+                                if r.get("cup_place_abs") is not None
+                                else r.get("pcr_place_abs")
+                            ),
+                            "очков": r.get("очков"),
+                            "время": "",
+                            "raw": r.get("raw"),
+                            "competition_id": cid,
+                        }
+                    )
+            inner_raw, total = (
+                _individual_finish_lines_points_table(
+                    db_path, pid, cup_id, year, pcr_member, stage_ix_map=st_ix
+                )
+                if pcr_member
+                else ([], 0)
+            )
+        inner_disp = [{k: v for k, v in ir.items() if k != "_pts_int"} for ir in inner_raw]
+        agg.append((pid, name, total, inner_disp))
+    agg.sort(key=lambda x: (-x[2], x[1].casefold()))
+    leader_pts = int(agg[0][2]) if agg else 0
+    parts: list[str] = [
+        """<div class="vm-cup-tree" role="tree">
+<div class="vm-cup-head"><span>Место</span><span>Участник</span><span>Очки</span><span>Отставание</span></div>
+"""
+    ]
+    for rank, (_pid, name, total_pts, inner_rows) in enumerate(agg, start=1):
+        gap_v = max(0, leader_pts - int(total_pts))
+        parts.append(
+            f'<details class="vm-cup-team"><summary>'
+            f'<span class="vm-cup-rank-cell"><span class="vm-cup-caret-t" aria-hidden="true"></span>'
+            f"{_esc_html(rank)}</span>"
+            f"<span>{_esc_html(name)}</span>"
+            f'<span style="text-align:right;font-variant-numeric:tabular-nums;">{_esc_html(total_pts)}</span>'
+            f'<span style="text-align:right;font-variant-numeric:tabular-nums;">{_esc_html(gap_v)}</span>'
+            f"</summary><div class='vm-cup-team-body'>"
+        )
+        parts.append("<table class='vm-cup-ev'><thead><tr>")
+        for h in ("Этап", "Дистанция", "Событие", "Место абсолют", "Время", "Очки"):
+            parts.append(f"<th>{_esc_html(h)}</th>")
+        parts.append("</tr></thead><tbody>")
+        for ir in inner_rows:
+            parts.append(
+                "<tr>"
+                f"<td>{_esc_html(ir.get('этап'))}</td>"
+                f"<td>{_esc_html(ir.get('дистанция'))}</td>"
+                f"<td>{_esc_html(ir.get('событие'))}</td>"
+                f"<td>{_esc_html(ir.get('место_абс'))}</td>"
+                f"<td>{_esc_html(ir.get('время'))}</td>"
+                f"<td>{_esc_html(ir.get('очки'))}</td>"
+                "</tr>"
+            )
+        parts.append("</tbody></table></div></details>")
+    parts.append("</div>")
+    return "".join(parts)
+
+
+def _cup_individual_base_scoring_hierarchy_html(
+    db_path: Path,
+    cup_id: int,
+    year: int,
+    filtered_detail_rows: list[dict[str, Any]],
+    display_limit: int,
+) -> tuple[str, int, int]:
+    """
+    Личное первенство: сумма базовых очков (как в командном зачёте, без бонуса 50+),
+    сортировка по убыванию. display_limit — максимум участников в разметке.
+    Возвращает (html, показано, всего по фильтру).
+    """
+    from collections import defaultdict
+
+    pcr_by_pid: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    names: dict[int, str] = {}
+    for row in filtered_detail_rows:
+        pid_raw = row.get("profile_id")
+        if pid_raw is None:
+            continue
+        try:
+            pid = int(pid_raw)
+        except (TypeError, ValueError):
+            continue
+        nm = str(row.get("участник") or "").strip()
+        if nm:
+            names[pid] = nm
+        pcr_by_pid[pid].append(row)
+
+    by_pid_stages = mq.compute_individual_cup_base_rows_by_participant(
+        db_path, cup_id, year
+    )
+    agg: list[tuple[int, str, int, list[dict[str, Any]]]] = []
+    for pid, p_rows in pcr_by_pid.items():
+        name = (
+            names.get(pid)
+            or (str(p_rows[0].get("участник") or "").strip() if p_rows else "")
+            or f"id {pid}"
+        )
+        rows = by_pid_stages.get(pid, [])
+        total = int(sum(int(r.get("очков_база") or 0) for r in rows))
+        inner_disp: list[dict[str, Any]] = []
+        for r in rows:
+            pa = r.get("место_абс")
+            try:
+                pai = int(pa) if pa is not None else 0
+            except (TypeError, ValueError):
+                pai = 0
+            place_s = str(pai) if pai > 0 else "—"
+            inner_disp.append(
+                {
+                    "этап": str(r.get("этап") or "—"),
+                    "дистанция": str(r.get("дистанция") or "—"),
+                    "событие": str(r.get("событие") or "—"),
+                    "место_абс": place_s,
+                    "время": str(r.get("время") or "—").strip() or "—",
+                    "очки": str(int(r.get("очков_база") or 0)),
+                }
+            )
+        agg.append((pid, name, total, inner_disp))
+
+    agg.sort(key=lambda x: (-x[2], x[1].casefold()))
+    total_filtered = len(agg)
+    lim = max(0, int(display_limit))
+    agg_slice = agg[:lim] if lim else agg
+
+    if not agg_slice:
+        empty_msg = (
+            "<p>Нет участников по фильтру.</p>"
+            if total_filtered == 0
+            else "<p>Нет данных для отображения.</p>"
+        )
+        return (empty_msg, 0, total_filtered)
+
+    leader_pts = int(agg_slice[0][2])
+    parts: list[str] = [
+        """<div class="vm-cup-tree" role="tree">
+<div class="vm-cup-head"><span>Место</span><span>Участник</span><span>Очки</span><span>Отставание</span></div>
+"""
+    ]
+    for rank, (_pid, name, total_pts, inner_rows) in enumerate(agg_slice, start=1):
+        gap_v = max(0, leader_pts - int(total_pts))
+        parts.append(
+            f'<details class="vm-cup-team"><summary>'
+            f'<span class="vm-cup-rank-cell"><span class="vm-cup-caret-t" aria-hidden="true"></span>'
+            f"{_esc_html(rank)}</span>"
+            f"<span>{_esc_html(name)}</span>"
+            f'<span style="text-align:right;font-variant-numeric:tabular-nums;">{_esc_html(total_pts)}</span>'
+            f'<span style="text-align:right;font-variant-numeric:tabular-nums;">{_esc_html(gap_v)}</span>'
+            f"</summary><div class='vm-cup-team-body'>"
+        )
+        parts.append("<table class='vm-cup-ev'><thead><tr>")
+        for h in (
+            "Этап",
+            "Дистанция",
+            "Событие",
+            "Место, абсолют",
+            "Время",
+            "Очки (база)",
+        ):
+            parts.append(f"<th>{_esc_html(h)}</th>")
+        parts.append("</tr></thead><tbody>")
+        for ir in inner_rows:
+            parts.append(
+                "<tr>"
+                f"<td>{_esc_html(ir.get('этап'))}</td>"
+                f"<td>{_esc_html(ir.get('дистанция'))}</td>"
+                f"<td>{_esc_html(ir.get('событие'))}</td>"
+                f"<td>{_esc_html(ir.get('место_абс'))}</td>"
+                f"<td>{_esc_html(ir.get('время'))}</td>"
+                f"<td>{_esc_html(ir.get('очки'))}</td>"
+                "</tr>"
+            )
+        if not inner_rows:
+            parts.append(
+                "<tr><td colspan=\"6\">"
+                "<em>Нет зачётных этапов по правилам базовых очков</em>"
+                "</td></tr>"
+            )
+        parts.append("</tbody></table></div></details>")
+    parts.append("</div>")
+    return ("".join(parts), len(agg_slice), total_filtered)
+
+
 def _event_records_hierarchy_html(rows: list[dict[str, Any]]) -> str:
     """Иерархия для раздела «Рекорды события»: событие -> дистанция -> топ-5 м/ж."""
     from collections import defaultdict
@@ -4431,92 +4909,137 @@ def _event_records_hierarchy_html(rows: list[dict[str, Any]]) -> str:
 
 def _team_scoring_hierarchy_html(
     teams_rows: list[dict[str, Any]],
-    members_rows: list[dict[str, Any]],
+    _members_rows: list[dict[str, Any]],
     stage_rows: list[dict[str, Any]],
 ) -> str:
-    """Иерархия командного зачёта: команда -> участник -> этапы (расчётные очки)."""
+    """Иерархия командного зачёта: команда → событие → участник (детализация очков)."""
     from collections import defaultdict
 
-    by_team_members: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for r in members_rows:
+    stage_rows = [dict(x) for x in stage_rows]
+    _team_scoring_stage_rows_mark_event_top5(stage_rows)
+
+    by_team_comp: dict[str, dict[int, list[dict[str, Any]]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for r in stage_rows:
         team = str(r.get("команда") or "").strip()
         if not team:
             continue
-        by_team_members[team].append(r)
-
-    by_team_member_stages: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
-    for r in stage_rows:
-        team = str(r.get("команда") or "").strip()
-        pid = r.get("profile_id")
+        cid = r.get("competition_id")
+        if cid is None:
+            continue
         try:
-            pid_i = int(pid)
+            ci = int(cid)
         except (TypeError, ValueError):
             continue
-        by_team_member_stages[(team, pid_i)].append(r)
+        by_team_comp[team][ci].append(r)
 
     parts: list[str] = [
         """<div class="vm-cup-tree" role="tree">
-<div class="vm-cup-head"><span>Место</span><span>Команда</span><span>Очки</span><span>Участников</span></div>
+<div class="vm-cup-head"><span>Место</span><span>Команда</span><span>Очки</span><span>Событий</span></div>
 """
     ]
     for rank, team_row in enumerate(teams_rows, start=1):
         team = str(team_row.get("команда") or "").strip()
         team_pts = int(team_row.get("очков") or 0)
-        mems = by_team_members.get(team, [])
-        mems_sorted = sorted(mems, key=lambda x: int(x.get("очков_7из8") or 0), reverse=True)
-        team_points_all_members = int(
-            sum(int(x.get("очков_7из8") or 0) for x in mems_sorted)
-        )
+        ev_map = by_team_comp.get(team, {})
+        n_events = len(ev_map)
         parts.append(
             f'<details class="vm-cup-team"><summary>'
             f'<span class="vm-cup-rank-cell"><span class="vm-cup-caret-t" aria-hidden="true"></span>{_esc_html(rank)}</span>'
             f"<span>{_esc_html(team)}</span>"
             f'<span style="text-align:right;font-variant-numeric:tabular-nums;">{_esc_html(team_pts)}</span>'
-            f'<span style="text-align:right;font-variant-numeric:tabular-nums;">{_esc_html(len(mems_sorted))}</span>'
+            f'<span style="text-align:right;font-variant-numeric:tabular-nums;">{_esc_html(n_events)}</span>'
             f"</summary><div class='vm-cup-team-body'>"
         )
-        for i, m in enumerate(mems_sorted, start=1):
-            pid = int(m.get("profile_id") or 0)
-            name = str(m.get("участник") or f"id {pid}")
-            pts_best7 = int(m.get("очков_7из8") or 0)
-            share = (
-                round((100.0 * pts_best7 / team_points_all_members), 1)
-                if team_points_all_members > 0
-                else 0.0
+        if not ev_map:
+            parts.append("<p style='margin:0;padding:4px 0;color:#666;font-size:0.88rem;'>Нет строк этапов.</p>")
+            parts.append("</div></details>")
+            continue
+
+        event_items: list[tuple[int, int, str, list[dict[str, Any]], int, int]] = []
+        for cid, lst in ev_map.items():
+            mn_st = min(int(x.get("этап") or 0) for x in lst)
+            title = str(lst[0].get("событие") or "").strip() or f"Событие #{cid}"
+            sorted_for_top5 = sorted(
+                lst,
+                key=lambda x: (
+                    -int(x.get("очков_в_командный") or 0),
+                    int(x.get("profile_id") or 0),
+                ),
             )
-            in_counted = i <= 5
-            badge = (
-                '<span class="vm-cup-badge">в зачёт</span>'
-                if in_counted
-                else '<span class="vm-cup-badge vm-cup-badge-muted">вне топ‑5</span>'
+            top5_sum = sum(
+                int(x.get("очков_в_командный") or 0) for x in sorted_for_top5[:5]
             )
-            row_style = "background:#eaf7ea;" if in_counted else ""
+            event_items.append((mn_st, cid, title, lst, top5_sum, len(lst)))
+        event_items.sort(key=lambda x: (x[0], x[1], x[2].casefold()))
+
+        for _mn_st, cid, title, lst, evt_top5_sum, n_part in event_items:
+            sorted_participants = sorted(
+                lst,
+                key=lambda x: (
+                    -int(x.get("очков_в_командный") or 0),
+                    int(x.get("profile_id") or 0),
+                ),
+            )
             parts.append(
-                f"<details class='vm-cup-member' style='{row_style}'><summary>"
-                f'<span class="vm-cup-name-cell"><span class="vm-cup-caret-m" aria-hidden="true"></span>{_esc_html(name)}</span>'
-                f'<span style="text-align:right;font-variant-numeric:tabular-nums;">{_esc_html(pts_best7)}</span>'
-                f'<span class="vm-cup-share">{_esc_html(share)}%</span>'
-                f"{badge}</summary>"
+                "<details class='vm-cup-event'><summary>"
+                f'<span class="vm-cup-rank-cell"><span class="vm-cup-caret-e" aria-hidden="true"></span></span>'
+                f"<span>{_esc_html(title)}</span>"
+                f'<span style="text-align:right;font-variant-numeric:tabular-nums;">{_esc_html(evt_top5_sum)}</span>'
+                f'<span style="text-align:right;font-variant-numeric:tabular-nums;">{_esc_html(n_part)}</span>'
+                "</summary>"
+                "<div class='vm-cup-event-body'>"
             )
-            stg = by_team_member_stages.get((team, pid), [])
-            stg_sorted = sorted(stg, key=lambda x: int(x.get("этап") or 0))
-            parts.append("<table class='vm-cup-ev'><thead><tr>")
-            for h in ("Этап", "Событие", "Место, абсолют", "Очки (база)", "Бонус", "Очки (зачёт)", "Комментарий"):
-                parts.append(f"<th>{_esc_html(h)}</th>")
-            parts.append("</tr></thead><tbody>")
-            for s in stg_sorted:
+            for i, s in enumerate(sorted_participants):
+                pid = int(s.get("profile_id") or 0)
+                name = str(s.get("участник") or f"id {pid}")
+                pts_z = int(s.get("очков_в_командный") or 0)
+                is_top5 = i < 5
+                p_cls = (
+                    "vm-cup-ts-participant vm-cup-ts-top5"
+                    if is_top5
+                    else "vm-cup-ts-participant vm-cup-ts-flat"
+                )
+                badge = (
+                    '<span class="vm-cup-badge">топ‑5 события</span>'
+                    if is_top5
+                    else '<span class="vm-cup-badge vm-cup-badge-muted">вне топ‑5</span>'
+                )
+                parts.append(
+                    f"<details class='{p_cls}'><summary>"
+                    f'<span class="vm-cup-name-cell"><span class="vm-cup-caret-m" aria-hidden="true"></span>'
+                    f"{_esc_html(name)}</span>"
+                    f'<span style="text-align:right;font-variant-numeric:tabular-nums;">{_esc_html(pts_z)}</span>'
+                    f"{badge}</summary>"
+                )
+                parts.append("<table class='vm-cup-ts'><thead><tr>")
+                for h in (
+                    "Этап",
+                    "Место, абсолют",
+                    "Очки (база)",
+                    "Бонус",
+                    "Очки (зачёт)",
+                    "Комментарий",
+                    "Дистанция",
+                    "Время",
+                ):
+                    parts.append(f"<th>{_esc_html(h)}</th>")
+                parts.append("</tr></thead><tbody>")
                 parts.append(
                     "<tr>"
                     f"<td>{_esc_html(s.get('этап'))}</td>"
-                    f"<td>{_esc_html(s.get('событие'))}</td>"
                     f"<td>{_esc_html(s.get('место_абс'))}</td>"
                     f"<td>{_esc_html(s.get('очков_база'))}</td>"
                     f"<td>{_esc_html(s.get('очков_бонус'))}</td>"
                     f"<td>{_esc_html(s.get('очков_в_командный'))}</td>"
                     f"<td>{_esc_html(s.get('комментарий'))}</td>"
+                    f"<td>{_esc_html(s.get('дистанция'))}</td>"
+                    f"<td>{_esc_html(s.get('время'))}</td>"
                     "</tr>"
                 )
-            parts.append("</tbody></table></details>")
+                parts.append("</tbody></table></details>")
+            parts.append("</div></details>")
         parts.append("</div></details>")
     parts.append("</div>")
     return "".join(parts)
@@ -5395,31 +5918,62 @@ def page_cups() -> None:
                     help="Берётся из JSON profile_cup_results.raw → group (name или age_from–age_to).",
                 )
             filtered = _filter_cup_detail_rows(detail, sn, gmode, age_sel)
-            st.caption(
-                f"Показано строк: **{len(filtered)}** из {len(detail)}."
+            n_participants = len(
+                {
+                    int(r["profile_id"])
+                    for r in filtered
+                    if r.get("profile_id") is not None
+                    and str(r.get("profile_id")).strip() != ""
+                }
             )
-            hide = (
-                "last_name",
-                "gender",
-                "raw",
-                "pcr_place_abs",
-                "cup_place_abs",
-                "cup_place_gender",
-                "cup_place_group",
-            )
-            view: list[dict] = []
-            for row in filtered:
-                place = mq.cup_detail_resolve_display_place(row, gmode, age_sel)
-                pub = {k: v for k, v in row.items() if k not in hide}
-                pub["место"] = place
-                ov = pub.get("очков")
-                try:
-                    pub["очки"] = int(round(float(ov))) if ov is not None else None
-                except (TypeError, ValueError):
-                    pub["очки"] = None
-                pub.pop("очков", None)
-                view.append(pub)
-            st.dataframe(pd.DataFrame(view), use_container_width=True, hide_index=True)
+            lim_key = f"cups_indiv_limit_{year}_{cup_id}"
+            if mq.is_team_scoring_enabled(cup_id, year):
+                if lim_key not in st.session_state:
+                    st.session_state[lim_key] = 100
+                lim = int(st.session_state[lim_key])
+                st.caption(
+                    f"Участников в списке: **{n_participants}** (есть хотя бы одна строка **profile_cup_results** под фильтры; всего строк PCR: "
+                    f"**{len(filtered)}** из **{len(detail)}**). **Очки** — **базовые**, как колонка **Очки (база)** на вкладке «Командный зачёт» "
+                    "(этап, дистанция, место: **место в зачёте пола**, если есть, иначе **место абсолют**), **без** бонуса +15 за группу 50+ и без усечения по потолку 1-го места. "
+                    "На каждый этап — один лучший финиш участника по величине базовых очков. Сортировка по **убыванию** суммы базовых очков."
+                )
+                with st.spinner("Загрузка…"):
+                    frag_ind, n_shown, n_total = _cup_individual_base_scoring_hierarchy_html(
+                        path, cup_id, year, filtered, lim
+                    )
+                if hasattr(st, "html"):
+                    st.html(frag_ind)
+                else:
+                    st.markdown(frag_ind, unsafe_allow_html=True)
+                if n_total > 0:
+                    if n_shown < n_total:
+                        st.caption(
+                            f"Отображено **{n_shown}** участников из **{n_total}** (по фильтру)."
+                        )
+                        if st.button(
+                            "Загрузить еще 50 участников",
+                            key=f"cups_ind_more_{year}_{cup_id}",
+                            use_container_width=True,
+                        ):
+                            st.session_state[lim_key] = lim + 50
+                            st.rerun()
+                    else:
+                        st.caption(f"Показаны все **{n_total}** участников по фильтру.")
+            else:
+                st.caption(
+                    f"Участников в списке: **{n_participants}** (есть хотя бы одна строка **profile_cup_results** под фильтры; всего строк PCR: "
+                    f"**{len(filtered)}** из **{len(detail)}**). **Очки** в строке участника — сумма по **непустым** очкам во вложенной таблице. "
+                    f"При раскрытии строки показываются **все финиши этого участника** в событиях кубка за год (**results** через **cup_competitions**) "
+                    f"или, если финишей нет, строки PCR; столбцы: **Этап** (дистанция), **Событие**, **Место абсолют**, **Очки** — разрешение очков как на вкладке «Командный зачёт»."
+                )
+                with st.spinner("Загрузка…"):
+                    frag_ind = _cup_individual_championship_hierarchy_html(
+                        path, cup_id, year, filtered
+                    )
+                if hasattr(st, "html"):
+                    st.html(frag_ind)
+                else:
+                    st.markdown(frag_ind, unsafe_allow_html=True)
 
     with tab_team:
         if int(cup_id) == 54 and int(year) == 2026:
@@ -5427,9 +5981,10 @@ def page_cups() -> None:
                 "Логика расчёта: очки по месту в абсолюте в разрезе пола зависят от этапа и дистанции. "
                 "Этапы 1–6: 7+ км (600/598/596..., с 7 места шаг -1), 5–6 км (598/596/..., с 6 места шаг -1). "
                 "Этапы 7–8: 10–21 км (602/600/599..., далее шаг -1), 5 км (598/596/..., с 6 места шаг -1), "
-                "на 2–3 км очки не начисляются. Для 50+ добавляется +15 очков в командный зачёт, "
-                "но итог за этап не выше очков 1 места. Участнику в зачёт идёт 7 из 8 лучших этапов, "
-                "команде — сумма 5 лучших участников."
+                "на 2–3 км очки не начисляются. Для 50+ добавляется +15 очков в зачёт результата, "
+                "но итог за результат не выше очков 1 места. По **каждому событию** (соревнованию) в счёт команды "
+                "идут **пять лучших результатов** участников этой команды на этом событии; **итог команды** — "
+                "сумма таких взносов по всем учитываемым событиям года."
             )
             stage_map = mq.load_stage_index_map()
             rec = mq.compute_team_scoring_for_cup_year(

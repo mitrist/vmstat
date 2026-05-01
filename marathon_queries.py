@@ -1711,7 +1711,7 @@ def ensure_team_scoring_schema(db_path: Path | str | None = None) -> None:
                 first_place_cap INTEGER NOT NULL,
                 source_result_id INTEGER,
                 computed_at TEXT,
-                UNIQUE(rule_version, cup_id, year, stage_index, profile_id)
+                UNIQUE(rule_version, cup_id, year, competition_id, profile_id)
             );
             CREATE TABLE IF NOT EXISTS team_scoring_member_totals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1740,6 +1740,71 @@ def ensure_team_scoring_schema(db_path: Path | str | None = None) -> None:
             """
         )
         c.commit()
+        _migrate_team_scoring_stage_points_unique_on_connection(c)
+
+
+def _migrate_team_scoring_stage_points_unique_on_connection(
+    conn: sqlite3.Connection,
+) -> None:
+    """
+    Переход UNIQUE (stage_index, profile_id) → (competition_id, profile_id):
+    пересоздание таблицы team_scoring_stage_points при необходимости.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='team_scoring_stage_points'"
+    ).fetchone()
+    if not row or not row[0]:
+        return
+    sql = row[0].replace("\n", " ")
+    if "UNIQUE(rule_version, cup_id, year, competition_id, profile_id)" in sql.replace(
+        " ", ""
+    ):
+        return
+    if "UNIQUE(rule_version, cup_id, year, stage_index, profile_id)" not in sql.replace(
+        " ", ""
+    ):
+        return
+    conn.executescript(
+        """
+        CREATE TABLE team_scoring_stage_points__new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rule_version TEXT NOT NULL,
+            cup_id INTEGER NOT NULL,
+            year INTEGER NOT NULL,
+            stage_index INTEGER NOT NULL,
+            competition_id INTEGER NOT NULL,
+            profile_id INTEGER NOT NULL,
+            team_name TEXT NOT NULL,
+            gender TEXT,
+            age INTEGER,
+            distance_id INTEGER,
+            distance_km REAL,
+            place_abs INTEGER,
+            base_points INTEGER NOT NULL,
+            bonus_points INTEGER NOT NULL,
+            points_for_team INTEGER NOT NULL,
+            first_place_cap INTEGER NOT NULL,
+            source_result_id INTEGER,
+            computed_at TEXT,
+            UNIQUE(rule_version, cup_id, year, competition_id, profile_id)
+        );
+        INSERT OR IGNORE INTO team_scoring_stage_points__new (
+            rule_version, cup_id, year, stage_index, competition_id, profile_id,
+            team_name, gender, age, distance_id, distance_km, place_abs,
+            base_points, bonus_points, points_for_team, first_place_cap,
+            source_result_id, computed_at
+        )
+        SELECT
+            rule_version, cup_id, year, stage_index, competition_id, profile_id,
+            team_name, gender, age, distance_id, distance_km, place_abs,
+            base_points, bonus_points, points_for_team, first_place_cap,
+            source_result_id, computed_at
+        FROM team_scoring_stage_points;
+        DROP TABLE team_scoring_stage_points;
+        ALTER TABLE team_scoring_stage_points__new RENAME TO team_scoring_stage_points;
+        """
+    )
+    conn.commit()
 
 
 def norm_distances_csv_path() -> Path:
@@ -2567,7 +2632,10 @@ def compute_team_scoring_for_cup_year(
 ) -> dict[str, int]:
     """
     Пересчитывает таблицы team_scoring_* для cup_id/year.
-    Правила: лучшая строка участника в этапе, бонус 50+ = +15, cap очков не выше 1 места.
+    По каждому событию (competition_id): у команды в зачёт входят **пять лучших результатов**
+    участников (очки за этап после бонуса 50+ и cap). Итог команды — **сумма** таких
+    взносов по всем учитываемым событиям календарного года.
+    На событие у участника остаётся один финиш — с наибольшими points_for_team (лучшая дистанция/попытка).
     """
     ensure_team_scoring_schema(db_path)
     ensure_norm_distances_schema(db_path)
@@ -2605,7 +2673,7 @@ def compute_team_scoring_for_cup_year(
         """,
         tuple([year] + comp_ids),
     )
-    by_stage_profile: dict[tuple[int, int], dict[str, Any]] = {}
+    by_competition_profile: dict[tuple[int, int], dict[str, Any]] = {}
     for r in base_rows:
         comp_id = int(r["competition_id"])
         if comp_id not in stage_ix_map:
@@ -2623,8 +2691,8 @@ def compute_team_scoring_for_cup_year(
         age = r.get("age")
         bonus = 15 if age is not None and int(age) >= 50 else 0
         pts_team = min(base_pts + bonus, cap)
-        key = (stage_idx, int(r["profile_id"]))
-        cur = by_stage_profile.get(key)
+        key = (comp_id, int(r["profile_id"]))
+        cur = by_competition_profile.get(key)
         cand = {
             "stage_index": stage_idx,
             "competition_id": comp_id,
@@ -2642,8 +2710,8 @@ def compute_team_scoring_for_cup_year(
             "source_result_id": int(r["result_id"]),
         }
         if cur is None or int(cand["points_for_team"]) > int(cur["points_for_team"]):
-            by_stage_profile[key] = cand
-    chosen_rows = list(by_stage_profile.values())
+            by_competition_profile[key] = cand
+    chosen_rows = list(by_competition_profile.values())
     with connect(db_path) as c:
         now = datetime.now(timezone.utc).isoformat()
         c.execute(
@@ -2692,36 +2760,69 @@ def compute_team_scoring_for_cup_year(
                     for r in chosen_rows
                 ],
             )
-        # member totals: best 7 of 8
-        stage_rows = [
-            {
-                "team_name": str(r["team_name"]),
-                "profile_id": int(r["profile_id"]),
-                "stage_index": int(r["stage_index"]),
-                "points_for_team": int(r["points_for_team"]),
-            }
-            for r in chosen_rows
-        ]
-        by_member: dict[tuple[str, int], list[dict[str, Any]]] = {}
-        for r in stage_rows:
-            k = (str(r["team_name"]), int(r["profile_id"]))
-            by_member.setdefault(k, []).append(r)
-        member_rows: list[tuple[Any, ...]] = []
-        team_acc: dict[str, list[tuple[int, int]]] = {}
-        for (team_name, profile_id), rr in by_member.items():
-            rr_sorted = sorted(
-                rr, key=lambda x: int(x.get("points_for_team") or 0), reverse=True
+        # По каждому событию (competition_id): топ‑5 результатов команды → сумма; итог команды =
+        # сумма по всем событиям.
+        from collections import defaultdict
+
+        by_team_comp: dict[tuple[str, int], list[tuple[int, int]]] = defaultdict(list)
+        for row in chosen_rows:
+            tn = str(row["team_name"] or "").strip()
+            if not tn:
+                continue
+            cid = int(row["competition_id"])
+            by_team_comp[(tn, cid)].append(
+                (int(row["profile_id"]), int(row["points_for_team"]))
             )
-            best7 = rr_sorted[:7]
-            points_all = int(sum(int(x.get("points_for_team") or 0) for x in rr_sorted))
-            points_best7 = int(sum(int(x.get("points_for_team") or 0) for x in best7))
+
+        member_contribution = defaultdict(int)
+        team_points_acc: dict[str, int] = defaultdict(int)
+        members_in_top5 = set()
+
+        for (team_name, comp_id), pairs in by_team_comp.items():
+            pairs_sorted = sorted(pairs, key=lambda x: (-x[1], x[0]))[:5]
+            team_points_acc[team_name] += sum(p for _, p in pairs_sorted)
+            for pid, p in pairs_sorted:
+                member_contribution[(team_name, pid)] += int(p)
+                members_in_top5.add((team_name, comp_id, pid))
+
+        all_member_keys: set[tuple[str, int]] = set()
+        for row in chosen_rows:
+            tn = str(row["team_name"] or "").strip()
+            if tn:
+                all_member_keys.add((tn, int(row["profile_id"])))
+
+        member_rows: list[tuple[Any, ...]] = []
+        for team_name, profile_id in sorted(all_member_keys):
+            rows_m = [
+                x
+                for x in chosen_rows
+                if str(x["team_name"] or "").strip() == team_name
+                and int(x["profile_id"]) == profile_id
+            ]
+            points_all = int(
+                sum(int(x.get("points_for_team") or 0) for x in rows_m)
+            )
+            points_counted_toward_team = int(
+                member_contribution.get((team_name, profile_id), 0)
+            )
+            rows_m_sorted = sorted(
+                rows_m,
+                key=lambda z: (int(z.get("stage_index") or 0), int(z.get("competition_id") or 0)),
+            )
             stages_json = json.dumps(
                 [
                     {
                         "stage_index": int(x.get("stage_index") or 0),
+                        "competition_id": int(x.get("competition_id") or 0),
                         "points": int(x.get("points_for_team") or 0),
+                        "in_team_top5_event": (
+                            team_name,
+                            int(x.get("competition_id") or 0),
+                            profile_id,
+                        )
+                        in members_in_top5,
                     }
-                    for x in best7
+                    for x in rows_m_sorted
                 ],
                 ensure_ascii=False,
             )
@@ -2733,12 +2834,11 @@ def compute_team_scoring_for_cup_year(
                     team_name,
                     profile_id,
                     points_all,
-                    points_best7,
+                    points_counted_toward_team,
                     stages_json,
                     now,
                 )
             )
-            team_acc.setdefault(team_name, []).append((profile_id, points_best7))
         if member_rows:
             c.executemany(
                 """
@@ -2750,12 +2850,19 @@ def compute_team_scoring_for_cup_year(
                 member_rows,
             )
         team_rows: list[tuple[Any, ...]] = []
-        for team_name, vals in team_acc.items():
-            vals_sorted = sorted(vals, key=lambda x: x[1], reverse=True)
-            top5 = vals_sorted[:5]
-            team_points = int(sum(v for _, v in top5))
+        for team_name in sorted(team_points_acc.keys(), key=lambda t: (-team_points_acc[t], t)):
+            team_points = int(team_points_acc[team_name])
+            contribs = [
+                (pid, int(member_contribution[(team_name, pid)]))
+                for (tn, pid) in all_member_keys
+                if tn == team_name and member_contribution[(team_name, pid)] > 0
+            ]
+            contribs.sort(key=lambda x: (-x[1], x[0]))
             members_json = json.dumps(
-                [{"profile_id": int(pid), "points_best7_of8": int(pts)} for pid, pts in top5],
+                [
+                    {"profile_id": int(pid), "points_counted_in_team_total": int(pts)}
+                    for pid, pts in contribs
+                ],
                 ensure_ascii=False,
             )
             team_rows.append(
@@ -2785,6 +2892,108 @@ def compute_team_scoring_for_cup_year(
         "member_rows": len(member_rows),
         "team_rows": len(team_rows),
     }
+
+
+def compute_individual_cup_base_rows_by_participant(
+    db_path: Path | str,
+    cup_id: int,
+    year: int,
+    stage_ix_map: dict[int, int] | None = None,
+) -> dict[int, list[dict[str, Any]]]:
+    """
+    Личное первенство в контуре team_scoring: базовые очки этапа (как «Очки (база)»),
+    без бонуса 50+ и без требования непустого results.team.
+    На этап оставляется один финиш — с наибольшими base_points (сравнение только по базе).
+    Учитываются соревнования из пересечения cup_competitions и карты этапов.
+    """
+    ensure_norm_distances_schema(db_path)
+    ix = stage_ix_map if stage_ix_map is not None else load_stage_index_map()
+    if not ix:
+        return {}
+    cup_rows = q_all(
+        db_path,
+        "SELECT competition_id FROM cup_competitions WHERE cup_id=?",
+        (int(cup_id),),
+    )
+    cup_cids = {int(r["competition_id"]) for r in cup_rows}
+    comp_ids = sorted(cup_cids & set(ix.keys()))
+    if not comp_ids:
+        return {}
+    comp_placeholders = ",".join("?" * len(comp_ids))
+    base_rows = q_all(
+        db_path,
+        f"""
+        SELECT
+            r.id AS result_id,
+            r.competition_id,
+            r.profile_id,
+            r.distance_id,
+            d.distance_km,
+            d.name AS distance_name,
+            {_scalar_norm_distance_km()} AS norm_distance_km,
+            r.place_abs,
+            r.place_gender,
+            COALESCE(NULLIF(TRIM(r.finish_time), ''), '') AS finish_time,
+            COALESCE(c.title, '') AS competition_title
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id AND c.year = ?
+        INNER JOIN cup_competitions cc
+          ON cc.competition_id = r.competition_id AND cc.cup_id = ?
+        LEFT JOIN distances d ON d.id = r.distance_id
+        {_join_norm_distances_rd()}
+        WHERE COALESCE(r.dnf, 0) = 0
+          AND r.profile_id IS NOT NULL
+          AND (r.place_gender IS NOT NULL OR r.place_abs IS NOT NULL)
+          AND r.competition_id IN ({comp_placeholders})
+        """,
+        tuple([year, int(cup_id)] + comp_ids),
+    )
+    by_stage_profile: dict[tuple[int, int], dict[str, Any]] = {}
+    for r in base_rows:
+        comp_id = int(r["competition_id"])
+        if comp_id not in ix:
+            continue
+        stage_idx = int(ix[comp_id])
+        km = _resolve_distance_km(r.get("norm_distance_km"), r.get("distance_name"))
+        if float(km) <= 0:
+            km = _resolve_distance_km(r.get("distance_km"), r.get("distance_name"))
+        place_for_score = r.get("place_gender")
+        if place_for_score is None:
+            place_for_score = r.get("place_abs")
+        base_pts, _cap = calc_team_stage_base_points(stage_idx, km, place_for_score)
+        if base_pts <= 0:
+            continue
+        key = (stage_idx, int(r["profile_id"]))
+        pa = r.get("place_abs")
+        try:
+            place_abs_int = int(pa) if pa is not None else 0
+        except (TypeError, ValueError):
+            place_abs_int = 0
+        dn = str(r.get("distance_name") or "").strip()
+        if dn:
+            dist_label = dn
+        elif float(km) > 0:
+            dist_label = f"{float(km):g} км"
+        else:
+            dist_label = "—"
+        ft = str(r.get("finish_time") or "").strip()
+        cand = {
+            "этап": stage_idx,
+            "дистанция": dist_label,
+            "событие": str(r.get("competition_title") or "").strip() or "—",
+            "место_абс": place_abs_int,
+            "очков_база": int(base_pts),
+            "время": ft if ft else "—",
+        }
+        cur = by_stage_profile.get(key)
+        if cur is None or int(cand["очков_база"]) > int(cur["очков_база"]):
+            by_stage_profile[key] = cand
+    out: dict[int, list[dict[str, Any]]] = {}
+    for (_st, pid), row in by_stage_profile.items():
+        out.setdefault(pid, []).append(row)
+    for _pid, lr in out.items():
+        lr.sort(key=lambda x: int(x.get("этап") or 0))
+    return out
 
 
 def query_team_scoring_team_totals(
@@ -2845,6 +3054,51 @@ def query_team_scoring_member_totals(
     )
 
 
+def _enrich_team_scoring_stage_distance_time(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Внутренние поля join: _dist_nm, _dist_km, _ftime → дистанция, время для UI/Excel."""
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        r = dict(row)
+        dn = str(r.pop("_dist_nm", None) or "").strip()
+        km = r.pop("_dist_km", None)
+        ft = str(r.pop("_ftime", None) or "").strip()
+        if dn:
+            r["дистанция"] = dn
+        else:
+            try:
+                kf = float(km) if km is not None else 0.0
+            except (TypeError, ValueError):
+                kf = 0.0
+            r["дистанция"] = f"{kf:g} км" if kf > 0 else "—"
+        r["время"] = ft if ft else "—"
+        out.append(r)
+    return out
+
+
+_TEAM_SCORING_STAGE_SELECT = """
+    SELECT
+        sp.team_name AS команда,
+        sp.profile_id,
+        sp.stage_index AS этап,
+        sp.competition_id,
+        COALESCE(c.title, '') AS событие,
+        TRIM(COALESCE(p.last_name, '') || ' ' || COALESCE(p.first_name, '')) AS участник,
+        sp.place_abs AS место_абс,
+        sp.base_points AS очков_база,
+        sp.bonus_points AS очков_бонус,
+        sp.points_for_team AS очков_в_командный,
+        CASE WHEN sp.bonus_points > 0 THEN 'Группа 50+ бонус 15 очков' ELSE '' END AS комментарий,
+        TRIM(COALESCE(d.name, '')) AS _dist_nm,
+        sp.distance_km AS _dist_km,
+        COALESCE(NULLIF(TRIM(r.finish_time), ''), '') AS _ftime
+    FROM team_scoring_stage_points sp
+    LEFT JOIN profiles p ON p.id = sp.profile_id
+    LEFT JOIN competitions c ON c.id = sp.competition_id
+    LEFT JOIN results r ON r.id = sp.source_result_id
+    LEFT JOIN distances d ON d.id = sp.distance_id AND d.competition_id = sp.competition_id
+"""
+
+
 def query_team_scoring_stage_points(
     db_path: Path | str,
     cup_id: int,
@@ -2854,52 +3108,26 @@ def query_team_scoring_stage_points(
 ) -> list[dict[str, Any]]:
     """Детализация очков по этапам для участников командного зачёта."""
     if team_name is None:
-        return q_all(
+        raw = q_all(
             db_path,
-            """
-            SELECT
-                sp.team_name AS команда,
-                sp.profile_id,
-                sp.stage_index AS этап,
-                sp.competition_id,
-                COALESCE(c.title, '') AS событие,
-                TRIM(COALESCE(p.last_name, '') || ' ' || COALESCE(p.first_name, '')) AS участник,
-                sp.place_abs AS место_абс,
-                sp.base_points AS очков_база,
-                sp.bonus_points AS очков_бонус,
-                sp.points_for_team AS очков_в_командный,
-                CASE WHEN sp.bonus_points > 0 THEN 'Группа 50+ бонус 15 очков' ELSE '' END AS комментарий
-            FROM team_scoring_stage_points sp
-            LEFT JOIN profiles p ON p.id = sp.profile_id
-            LEFT JOIN competitions c ON c.id = sp.competition_id
+            _TEAM_SCORING_STAGE_SELECT
+            + """
             WHERE sp.rule_version=? AND sp.cup_id=? AND sp.year=?
             ORDER BY sp.team_name, sp.stage_index, sp.points_for_team DESC, участник
             """,
             (rule_version, cup_id, year),
         )
-    return q_all(
+        return _enrich_team_scoring_stage_distance_time(raw)
+    raw = q_all(
         db_path,
-        """
-        SELECT
-            sp.team_name AS команда,
-            sp.profile_id,
-            sp.stage_index AS этап,
-            sp.competition_id,
-            COALESCE(c.title, '') AS событие,
-            TRIM(COALESCE(p.last_name, '') || ' ' || COALESCE(p.first_name, '')) AS участник,
-            sp.place_abs AS место_абс,
-            sp.base_points AS очков_база,
-            sp.bonus_points AS очков_бонус,
-            sp.points_for_team AS очков_в_командный,
-            CASE WHEN sp.bonus_points > 0 THEN 'Группа 50+ бонус 15 очков' ELSE '' END AS комментарий
-        FROM team_scoring_stage_points sp
-        LEFT JOIN profiles p ON p.id = sp.profile_id
-        LEFT JOIN competitions c ON c.id = sp.competition_id
+        _TEAM_SCORING_STAGE_SELECT
+        + """
         WHERE sp.rule_version=? AND sp.cup_id=? AND sp.year=? AND sp.team_name=?
         ORDER BY sp.stage_index, sp.points_for_team DESC, участник
         """,
         (rule_version, cup_id, year, team_name),
     )
+    return _enrich_team_scoring_stage_distance_time(raw)
 
 
 def query_team_championship_matrix(
@@ -4127,6 +4355,7 @@ def query_profile_cup_detail_for_year_cup(
         db_path,
         f"""
         SELECT
+            p.id AS profile_id,
             TRIM(COALESCE(p.last_name, '') || ' ' || COALESCE(p.first_name, '')) AS участник,
             COALESCE(p.last_name, '') AS last_name,
             COALESCE(p.gender, '') AS gender,
@@ -4283,6 +4512,59 @@ def query_profile_cup_team_member_competition_rows(
     ``results.competition_id`` (в т.ч. через CAST). Сопоставление по названию — в UI
     через ``map_profile_cup_points_by_title_distance`` (только текст из **raw**), иначе
     снова схлопывается в один этап.
+    """
+    ensure_norm_distances_schema(db_path)
+    return q_all(
+        db_path,
+        f"""
+        SELECT
+            c.title AS событие,
+            COALESCE(NULLIF(TRIM(d.name), ''), '') AS дистанция,
+            {_scalar_norm_distance_km()} AS norm_distance_km,
+            r.place_abs AS место_абс,
+            r.competition_id AS competition_id,
+            (
+              SELECT pcr.total_points
+              FROM profile_cup_results pcr
+              WHERE pcr.profile_id = r.profile_id
+                AND pcr.cup_id = ?
+                AND pcr.year = ?
+                AND (
+                  json_extract(pcr.raw, '$.competition.id') = r.competition_id
+                  OR CAST(json_extract(pcr.raw, '$.competition.id') AS INTEGER) = r.competition_id
+                  OR json_extract(pcr.raw, '$.competition_id') = r.competition_id
+                  OR CAST(json_extract(pcr.raw, '$.competition_id') AS INTEGER) = r.competition_id
+                  OR json_extract(pcr.raw, '$.result.competition.id') = r.competition_id
+                  OR CAST(json_extract(pcr.raw, '$.result.competition.id') AS INTEGER) = r.competition_id
+                )
+              ORDER BY pcr.id
+              LIMIT 1
+            ) AS очков,
+          COALESCE(NULLIF(TRIM(r.finish_time), ''), '') AS время
+        FROM results r
+        INNER JOIN cup_competitions cc
+          ON cc.competition_id = r.competition_id AND cc.cup_id = ?
+        INNER JOIN competitions c ON c.id = r.competition_id AND c.year = ?
+        INNER JOIN distances d ON d.id = r.distance_id AND d.competition_id = c.id
+        {_join_norm_distances_rd()}
+        WHERE r.profile_id = ?
+          AND COALESCE(r.dnf, 0) = 0
+        ORDER BY c.date ASC, c.id ASC, d.id ASC
+        """,
+        (cup_id, year, cup_id, year, profile_id),
+    )
+
+
+def query_profile_cup_finishes_for_participant(
+    db_path: Path | str,
+    profile_id: int,
+    cup_id: int,
+    year: int,
+) -> list[dict[str, Any]]:
+    """
+    Все финиши участника в соревнованиях кубка за календарный год (cup_competitions),
+    без требования указать команду в **results.team** — для личного первенства.
+    Совпадает по сути с ``query_profile_cup_team_member_competition_rows``, но доступен для всех финиширующих.
     """
     ensure_norm_distances_schema(db_path)
     return q_all(

@@ -255,6 +255,7 @@ def test_profile_cup_page_queries(sample_db: Path) -> None:
     d = mq.query_profile_cup_detail_for_year_cup(sample_db, 2024, 1)
     assert len(d) == 2
     ivan = next(r for r in d if "Testov" in (r.get("участник") or ""))
+    assert int(ivan["profile_id"]) == 100
     assert float(ivan["очков"]) == 88.25
     assert "событие" in ivan and "дистанция" in ivan
     assert ivan["last_name"] == "Testov"
@@ -291,6 +292,16 @@ def test_profile_cup_team_member_competition_rows(sample_db: Path) -> None:
     assert len(r101) == 1
     assert r101[0]["событие"] == "Test Marathon"
     assert float(r101[0]["очков"]) == 150.0
+
+
+def test_profile_cup_finishes_for_participant_matches_team_member_when_team_set(
+    sample_db: Path,
+) -> None:
+    """Отдельный запрос финишей без фильтра по команде совпадает с запросом для команд, если участник указал команду."""
+    tm = mq.query_profile_cup_team_member_competition_rows(sample_db, 100, 1, 2024)
+    allf = mq.query_profile_cup_finishes_for_participant(sample_db, 100, 1, 2024)
+    assert len(allf) == len(tm)
+    assert allf[0]["competition_id"] == tm[0]["competition_id"]
 
 
 def test_assign_profile_cup_points_to_result_lines(sample_db: Path) -> None:
@@ -789,6 +800,55 @@ def test_compute_team_scoring_for_cup_year(sample_db: Path) -> None:
     )
     assert len(members) == 1
     assert members[0]["очков_7из8"] == 600
+
+
+def test_compute_team_scoring_team_total_sums_top5_per_event(sample_db: Path) -> None:
+    """Итог команды = сумма по событиям (на каждое — топ‑5), а не топ‑5 участников по сезону."""
+    conn = sqlite3.connect(sample_db)
+    conn.executescript(
+        """
+        INSERT INTO competitions VALUES (3, 'Second Stage Event', '2024-07-15', 2024, 'run');
+        INSERT INTO distances VALUES (30, 3, '21 km', 21.0, 0);
+        INSERT INTO cup_competitions VALUES (1, 3);
+        INSERT INTO profiles VALUES (201, 'A', 'OnlyFirst', '', 'm', 30, 1994, 'X',
+            NULL, 'VO', 36, 'Россия', '', 0, 0, 0, 0, 0, 0, '{}');
+        INSERT INTO profiles VALUES (202, 'B', 'OnlySec', '', 'm', 31, 1993, 'X',
+            NULL, 'VO', 36, 'Россия', '', 0, 0, 0, 0, 0, 0, '{}');
+        INSERT INTO profiles VALUES (203, 'C', 'OnlySec', '', 'm', 32, 1992, 'X',
+            NULL, 'VO', 36, 'Россия', '', 0, 0, 0, 0, 0, 0, '{}');
+        INSERT INTO profiles VALUES (204, 'D', 'OnlySec', '', 'm', 33, 1991, 'X',
+            NULL, 'VO', 36, 'Россия', '', 0, 0, 0, 0, 0, 0, '{}');
+        INSERT INTO profiles VALUES (205, 'E', 'OnlySec', '', 'm', 34, 1990, 'X',
+            NULL, 'VO', 36, 'Россия', '', 0, 0, 0, 0, 0, 0, '{}');
+        INSERT INTO profiles VALUES (206, 'F', 'OnlySec', '', 'm', 35, 1989, 'X',
+            NULL, 'VO', 36, 'Россия', '', 0, 0, 0, 0, 0, 0, '{}');
+        INSERT INTO results VALUES (50, 1, 10, 201, 0, 3600.0, 'Team T', 1, 1, 1, 'M40', '01:00:00', '{}');
+        INSERT INTO results VALUES (51, 3, 30, 202, 0, 3700.0, 'Team T', 2, 2, 1, 'M40', '01:02:00', '{}');
+        INSERT INTO results VALUES (52, 3, 30, 203, 0, 3710.0, 'Team T', 3, 2, 2, 'M40', '01:02:10', '{}');
+        INSERT INTO results VALUES (53, 3, 30, 204, 0, 3720.0, 'Team T', 4, 2, 3, 'M40', '01:02:20', '{}');
+        INSERT INTO results VALUES (54, 3, 30, 205, 0, 3730.0, 'Team T', 5, 2, 4, 'M40', '01:02:30', '{}');
+        INSERT INTO results VALUES (55, 3, 30, 206, 0, 3740.0, 'Team T', 6, 2, 5, 'M40', '01:02:40', '{}');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    mq.ensure_team_scoring_schema(sample_db)
+    out = mq.compute_team_scoring_for_cup_year(
+        sample_db,
+        cup_id=1,
+        year=2024,
+        stage_map={1: 1, 3: 2},
+        rule_version="team_evt_rules_v1",
+    )
+    assert out["stage_rows"] >= 7
+    teams = mq.query_team_scoring_team_totals(
+        sample_db, cup_id=1, year=2024, rule_version="team_evt_rules_v1"
+    )
+    tt = next((r for r in teams if r.get("команда") == "Team T"), None)
+    assert tt is not None
+    # Событие 1: один участник 600. Событие 3: шесть по 598, в зачёт пять → 5*598.
+    assert int(tt["очков"]) == 600 + 5 * 598
 
 
 def test_compute_team_scoring_uses_place_gender(sample_db: Path) -> None:
