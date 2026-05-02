@@ -18,7 +18,7 @@ import calendar
 import datetime
 import math
 import json
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from io import BytesIO
 import tomllib
@@ -626,7 +626,12 @@ def _facts_prepare_df(rows: list[dict[str, Any]]) -> pd.DataFrame:
     return out
 
 
-def _facts_table(rows: list[dict[str, Any]], key: str) -> None:
+def _facts_table(
+    rows: list[dict[str, Any]],
+    key: str,
+    *,
+    on_first_nonempty_table: Callable[[], None] | None = None,
+) -> None:
     df = _facts_prepare_df(rows)
     if df.empty:
         st.caption("Нет данных для таблицы.")
@@ -639,6 +644,106 @@ def _facts_table(rows: list[dict[str, Any]], key: str) -> None:
             display_text=r".*pid=(\d+)",
         )
     st.dataframe(df, use_container_width=True, hide_index=True, key=key, column_config=cfg or None)
+    if on_first_nonempty_table is not None:
+        on_first_nonempty_table()
+
+
+def _vm_loading_bicycle_html() -> str:
+    """Баннер «Загрузка данных»: велосипед (зеркально) по пунктирной линии слева направо на всю ширину блока."""
+    accent = VM_ACCENT
+    text = VM_TEXT
+    muted = VM_MUTED
+    uid = "vmloadbike"
+    return f"""<style>
+#{uid}_wrap {{
+  margin: 0 0 20px 0;
+  padding: 16px 12px;
+  border-radius: 12px;
+  background: rgba(227,239,247,0.55);
+  border: 1px solid rgba(147,189,221,0.45);
+  box-sizing: border-box;
+  width: 100%;
+}}
+#{uid}_track {{
+  position: relative;
+  width: 100%;
+  max-width: 100%;
+  height: 52px;
+  margin: 6px 0 10px 0;
+  box-sizing: border-box;
+}}
+#{uid}_rule {{
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 12px;
+  height: 0;
+  border-bottom: 2.75px dashed {accent};
+  opacity: 0.92;
+  border-radius: 1px;
+}}
+@keyframes {uid}_lr {{
+  from {{ left: 0; }}
+  to {{ left: calc(100% - 1.85rem); }}
+}}
+#{uid}_mover {{
+  position: absolute;
+  bottom: 24px;
+  left: 0;
+  font-size: 1.75rem;
+  line-height: 1;
+  animation: {uid}_lr 8.55s linear infinite;
+  display: inline-block;
+  filter: drop-shadow(0 1px 1px rgba(0,0,0,0.1));
+}}
+#{uid}_bike {{
+  display: inline-block;
+  transform: scaleX(-1);
+}}
+@media (prefers-reduced-motion: reduce) {{
+  #{uid}_mover {{
+    animation: none !important;
+    left: 35%;
+  }}
+}}
+#{uid}_text {{
+  text-align: center;
+  color: {text};
+  font-weight: 600;
+  font-size: 1rem;
+  letter-spacing: 0.02em;
+}}
+#{uid}_hint {{
+  text-align: center;
+  margin-top: 4px;
+  font-size: 0.82rem;
+  color: {muted};
+}}
+</style>
+<div id="{uid}_wrap">
+  <div id="{uid}_track">
+    <div id="{uid}_rule" aria-hidden="true"></div>
+    <div id="{uid}_mover"><span id="{uid}_bike" role="img" aria-label="">🚴</span></div>
+  </div>
+  <div id="{uid}_text">Загрузка данных…</div>
+  <div id="{uid}_hint">Запросы к базе, подождите несколько секунд</div>
+</div>
+"""
+
+
+def _vm_loading_banner_placeholder() -> Callable[[], None]:
+    """Показывает велобаннер; возвращаемую функцию вызывают один или несколько раз — плейсхолдер снимется один раз."""
+    ph = st.empty()
+    ph.markdown(_vm_loading_bicycle_html(), unsafe_allow_html=True)
+    cleared = {"v": False}
+
+    def clear_once() -> None:
+        if cleared["v"]:
+            return
+        ph.empty()
+        cleared["v"] = True
+
+    return clear_once
 
 
 def db_path() -> Path:
@@ -1551,7 +1656,9 @@ def page_general_statistics() -> None:
         sel_cup_ids = []
     cf = sel_cup_ids if sel_cup_ids else None
 
+    _clear_obsh_banner = _vm_loading_banner_placeholder()
     cards = mq.query_general_stats_cards(path, yf, sf, cf)
+    _clear_obsh_banner()
     st.markdown("##### Показатели")
     m1, m2, m3, m4, m5 = st.columns(5, gap="small")
     with m1:
@@ -1567,9 +1674,13 @@ def page_general_statistics() -> None:
 
     _section_anchor("general-charts")
     st.subheader("Графики")
+    _clear_obsh_charts_banner = _vm_loading_banner_placeholder()
+    _dfe_raw_ev = mq.query_chart_events_by_year(path, yf, sf, cf)
+    _dfp_raw_part = mq.query_chart_unique_participants_by_year(path, yf, sf, cf)
+    _clear_obsh_charts_banner()
     g1, g2 = st.columns(2)
     with g1:
-        dfe = pd.DataFrame(mq.query_chart_events_by_year(path, yf, sf, cf))
+        dfe = pd.DataFrame(_dfe_raw_ev)
         if dfe.empty:
             st.caption("Нет данных для гистограммы событий по годам.")
         else:
@@ -1614,7 +1725,7 @@ def page_general_statistics() -> None:
             )
 
     with g2:
-        dfp = pd.DataFrame(mq.query_chart_unique_participants_by_year(path, yf, sf, cf))
+        dfp = pd.DataFrame(_dfp_raw_part)
         if dfp.empty:
             st.caption("Нет данных для гистограммы участников по годам.")
         else:
@@ -1671,9 +1782,11 @@ def page_general_statistics() -> None:
     with d2:
         if bar_drill is not None:
             st.caption(f"Таблица уточнена по **{bar_drill}** г. (клик по гистограмме «событий по годам»).")
+    _clear_obsh_events_banner = _vm_loading_banner_placeholder()
     ev_rows = mq.query_general_stats_events_table(
         path, yf, sf, cf, bar_year=bar_drill
     )
+    _clear_obsh_events_banner()
     if not ev_rows:
         st.caption("Нет строк для выбранных фильтров.")
     else:
@@ -1684,8 +1797,12 @@ def page_general_statistics() -> None:
         )
 
     p1, p2 = st.columns(2)
+    _clear_obsh_pie_banner = _vm_loading_banner_placeholder()
+    _sport_pie_rows = mq.query_chart_events_by_sport(path, yf, sf, cf)
+    _gender_pie_rows = mq.query_chart_participants_by_gender(path, yf, sf, cf)
+    _clear_obsh_pie_banner()
     with p1:
-        dfs = pd.DataFrame(mq.query_chart_events_by_sport(path, yf, sf, cf))
+        dfs = pd.DataFrame(_sport_pie_rows)
         if dfs.empty:
             st.caption("Нет данных для диаграммы по видам спорта.")
         else:
@@ -1710,7 +1827,7 @@ def page_general_statistics() -> None:
             st.altair_chart((pie_sport + labels).properties(height=360), use_container_width=True)
 
     with p2:
-        dfg = pd.DataFrame(mq.query_chart_participants_by_gender(path, yf, sf, cf))
+        dfg = pd.DataFrame(_gender_pie_rows)
         if dfg.empty:
             st.caption("Нет данных для диаграммы по полу.")
         else:
@@ -1755,6 +1872,8 @@ def page_interesting_facts() -> None:
     min_starts = 1
     year_val = None
     sport_val = None if sport_pick == "Все" else str(sport_pick)
+
+    _clear_facts_loading_banner_once = _vm_loading_banner_placeholder()
 
     loyal = mq.query_interesting_facts_loyal_participants(
         path, year=year_val, sport=sport_val, min_starts=int(min_starts), limit=100
@@ -1941,26 +2060,46 @@ def page_interesting_facts() -> None:
     with f1:
         st.markdown("**Самые преданные участники**")
         st.caption("Топ по активным годам участия.")
-        _facts_table(loyal, key="facts_table_loyal")
+        _facts_table(
+            loyal,
+            key="facts_table_loyal",
+            on_first_nonempty_table=_clear_facts_loading_banner_once,
+        )
     with f2:
         st.markdown("**Железные финишеры**")
         st.caption("Топ по проценту финишей.")
-        _facts_table(finishers, key="facts_table_finishers")
+        _facts_table(
+            finishers,
+            key="facts_table_finishers",
+            on_first_nonempty_table=_clear_facts_loading_banner_once,
+        )
 
     f3, f4 = st.columns(2)
     with f3:
         st.markdown("**Топ-10 по пройденному расстоянию (мужчины)**")
         st.caption("Сумма км по нормализованному справочнику событие×дистанция (финиши); столбец «Км из БД» — из таблицы distances.")
-        _facts_table(km_leaders_m, key="facts_table_km_male")
+        _facts_table(
+            km_leaders_m,
+            key="facts_table_km_male",
+            on_first_nonempty_table=_clear_facts_loading_banner_once,
+        )
     with f4:
         st.markdown("**Топ-10 по пройденному расстоянию (женщины)**")
         st.caption("Те же правила, что и для мужчин.")
-        _facts_table(km_leaders_f, key="facts_table_km_female")
+        _facts_table(
+            km_leaders_f,
+            key="facts_table_km_female",
+            on_first_nonempty_table=_clear_facts_loading_banner_once,
+        )
 
     with st.container():
         st.markdown("**Универсалы по видам спорта**")
         st.caption("Чем больше покрытие видов спорта, тем выше место.")
-        _facts_table(universals, key="facts_table_universals")
+        _facts_table(
+            universals,
+            key="facts_table_universals",
+            on_first_nonempty_table=_clear_facts_loading_banner_once,
+        )
 
     with st.container(border=True):
         st.markdown("**Серии финишей на этапах кубков**")
@@ -1971,17 +2110,31 @@ def page_interesting_facts() -> None:
             "считаем подряд идущие финиши до первого этапа без финиша; будущие заезды не обнуляют серию; "
             "«Макс. серия» — самый длинный такой же непрерывный участок по **всему** ряду (с учётом фильтров)."
         )
-        _facts_table(cup_streaks, key="facts_table_cup_stage_streaks")
+        _facts_table(
+            cup_streaks,
+            key="facts_table_cup_stage_streaks",
+            on_first_nonempty_table=_clear_facts_loading_banner_once,
+        )
 
     f5, f6 = st.columns(2)
     with f5:
         st.markdown("**Топ дистанций**")
         st.caption("Самые частые дистанции по числу стартов.")
-        _facts_table(distances, key="facts_table_distances")
+        _facts_table(
+            distances,
+            key="facts_table_distances",
+            on_first_nonempty_table=_clear_facts_loading_banner_once,
+        )
     with f6:
         st.markdown("**Команды-долгожители**")
         st.caption("Команды с самым длинным активным периодом.")
-        _facts_table(teams, key="facts_table_teams")
+        _facts_table(
+            teams,
+            key="facts_table_teams",
+            on_first_nonempty_table=_clear_facts_loading_banner_once,
+        )
+
+    _clear_facts_loading_banner_once()
 
     _section_anchor("facts-charts")
     st.subheader("Графики")
@@ -3097,9 +3250,9 @@ def page_vm_geography() -> None:
     )
     sport_val: str | None = None if sport_pick == "Все" else str(sport_pick).strip()
 
-    with st.spinner("Загрузка данных…"):
-        geo_vm = mq.query_vm_geography_page(path, year=year_val, sport=sport_val)
-
+    _clear_geo_banner = _vm_loading_banner_placeholder()
+    geo_vm = mq.query_vm_geography_page(path, year=year_val, sport=sport_val)
+    _clear_geo_banner()
     _render_geo_vm_data_tables(geo_vm, widget_key_prefix="yamap_geo")
 
     api_key = _resolve_yandex_maps_api_key()
@@ -3390,11 +3543,13 @@ def page_vm_records() -> None:
     else:
         sports_filter = None
 
+    _clear_rec_banner_ch = _vm_loading_banner_placeholder()
     st.subheader("Лидеры по числу действующих рекордов")
     for code, label in RECORDS_VM_CARD_SPORTS:
         hdr = f"{label} ({code})"
         st.markdown(f"##### {hdr}")
         ch = mq.query_vm_records_champions_cards(path, years_filter, code)
+        _clear_rec_banner_ch()
         col_m, col_f = st.columns(2)
         male = ch.get("males") or {}
         female = ch.get("females") or {}
@@ -3436,9 +3591,11 @@ def page_vm_records() -> None:
                 st.caption("Нет данных для расчёта.")
 
     st.subheader("Рекорды ВМ")
+    _clear_rec_banner_h = _vm_loading_banner_placeholder()
     rec_rows = mq.query_event_section_records_hierarchy(
         path, years_filter, sports_filter, top_n=5
     )
+    _clear_rec_banner_h()
     if not rec_rows:
         st.caption("Нет данных для построения рекордов по выбранным фильтрам.")
     else:
@@ -3671,9 +3828,11 @@ def page_upcoming_events() -> None:
     cy = int(st.session_state[ss_y])
     m_sel = max(1, min(12, int(st.session_state[ss_m])))
 
+    _clear_cal_banner = _vm_loading_banner_placeholder()
     past_rows, fut_rows = mq.query_competitions_calendar_month_events(
         path, cy, m_sel, today=today
     )
+    _clear_cal_banner()
     by_day_past: dict[int, list[dict[str, Any]]] = {}
     by_day_future: dict[int, list[dict[str, Any]]] = {}
     for r in past_rows:
@@ -3748,7 +3907,11 @@ def page_event() -> None:
     else:
         sports_filter = None
 
+    _clear_ev_banner = _vm_loading_banner_placeholder()
     cards = mq.query_event_section_cards(path, years_filter, sports_filter)
+    series_rank = mq.query_event_series_title_short_ranking(path, years_filter, sports_filter)
+    event_rows = mq.query_event_section_events_table(path, years_filter, sports_filter)
+    _clear_ev_banner()
     st.markdown("##### Показатели")
     c1, c2, c3, c4, c5 = st.columns(5, gap="small")
     with c1:
@@ -3764,7 +3927,6 @@ def page_event() -> None:
 
     _section_anchor("event-series")
     st.subheader("Серии событий")
-    series_rank = mq.query_event_series_title_short_ranking(path, years_filter, sports_filter)
     if not series_rank:
         st.caption(
             "Нет серий с повторными выпусками по **title_short** в текущих фильтрах, "
@@ -3794,7 +3956,6 @@ def page_event() -> None:
 
     _section_anchor("event-list")
     st.subheader("События")
-    event_rows = mq.query_event_section_events_table(path, years_filter, sports_filter)
     if not event_rows:
         st.caption("Нет строк для выбранных фильтров.")
     else:
@@ -3807,6 +3968,7 @@ def page_event() -> None:
         st.caption("Нет годов для детализации.")
         return
 
+    _clear_ev_comps_banner = _vm_loading_banner_placeholder()
     comps: list[dict[str, Any]] = []
     for yy in years_for_detail:
         rows = mq.query_competitions_for_year(path, int(yy))
@@ -3814,6 +3976,7 @@ def page_event() -> None:
             sports_set = {str(x) for x in sports_filter}
             rows = [c for c in rows if str(c.get("вид") or "") in sports_set]
         comps.extend(rows)
+    _clear_ev_comps_banner()
     if not comps:
         st.info("Нет событий для выбранных фильтров.")
         return
@@ -5070,7 +5233,9 @@ def page_participant() -> None:
         return
 
     st.caption("Быстрый выбор: начните вводить фамилию/имя/id — подсказки появятся в этом же поле.")
+    _clear_pt_ac_banner = _vm_loading_banner_placeholder()
     ac_rows = mq.query_profile_autocomplete_options(path, limit=20000)
+    _clear_pt_ac_banner()
     ac_labels: list[str] = []
     ac_map: dict[str, int] = {}
     for r in ac_rows:
@@ -5144,7 +5309,9 @@ def page_participant() -> None:
 
 
 def show_participant_dashboard(path: Path, pid: int) -> None:
+    _clear_pt_db_banner = _vm_loading_banner_placeholder()
     p = mq.query_profile_row(path, pid)
+    _clear_pt_db_banner()
     if not p:
         st.warning(f"Профиль #{pid} не найден.")
         return
@@ -5571,7 +5738,9 @@ def page_team() -> None:
         st.caption("Выберите команду в поле выше.")
         return
 
+    _clear_team_banner = _vm_loading_banner_placeholder()
     base_stats = mq.query_team_stats(path, team)
+    _clear_team_banner()
     if not base_stats:
         st.error("Нет стартов для этой команды в выбранных данных.")
         return
@@ -5866,7 +6035,9 @@ def page_cups() -> None:
     )
     year = int(st.session_state[yk])
 
+    _clear_cups_banner = _vm_loading_banner_placeholder()
     summaries = mq.query_profile_cup_summaries_for_year(path, year)
+    _clear_cups_banner()
     st.subheader(f"Кубки за {year} год")
     if not summaries:
         st.warning(f"За **{year}** нет строк в profile_cup_results.")
