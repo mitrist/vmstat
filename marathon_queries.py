@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 
 DEFAULT_DB = Path(os.environ.get("MARATHON_DB", "marathon.db"))
 DEFAULT_DISTANCE_ALIASES_FILE = (
@@ -3128,6 +3128,127 @@ def query_team_scoring_stage_points(
         (rule_version, cup_id, year, team_name),
     )
     return _enrich_team_scoring_stage_distance_time(raw)
+
+
+def query_cup_team_stage_events_ordered(
+    db_path: Path | str, cup_id: int, year: int
+) -> list[dict[str, Any]]:
+    """
+    Этапы кубка за календарный год: события из cup_competitions с годом competitions.year,
+    порядок по дате соревнования.
+    Поля: competition_id, title.
+    """
+    return q_all(
+        db_path,
+        """
+        SELECT
+            c.id AS competition_id,
+            TRIM(
+                COALESCE(
+                    NULLIF(c.title, ''),
+                    '#' || CAST(c.id AS TEXT)
+                )
+            ) AS title
+        FROM cup_competitions cc
+        INNER JOIN competitions c ON c.id = cc.competition_id AND c.year = ?
+        WHERE cc.cup_id = ?
+        GROUP BY c.id
+        ORDER BY MIN(c.date), c.id
+        """,
+        (int(year), int(cup_id)),
+    )
+
+
+def _leaderboards_by_competition_from_stage_points(
+    stage_rows: list[dict[str, Any]],
+    competition_ids_ordered: Sequence[int],
+    *,
+    top_k: int = 5,
+) -> dict[int, list[dict[str, Any]]]:
+    """Сводка топ-K вкладов на этапе → рейтинг команд с очками и отставанием от лидера."""
+    from collections import defaultdict
+
+    max_pid_pts: dict[tuple[int, str, int], int] = {}
+    for r in stage_rows:
+        cid = int(r.get("competition_id") or 0)
+        if cid <= 0:
+            continue
+        team = str(r.get("team_name") or "").strip()
+        pid = int(r.get("profile_id") or 0)
+        pts = int(r.get("points_for_team") or 0)
+        if not team or pid <= 0:
+            continue
+        key = (cid, team, pid)
+        prev = max_pid_pts.get(key, -1)
+        if pts > prev:
+            max_pid_pts[key] = pts
+
+    by_comp_team_vals: dict[int, dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
+    for (cid, team, pid), pts in max_pid_pts.items():
+        by_comp_team_vals[cid][team].append(int(pts))
+
+    k = max(1, int(top_k))
+    wanted = list(competition_ids_ordered)
+    out: dict[int, list[dict[str, Any]]] = {}
+    for cid in wanted:
+        team_totals: dict[str, int] = {}
+        for team, vals in (by_comp_team_vals.get(cid) or {}).items():
+            arr_sorted = sorted(vals, reverse=True)
+            team_totals[team] = int(sum(arr_sorted[:k]))
+
+        ranked = sorted(
+            team_totals.items(),
+            key=lambda x: (-int(x[1]), str(x[0]).casefold()),
+        )
+        if not ranked:
+            out[int(cid)] = []
+            continue
+        leader_pts = int(ranked[0][1])
+        rows_lb: list[dict[str, Any]] = []
+        for rank, (team, pts) in enumerate(ranked, start=1):
+            pts_i = int(pts)
+            rows_lb.append(
+                {
+                    "место": int(rank),
+                    "команда": team,
+                    "очки": pts_i,
+                    "отставание": int(leader_pts - pts_i),
+                }
+            )
+        out[int(cid)] = rows_lb
+    return out
+
+
+def query_team_scoring_leaderboards_by_competition(
+    db_path: Path | str,
+    cup_id: int,
+    year: int,
+    competition_ids_ordered: Sequence[int],
+    *,
+    rule_version: str = "team_v1",
+    top_k: int = 5,
+) -> dict[int, list[dict[str, Any]]]:
+    """
+    Рейтинг команд на каждом соревновании (stage): сумма top_k очков вкладов участников,
+    источник team_scoring_stage_points (как в командном первенстве).
+    Ключ результата — competition_id из списка (порядок списка определяет порядок вкладок UI).
+    """
+    if not competition_ids_ordered:
+        return {}
+    rows = q_all(
+        db_path,
+        """
+        SELECT competition_id, team_name, profile_id, points_for_team
+        FROM team_scoring_stage_points
+        WHERE rule_version = ? AND cup_id = ? AND year = ?
+        """,
+        (str(rule_version), int(cup_id), int(year)),
+    )
+    return _leaderboards_by_competition_from_stage_points(
+        list(rows),
+        competition_ids_ordered,
+        top_k=top_k,
+    )
 
 
 def query_team_championship_matrix(
@@ -6547,6 +6668,158 @@ def _build_interesting_facts_where(year: int | None, sport: str | None) -> tuple
         parts.append("c.sport = ?")
         params.append(str(sport).strip())
     return (" AND ".join(parts) if parts else "1=1"), params
+
+
+def _competition_calendar_date(raw: Any) -> date | None:
+    """Парсинг даты соревнования из SQLite (TEXT или другое)."""
+    if raw is None:
+        return None
+    if isinstance(raw, datetime):
+        return raw.date()
+    if isinstance(raw, date):
+        return raw
+    s = str(raw).strip()
+    if not s:
+        return None
+    head = s[:10]
+    try:
+        return date.fromisoformat(head)
+    except ValueError:
+        try:
+            return datetime.strptime(head, "%Y-%m-%d").date()
+        except ValueError:
+            return None
+
+
+def query_interesting_facts_cup_stage_finish_streaks(
+    db_path: Path | str,
+    year: int | None = None,
+    sport: str | None = None,
+    min_longest_streak: int = 1,
+    limit: int = 100,
+    *,
+    as_of_date: date | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Серии финишей по единому хронологическому ряду этапов кубков: все competition_id
+    из cup_competitions (без разреза по cup_id), порядок date, затем id.
+    streak_longest — максимум подряд по всему ряду за всё время (с фильтрами страницы).
+    streak_current — подряд от «последнего уже прошедшего по календарю» этапа к более ранним:
+    учитываются только соревнования с известной датой не позже текущего дня (as_of_date;
+    для UI — «сегодня»), считаем финиши подряд до первого участка без финиша.
+    """
+    w, params = _build_interesting_facts_where(year, sport)
+    oid_rows = q_all(
+        db_path,
+        f"""
+        SELECT c.id AS competition_id,
+               MIN(c.date) AS comp_date
+        FROM cup_competitions cc
+        INNER JOIN competitions c ON c.id = cc.competition_id
+        WHERE {w}
+        GROUP BY c.id
+        ORDER BY MIN(c.date), c.id
+        """,
+        tuple(params),
+    )
+    ordered_cids = [int(r["competition_id"]) for r in oid_rows]
+    if not ordered_cids:
+        return []
+
+    ordered_cids_until_today: list[int] = []
+    ref = date.today() if as_of_date is None else as_of_date
+    for r in oid_rows:
+        cid = int(r["competition_id"])
+        d = _competition_calendar_date(r.get("comp_date"))
+        if d is None or d <= ref:
+            ordered_cids_until_today.append(cid)
+
+    fin_rows = q_all(
+        db_path,
+        f"""
+        SELECT r.profile_id AS profile_id,
+               r.competition_id AS competition_id
+        FROM results r
+        INNER JOIN competitions c ON c.id = r.competition_id
+        INNER JOIN cup_competitions cc ON cc.competition_id = r.competition_id
+        WHERE r.profile_id IS NOT NULL
+          AND COALESCE(r.dnf, 0) = 0
+          AND {w}
+        """,
+        tuple(params),
+    )
+    cid_set_all = set(ordered_cids)
+    from collections import defaultdict
+
+    finishes: dict[int, set[int]] = defaultdict(set)
+    for r in fin_rows:
+        cid = int(r["competition_id"] or 0)
+        pid = int(r["profile_id"] or 0)
+        if pid and cid in cid_set_all:
+            finishes[pid].add(cid)
+
+    if not finishes:
+        return []
+
+    streak_longest_by: dict[int, int] = {}
+    streak_current_by: dict[int, int] = {}
+    for pid, finset in finishes.items():
+        longest = cur_run = 0
+        for cid in ordered_cids:
+            if cid in finset:
+                cur_run += 1
+                if cur_run > longest:
+                    longest = cur_run
+            else:
+                cur_run = 0
+        streak_longest_by[pid] = longest
+        tail = 0
+        if ordered_cids_until_today:
+            for cid in reversed(ordered_cids_until_today):
+                if cid in finset:
+                    tail += 1
+                else:
+                    break
+        streak_current_by[pid] = tail
+
+    min_ls = max(1, int(min_longest_streak))
+    cand = [
+        pid
+        for pid, ls in streak_longest_by.items()
+        if ls >= min_ls or streak_current_by[pid] >= min_ls
+    ]
+    cand.sort(key=lambda pid: (-streak_longest_by[pid], -streak_current_by[pid], pid))
+
+    if not cand:
+        return []
+
+    lim = max(1, min(int(limit), 5000))
+    top_ids = cand[:lim]
+
+    placeholders = ",".join("?" * len(top_ids))
+    names = q_all(
+        db_path,
+        f"""
+        SELECT id AS profile_id,
+               TRIM(COALESCE(last_name, '') || ' ' || COALESCE(first_name, '')) AS participant
+        FROM profiles
+        WHERE id IN ({placeholders})
+        """,
+        tuple(top_ids),
+    )
+    name_by_pid = {int(r["profile_id"]): str(r.get("participant") or "").strip() or "—" for r in names}
+
+    out: list[dict[str, Any]] = []
+    for pid in top_ids:
+        out.append(
+            {
+                "profile_id": pid,
+                "participant": name_by_pid.get(pid, "—"),
+                "streak_current": int(streak_current_by[pid]),
+                "streak_longest": int(streak_longest_by[pid]),
+            }
+        )
+    return out
 
 
 def _canonical_sport_code(value: str | None) -> str:

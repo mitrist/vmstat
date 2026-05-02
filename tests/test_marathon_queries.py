@@ -528,6 +528,98 @@ def test_interesting_facts_longest_series_by_sport_without_title_short(sample_db
     assert rows == []
 
 
+def test_query_cup_team_stage_events_ordered_filters_year(sample_db: Path) -> None:
+    rows = mq.query_cup_team_stage_events_ordered(sample_db, cup_id=1, year=2024)
+    cids = {int(r["competition_id"]) for r in rows}
+    assert cids == {1}
+    r2023 = mq.query_cup_team_stage_events_ordered(sample_db, cup_id=2, year=2023)
+    assert {int(r["competition_id"]) for r in r2023} == {2}
+
+
+def test_leaderboards_by_competition_from_stage_points_top_team() -> None:
+    fake = [
+        {
+            "competition_id": 10,
+            "team_name": "Red",
+            "profile_id": 1,
+            "points_for_team": 100,
+        },
+        {
+            "competition_id": 10,
+            "team_name": "Red",
+            "profile_id": 2,
+            "points_for_team": 50,
+        },
+        {
+            "competition_id": 10,
+            "team_name": "Blue",
+            "profile_id": 3,
+            "points_for_team": 200,
+        },
+    ]
+    lb = mq._leaderboards_by_competition_from_stage_points(fake, [10], top_k=5)
+    assert list(lb.keys()) == [10]
+    table = lb[10]
+    assert len(table) == 2
+    assert table[0]["команда"] == "Blue" and table[0]["очки"] == 200 and table[0]["отставание"] == 0
+    assert table[1]["команда"] == "Red" and table[1]["очки"] == 150
+    assert table[1]["отставание"] == 50
+
+
+def test_interesting_facts_cup_stage_finish_streaks(sample_db: Path) -> None:
+    """cup_competitions: comp 2 раньше (2023), comp 1 (2024)."""
+    rows = mq.query_interesting_facts_cup_stage_finish_streaks(
+        sample_db, year=None, sport=None, min_longest_streak=1, limit=10
+    )
+    assert len(rows) == 2
+    by_pid = {int(r["profile_id"]): r for r in rows}
+    assert int(by_pid[100]["streak_longest"]) == 2
+    assert int(by_pid[100]["streak_current"]) == 2
+    assert str(by_pid[100]["participant"]).startswith("Testov")
+    assert int(by_pid[101]["streak_longest"]) == 1
+    assert int(by_pid[101]["streak_current"]) == 1
+
+    # Только уже прошедшие этапы: на 2024-01-01 в ряду ещё нет финишей comp 1
+    cutoff = mq.query_interesting_facts_cup_stage_finish_streaks(
+        sample_db,
+        year=None,
+        sport=None,
+        min_longest_streak=1,
+        limit=10,
+        as_of_date=date(2024, 1, 1),
+    )
+    cu = {int(r["profile_id"]): r for r in cutoff}
+    assert int(cu[100]["streak_longest"]) == 2
+    assert int(cu[100]["streak_current"]) == 1
+
+    conn = sqlite3.connect(sample_db)
+    conn.execute(
+        "INSERT INTO competitions VALUES (88, 'Future Cup', '2029-06-01', 2029, 'run')"
+    )
+    conn.execute("INSERT INTO cup_competitions VALUES (1, 88)")
+    conn.commit()
+    conn.close()
+
+    fut = mq.query_interesting_facts_cup_stage_finish_streaks(
+        sample_db,
+        year=None,
+        sport=None,
+        min_longest_streak=1,
+        limit=10,
+        as_of_date=date(2026, 1, 1),
+    )
+    fu = {int(r["profile_id"]): r for r in fut}
+    assert int(fu[100]["streak_longest"]) == 2
+    assert int(fu[100]["streak_current"]) == 2
+
+    y2024 = mq.query_interesting_facts_cup_stage_finish_streaks(
+        sample_db, year=2024, sport="run", min_longest_streak=1, limit=10
+    )
+    assert len(y2024) >= 2
+    by24 = {int(r["profile_id"]): r for r in y2024}
+    assert int(by24[100]["streak_longest"]) == int(by24[100]["streak_current"]) == 1
+
+
 def test_interesting_facts_record_and_wins_leaders_by_sport(sample_db: Path) -> None:
     rec = mq.query_interesting_facts_record_leaders_by_sport(sample_db, year=None, sport=None)
     assert rec

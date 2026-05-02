@@ -129,6 +129,7 @@ SECTION_SUBMENUS: dict[str, list[tuple[str, str]]] = {
     "Кубки": [
         ("cups-list", "Кубки за год"),
         ("cups-results", "Результаты"),
+        ("cups-stage-rating", "Рейтинг по этапам"),
     ],
 }
 
@@ -610,6 +611,8 @@ def _facts_prepare_df(rows: list[dict[str, Any]]) -> pd.DataFrame:
         "country": "Страна",
         "sport": "Вид спорта",
         "profile_id": "profile_id",
+        "streak_current": "Текущая серия (подряд)",
+        "streak_longest": "Макс. серия",
     }
     out = df.rename(columns=rename_map)
     if "norm_distance_km_total" in df.columns and "km_total" in df.columns:
@@ -1786,6 +1789,9 @@ def page_interesting_facts() -> None:
     abs_wins_top = mq.query_interesting_facts_abs_wins_top10(
         path, year=year_val, sport=sport_val
     )
+    cup_streaks = mq.query_interesting_facts_cup_stage_finish_streaks(
+        path, year=year_val, sport=sport_val, min_longest_streak=1, limit=100
+    )
 
     st.subheader("Факт дня")
     if loyal:
@@ -1955,6 +1961,17 @@ def page_interesting_facts() -> None:
         st.markdown("**Универсалы по видам спорта**")
         st.caption("Чем больше покрытие видов спорта, тем выше место.")
         _facts_table(universals, key="facts_table_universals")
+
+    with st.container(border=True):
+        st.markdown("**Серии финишей на этапах кубков**")
+        st.caption(
+            "Ряд событий: все соревнования из cup_competitions (без привязки к конкретному кубку), "
+            "порядок по дате соревнования. Серия подряд — только финиши (DNF разрывает). "
+            "«Текущая серия» — среди этапов **не позже сегодняшней даты**, от самого последнего по календарю назад "
+            "считаем подряд идущие финиши до первого этапа без финиша; будущие заезды не обнуляют серию; "
+            "«Макс. серия» — самый длинный такой же непрерывный участок по **всему** ряду (с учётом фильтров)."
+        )
+        _facts_table(cup_streaks, key="facts_table_cup_stage_streaks")
 
     f5, f6 = st.columns(2)
     with f5:
@@ -5885,8 +5902,13 @@ def page_cups() -> None:
 
     _section_anchor("cups-results")
     st.subheader(f"Результаты: {cup_title} · {year}")
-    tab_ind, tab_team, tab_team_champ = st.tabs(
-        ["Личное первенство", "Командный зачёт", "Командное первенство"]
+    tab_ind, tab_team, tab_team_champ, tab_stage_rating = st.tabs(
+        [
+            "Личное первенство",
+            "Командный зачёт",
+            "Командное первенство",
+            "Рейтинг по этапам",
+        ]
     )
 
     with tab_ind:
@@ -6103,6 +6125,90 @@ def page_cups() -> None:
             else:
                 st.info("Матрица командного первенства доступна для Кубка беговых марафонов 2026 (id 54).")
 
+    with tab_stage_rating:
+        _section_anchor("cups-stage-rating")
+        stages = mq.query_cup_team_stage_events_ordered(path, cup_id, year)
+        st.caption(
+            "Подвкладки соответствуют **названию (title)** соревнования этапа. "
+            "**Очки** — сумма **пяти лучших** вкладов участников команды на этапе "
+            "(тот же пересчёт, что вкладка «Командный зачёт», при доступности данных). "
+            "**Отставание от лидера** — сколько очков команда набрала меньше победителя этапа."
+        )
+
+        boards: dict[int, list[dict[str, Any]]] = {}
+        if stages and mq.is_team_scoring_enabled(int(cup_id), int(year)):
+            stage_map_rating = mq.load_stage_index_map()
+            if not stage_map_rating:
+                st.warning("Не загружена карта этапов (.cursor/etapy.yaml); пересчёт командной таблицы невозможен.")
+            else:
+                mq.compute_team_scoring_for_cup_year(
+                    path,
+                    cup_id=int(cup_id),
+                    year=int(year),
+                    stage_map=stage_map_rating,
+                    rule_version="team_v1",
+                )
+                cid_order = [int(s["competition_id"]) for s in stages]
+                boards = mq.query_team_scoring_leaderboards_by_competition(
+                    path,
+                    int(cup_id),
+                    int(year),
+                    cid_order,
+                    rule_version="team_v1",
+                    top_k=5,
+                )
+        elif stages:
+            st.info(
+                "Таблицы с очками и отставанием доступны для кубков с пересчитанным командным зачётом "
+                "в контуре **team_scoring** (сейчас **cup_id = 54**, **2026** год). Выберите другой кубок "
+                "или вкладку «Командный зачёт», чтобы видеть свой формат данных."
+            )
+
+        if not stages:
+            st.warning("Этапов кубка в базе за этот год не найдено — подвкладки не созданы.")
+        else:
+            _cnt_titles: dict[str, int] = {}
+            _tab_labels: list[str] = []
+            for _s in stages:
+                _tid = str(_s.get("title") or "").strip()
+                if not _tid:
+                    _tid = f'Событие {int(_s["competition_id"])}'
+                _cnt_titles[_tid] = _cnt_titles.get(_tid, 0) + 1
+                _n = _cnt_titles[_tid]
+                _lbl = (
+                    _tid if _n == 1 else f'{_tid} · id {int(_s["competition_id"])}'
+                )
+                if len(_lbl) > 96:
+                    _lbl = _lbl[:93].rstrip() + "..."
+                _tab_labels.append(_lbl)
+
+            stage_rating_subtabs = st.tabs(_tab_labels)
+            for _s_tab, nav_sub in zip(stages, stage_rating_subtabs):
+                _cid_ev = int(_s_tab["competition_id"])
+                with nav_sub:
+                    rows_lb = list(boards.get(_cid_ev) or [])
+                    if not rows_lb:
+                        if mq.is_team_scoring_enabled(int(cup_id), int(year)):
+                            st.caption("На этом этапе нет зачётных строк в **team_scoring_stage_points**.")
+                        pd_empty = pd.DataFrame(
+                            columns=[
+                                "Место",
+                                "Команда",
+                                "Очки",
+                                "Отставание от лидера",
+                            ]
+                        )
+                        st.dataframe(pd_empty, use_container_width=True, hide_index=True)
+                    else:
+                        dff_lb = pd.DataFrame(rows_lb).rename(
+                            columns={
+                                "место": "Место",
+                                "команда": "Команда",
+                                "очки": "Очки",
+                                "отставание": "Отставание от лидера",
+                            }
+                        )
+                        st.dataframe(dff_lb, use_container_width=True, hide_index=True)
 
 def page_admin() -> None:
     slug = _resolve_admin_route_slug()
